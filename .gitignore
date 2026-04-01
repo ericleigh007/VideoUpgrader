@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+python/.cache/
+artifacts/
+workspace/
+src-tauri/target/

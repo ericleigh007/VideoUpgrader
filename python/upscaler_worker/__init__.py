@@ -1,0 +1,1 @@
+"""Upscaler Python worker package."""

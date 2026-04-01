@@ -1,0 +1,222 @@
+{
+  "backends": [
+    {
+      "id": "realesrgan-ncnn",
+      "label": "Real-ESRGAN NCNN Vulkan",
+      "loader": "ncnn-portable-binary",
+      "runtime": "portable-exe",
+      "supportsGpuSelection": true,
+      "frameTransport": "directory-batch"
+    },
+    {
+      "id": "pytorch-image-sr",
+      "label": "PyTorch Image SR",
+      "loader": "pytorch-checkpoint",
+      "runtime": "python-torch",
+      "supportsGpuSelection": true,
+      "frameTransport": "directory-batch"
+    },
+    {
+      "id": "pytorch-video-sr",
+      "label": "PyTorch Video SR",
+      "loader": "pytorch-checkpoint",
+      "runtime": "python-torch",
+      "supportsGpuSelection": true,
+      "frameTransport": "sequence-native"
+    }
+  ],
+  "models": [
+    {
+      "id": "realesrgan-x4plus",
+      "backendId": "realesrgan-ncnn",
+      "loader": "ncnn-portable-binary",
+      "runtimeModelName": "realesrgan-x4plus",
+      "label": "Real-ESRGAN x4 Plus",
+      "summary": "General-purpose photographic model with the strongest sharpening and texture lift in the current NCNN runtime.",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "production",
+      "qualityRank": 1,
+      "videoNative": false,
+      "mediaSuitability": ["photo", "video"],
+      "nativeScale": 4,
+      "specialHandling": {
+        "cropMath": "scale-aware",
+        "requiresVulkan": true,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": true
+      }
+    },
+    {
+      "id": "realesrnet-x4plus",
+      "backendId": "pytorch-image-sr",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "realesrnet-x4plus",
+      "label": "Real-ESRNet x4 Plus",
+      "summary": "More conservative Real-ESR family model with lower halo risk and a useful baseline against stronger sharpening models.",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "next",
+      "qualityRank": 2,
+      "videoNative": false,
+      "mediaSuitability": ["photo", "video"],
+      "nativeScale": 4,
+      "runtimeAsset": {
+        "kind": "checkpoint",
+        "fileName": "RealESRNet_x4plus.pth",
+        "downloadUrl": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.1/RealESRNet_x4plus.pth"
+      },
+      "specialHandling": {
+        "cropMath": "scale-aware",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": true
+      }
+    },
+    {
+      "id": "bsrgan-x4",
+      "backendId": "pytorch-image-sr",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "bsrgan-x4",
+      "label": "BSRGAN x4",
+      "summary": "Blind real-world super-resolution model with strong handling for noisy, compressed, or degraded photographic footage.",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "next",
+      "qualityRank": 3,
+      "videoNative": false,
+      "mediaSuitability": ["photo", "video"],
+      "nativeScale": 4,
+      "runtimeAsset": {
+        "kind": "checkpoint",
+        "fileName": "BSRGAN.pth",
+        "downloadUrl": "https://github.com/cszn/KAIR/releases/download/v1.0/BSRGAN.pth"
+      },
+      "specialHandling": {
+        "cropMath": "scale-aware",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": true
+      }
+    },
+    {
+      "id": "hat-realhat-gan-x4",
+      "backendId": "pytorch-image-sr",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "Real_HAT_GAN_SRx4",
+      "label": "HAT Real HAT GAN x4",
+      "summary": "Hybrid attention transformer tuned for high perceptual quality in real-world image SR, suitable for frame-by-frame video analysis.",
+      "visibleInUi": false,
+      "comparisonEligible": false,
+      "executionStatus": "planned",
+      "supportTier": "next",
+      "qualityRank": 4,
+      "videoNative": false,
+      "mediaSuitability": ["photo", "video"],
+      "nativeScale": 4,
+      "specialHandling": {
+        "cropMath": "scale-aware",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": true
+      }
+    },
+    {
+      "id": "swinir-realworld-x4",
+      "backendId": "pytorch-image-sr",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "swinir-realworld-x4",
+      "label": "SwinIR Real-World x4",
+      "summary": "Transformer-based image super-resolution model with strong texture recovery and more restrained sharpening than ESRGAN variants.",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "next",
+      "qualityRank": 5,
+      "videoNative": false,
+      "mediaSuitability": ["photo", "video"],
+      "nativeScale": 4,
+      "runtimeAsset": {
+        "kind": "checkpoint",
+        "fileName": "003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth",
+        "downloadUrl": "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth"
+      },
+      "specialHandling": {
+        "cropMath": "scale-aware",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": true
+      }
+    },
+    {
+      "id": "rvrt-x4",
+      "backendId": "pytorch-video-sr",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "rvrt-x4",
+      "label": "RVRT x4",
+      "summary": "Video-native recurrent transformer with temporal fusion, making it the first serious non-framewise target backend for real footage.",
+      "visibleInUi": false,
+      "comparisonEligible": false,
+      "executionStatus": "planned",
+      "supportTier": "research",
+      "qualityRank": 6,
+      "videoNative": true,
+      "mediaSuitability": ["photo", "video"],
+      "nativeScale": 4,
+      "specialHandling": {
+        "cropMath": "scale-aware",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": true
+      }
+    },
+    {
+      "id": "realesrgan-x4plus-anime",
+      "backendId": "realesrgan-ncnn",
+      "loader": "ncnn-portable-binary",
+      "runtimeModelName": "realesrgan-x4plus-anime",
+      "label": "Real-ESRGAN x4 Plus Anime",
+      "summary": "Compatibility-only bundled model retained so the app can exercise multi-result comparisons before the PyTorch backends land.",
+      "visibleInUi": false,
+      "comparisonEligible": false,
+      "executionStatus": "runnable",
+      "supportTier": "compatibility",
+      "qualityRank": 98,
+      "videoNative": false,
+      "mediaSuitability": ["anime", "illustration"],
+      "nativeScale": 4,
+      "specialHandling": {
+        "cropMath": "scale-aware",
+        "requiresVulkan": true,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": true
+      }
+    },
+    {
+      "id": "realesr-animevideov3-x4",
+      "backendId": "realesrgan-ncnn",
+      "loader": "ncnn-portable-binary",
+      "runtimeModelName": "realesr-animevideov3-x4",
+      "label": "Real-ESR AnimeVideo v3 x4",
+      "summary": "Compatibility-only bundled video model retained to give the app multiple runnable outputs for immediate side-by-side validation.",
+      "visibleInUi": false,
+      "comparisonEligible": false,
+      "executionStatus": "runnable",
+      "supportTier": "compatibility",
+      "qualityRank": 99,
+      "videoNative": false,
+      "mediaSuitability": ["anime", "video"],
+      "nativeScale": 4,
+      "specialHandling": {
+        "cropMath": "scale-aware",
+        "requiresVulkan": true,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": true,
+        "variantSuffixByScale": true
+      }
+    }
+  ]
+}

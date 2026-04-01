@@ -1,0 +1,17 @@
+{
+  "modelRatings": {},
+  "blindComparisons": [
+    {
+      "sourcePath": "C:\\eric\\Breakfast at Tiffany's (3⧸9) Movie CLIP - Moon River (1961) HD [uirBWk-qd9A].webm",
+      "previewDurationSeconds": 8,
+      "winnerModelId": "realesrgan-x4plus",
+      "candidateModelIds": [
+        "realesrgan-x4plus",
+        "realesrnet-x4plus",
+        "bsrgan-x4",
+        "swinir-realworld-x4"
+      ],
+      "createdAt": "1775076243"
+    }
+  ]
+}
