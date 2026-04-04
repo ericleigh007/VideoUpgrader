@@ -27,6 +27,12 @@ Upscaler is currently centered on:
 
 The current product direction is quality first, performance second.
 
+## What's Coming
+
+- Video frame interpolation as a planned follow-on capability.
+- Support for interpolation-only runs on existing videos, alongside post-upscale interpolation in the main export pipeline.
+- Explicit 30 fps and 60 fps target workflows once the runtime stage is implemented.
+
 ## Available Models
 
 ### Runnable Now
