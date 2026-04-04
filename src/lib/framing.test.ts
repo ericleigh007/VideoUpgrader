@@ -38,7 +38,7 @@ describe("planOutputFraming", () => {
     expect(plan.cropWindow.offsetX).toBeGreaterThanOrEqual(0);
   });
 
-  it("returns native x4 output without 4k coercion", () => {
+  it("returns native 2x output without 4k coercion when source aspect is preserved", () => {
     const plan = planOutputFraming({ width: 640, height: 360 }, "native4x", {
       aspectRatioPreset: "source",
       customAspectWidth: null,
@@ -51,7 +51,7 @@ describe("planOutputFraming", () => {
       cropWidth: null,
       cropHeight: null
     });
-    expect(plan.canvas).toEqual({ width: 2560, height: 1440 });
+    expect(plan.canvas).toEqual({ width: 1280, height: 720 });
   });
 
   it("derives target height from width when requested", () => {
@@ -68,6 +68,23 @@ describe("planOutputFraming", () => {
       cropHeight: null
     });
     expect(plan.canvas).toEqual({ width: 2048, height: 2048 });
+  });
+
+  it("derives an even 4:3 height from width-driven output", () => {
+    const plan = planOutputFraming({ width: 640, height: 480 }, "preserveAspect4k", {
+      aspectRatioPreset: "4:3",
+      customAspectWidth: null,
+      customAspectHeight: null,
+      resolutionBasis: "width",
+      targetWidth: 3840,
+      targetHeight: 2160,
+      cropLeft: null,
+      cropTop: null,
+      cropWidth: null,
+      cropHeight: null
+    });
+
+    expect(plan.canvas).toEqual({ width: 3840, height: 2880 });
   });
 
   it("defaults crop rect to centered aspect-matched selection", () => {

@@ -92,6 +92,17 @@ export const modelCatalog: ModelDefinition[] = typedCatalogData.models.map((mode
   specialHandling: model.specialHandling,
 }));
 
+export function getUiModels(): ModelDefinition[] {
+  return modelCatalog
+    .filter((model) => model.visibleInUi || model.executionStatus === "planned")
+    .sort((left, right) => {
+      if (left.qualityRank !== right.qualityRank) {
+        return left.qualityRank - right.qualityRank;
+      }
+      return left.label.localeCompare(right.label);
+    });
+}
+
 export function getVisibleModels(): ModelDefinition[] {
   return modelCatalog.filter((model) => model.visibleInUi);
 }

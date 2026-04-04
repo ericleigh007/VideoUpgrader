@@ -12,6 +12,6 @@ if ($RunTests) {
 }
 
 Invoke-CheckedCommand -Command { npm run build:web } -FailureMessage "Frontend build failed."
-Invoke-CheckedCommand -Command { cargo check --manifest-path "$PSScriptRoot/../src-tauri/Cargo.toml" } -FailureMessage "Cargo check failed."
+Invoke-CheckedCommand -Command { cargo build --manifest-path "$PSScriptRoot/../src-tauri/Cargo.toml" } -FailureMessage "Cargo build failed."
 
 Write-Host "Build checks completed."

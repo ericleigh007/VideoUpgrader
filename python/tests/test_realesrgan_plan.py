@@ -21,11 +21,16 @@ class RealesrganPlanTests(unittest.TestCase):
             crop_top=0.20,
             crop_width=0.75,
             crop_height=0.75,
+            segment_duration_seconds=20,
             output_path="artifacts/outputs/output.mp4",
             codec="h264",
             container="mp4",
             tile_size=256,
-            fp16=True,
+            fp16=False,
+            precision="bf16",
+            torch_compile_enabled=True,
+            pytorch_execution_path="streaming",
+            pytorch_runner="tensorrt",
             crf=18,
         )
 
@@ -35,13 +40,27 @@ class RealesrganPlanTests(unittest.TestCase):
         self.assertIn("--gpu-id", plan["command"])
         self.assertIn("1", plan["command"])
         self.assertIn("--tile-size", plan["command"])
+        self.assertIn("--segment-duration-seconds", plan["command"])
+        self.assertIn("20", plan["command"])
+        self.assertIn("--precision", plan["command"])
+        self.assertIn("bf16", plan["command"])
+        self.assertIn("--torch-compile", plan["command"])
+        self.assertIn("--pytorch-execution-path", plan["command"])
+        self.assertIn("streaming", plan["command"])
+        self.assertIn("--pytorch-runner", plan["command"])
+        self.assertIn("tensorrt", plan["command"])
         self.assertIn("Backend: realesrgan-ncnn", plan["notes"])
         self.assertIn("Runtime name: realesrgan-x4plus", plan["notes"])
         self.assertIn("GPU: 1", plan["notes"])
         self.assertIn("Aspect ratio: 1:1", plan["notes"])
         self.assertIn("Target width: 2048", plan["notes"])
         self.assertIn("Crop rect: 0.10, 0.20, 0.75, 0.75", plan["notes"])
+        self.assertIn("Segment duration: 20.0s", plan["notes"])
         self.assertIn("Codec: h264", plan["notes"])
+        self.assertIn("Precision: bf16", plan["notes"])
+        self.assertIn("torch.compile requested for PyTorch image SR execution.", plan["notes"])
+        self.assertIn("PyTorch execution path: streaming", plan["notes"])
+        self.assertIn("PyTorch runner: tensorrt", plan["notes"])
         self.assertEqual(len(plan["cacheKey"]), 64)
 
 

@@ -8,6 +8,7 @@
     "build:web": "tsc --noEmit && vite build",
     "test:web": "vitest run",
     "test:gui": "playwright test",
+    "stop": "pwsh -File ./scripts/stop.ps1 -IncludeRepoWorkers",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
   },

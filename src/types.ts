@@ -12,6 +12,8 @@ export type VideoCodec = "h264" | "h265";
 
 export type OutputContainer = "mp4" | "mkv";
 
+export type PytorchRunner = "torch" | "tensorrt";
+
 export type GpuKind = "discrete" | "integrated" | "unknown";
 
 export interface GpuDevice {
@@ -22,6 +24,7 @@ export interface GpuDevice {
 
 export interface SourceVideoSummary {
   path: string;
+  previewPath: string;
   width: number;
   height: number;
   durationSeconds: number;
@@ -81,9 +84,11 @@ export interface RealesrganJobRequest extends OutputSizingOptions {
   modelId: ModelId;
   outputMode: OutputMode;
   qualityPreset: QualityPreset;
+  pytorchRunner: PytorchRunner;
   gpuId: number | null;
   previewMode: boolean;
   previewDurationSeconds: number | null;
+  segmentDurationSeconds: number | null;
   outputPath: string;
   codec: VideoCodec;
   container: OutputContainer;
@@ -104,6 +109,25 @@ export interface PipelineProgress {
   upscaledFrames: number;
   encodedFrames: number;
   remuxedFrames: number;
+  segmentIndex?: number | null;
+  segmentCount?: number | null;
+  segmentProcessedFrames?: number | null;
+  segmentTotalFrames?: number | null;
+  batchIndex?: number | null;
+  batchCount?: number | null;
+  elapsedSeconds?: number | null;
+  averageFramesPerSecond?: number | null;
+  rollingFramesPerSecond?: number | null;
+  estimatedRemainingSeconds?: number | null;
+  processRssBytes?: number | null;
+  gpuMemoryUsedBytes?: number | null;
+  gpuMemoryTotalBytes?: number | null;
+  scratchSizeBytes?: number | null;
+  outputSizeBytes?: number | null;
+  extractStageSeconds?: number | null;
+  upscaleStageSeconds?: number | null;
+  encodeStageSeconds?: number | null;
+  remuxStageSeconds?: number | null;
 }
 
 export interface RealesrganJobPlan {
@@ -124,11 +148,50 @@ export interface PipelineResult {
   log: string[];
 }
 
+export interface PathStats {
+  path: string;
+  exists: boolean;
+  isDirectory: boolean;
+  sizeBytes: number;
+}
+
+export interface ScratchStorageSummary {
+  jobsRoot: PathStats;
+  convertedSourcesRoot: PathStats;
+  sourcePreviewsRoot: PathStats;
+}
+
+export interface ManagedJobSummary {
+  jobId: string;
+  jobKind: "pipeline" | "sourceConversion" | string;
+  label: string;
+  state: "queued" | "running" | "succeeded" | "failed" | "cancelled" | string;
+  sourcePath: string | null;
+  modelId: string | null;
+  codec: string | null;
+  container: string | null;
+  progress: PipelineProgress;
+  recordedCount: number;
+  scratchPath: string | null;
+  scratchStats: PathStats | null;
+  outputPath: string | null;
+  outputStats: PathStats | null;
+  updatedAt: string;
+}
+
 export interface PipelineJobStatus {
   jobId: string;
-  state: "queued" | "running" | "succeeded" | "failed";
+  state: "queued" | "running" | "succeeded" | "failed" | "cancelled";
   progress: PipelineProgress;
   result: PipelineResult | null;
+  error: string | null;
+}
+
+export interface SourceConversionJobStatus {
+  jobId: string;
+  state: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  progress: PipelineProgress;
+  result: SourceVideoSummary | null;
   error: string | null;
 }
 
@@ -137,11 +200,20 @@ export interface DesktopApi {
   selectOutputFile(defaultPath: string, container: OutputContainer): Promise<string | null>;
   ensureRuntimeAssets(): Promise<RuntimeStatus>;
   probeSourceVideo(sourcePath: string): Promise<SourceVideoSummary>;
+  startSourceConversionToMp4(sourcePath: string): Promise<string>;
+  getSourceConversionJob(jobId: string): Promise<SourceConversionJobStatus>;
+  cancelSourceConversionJob(jobId: string): Promise<void>;
   getAppConfig(): Promise<AppConfig>;
   saveModelRating(modelId: ModelId, rating: number | null): Promise<AppConfig>;
   recordBlindComparisonSelection(selection: BlindComparisonSelectionInput): Promise<AppConfig>;
   startPipeline(request: RealesrganJobRequest): Promise<string>;
   getPipelineJob(jobId: string): Promise<PipelineJobStatus>;
+  cancelPipelineJob(jobId: string): Promise<void>;
+  getPathStats(path: string): Promise<PathStats>;
+  getScratchStorageSummary(): Promise<ScratchStorageSummary>;
+  listManagedJobs(): Promise<ManagedJobSummary[]>;
+  deleteManagedPath(path: string): Promise<void>;
   openPathInDefaultApp(path: string): Promise<void>;
+  loadPreviewUrl(path: string): Promise<string>;
   toPreviewSrc(path: string): string;
 }

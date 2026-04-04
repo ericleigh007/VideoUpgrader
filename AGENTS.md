@@ -151,10 +151,12 @@ If you can't complete a task with existing tools and goals:
 Document model-specific mistakes here (not script bugs—those go in goals):
 
 * Always check `tools/manifest.md` before writing a new script
+* Before starting a multi-step implementation, refactor, UI reorganization, or other non-trivial sequence of edits, stop and present the main implementation options, tradeoffs, and a recommended path before editing. If the user's prompt explicitly says to proceed immediately or clearly overrides this behavior, follow the user's prompt.
 * Verify tool output format before chaining into another tool
 * Don't assume APIs support batch operations—check first
 * When a workflow fails mid-execution, preserve intermediate outputs before retrying
 * Read the full goal before starting a task—don't skim
+* Don't use VSCode to set an python virtual environment.
 * You can Write inside the directory of this Agents file and its subdirectories freely.
 * You can read outside the directory with permission
 

@@ -102,8 +102,8 @@ export function resolveOutputCanvas(source: FrameSize, mode: OutputMode, options
 
   if (mode === "native4x" && Math.abs(aspectRatio - sourceAspectRatio(source)) < EPSILON) {
     return {
-      width: roundDimension(source.width * 4),
-      height: roundDimension(source.height * 4)
+      width: roundDimension(source.width * 2),
+      height: roundDimension(source.height * 2)
     };
   }
 

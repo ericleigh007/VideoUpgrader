@@ -4,10 +4,14 @@ import type {
   AppConfig,
   BlindComparisonSelectionInput,
   DesktopApi,
+  ManagedJobSummary,
   OutputContainer,
+  PathStats,
   PipelineJobStatus,
   RealesrganJobRequest,
   RuntimeStatus,
+  ScratchStorageSummary,
+  SourceConversionJobStatus,
   SourceVideoSummary
 } from "../types";
 
@@ -21,6 +25,32 @@ function mockApi(): Partial<DesktopApi> | undefined {
   return window.__UPSCALER_MOCK__;
 }
 
+function inferPreviewMimeType(path: string): string {
+  const normalized = path.toLowerCase();
+  if (normalized.endsWith(".mp4")) {
+    return "video/mp4";
+  }
+  if (normalized.endsWith(".webm")) {
+    return "video/webm";
+  }
+  if (normalized.endsWith(".mov")) {
+    return "video/quicktime";
+  }
+  if (normalized.endsWith(".mkv")) {
+    return "video/x-matroska";
+  }
+  return "application/octet-stream";
+}
+
+function base64ToBlobUrl(base64: string, mimeType: string): string {
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+}
+
 export const desktopApi: DesktopApi = {
   async selectVideoFile() {
     const mock = mockApi();
@@ -30,7 +60,7 @@ export const desktopApi: DesktopApi = {
 
     const selected = await open({
       multiple: false,
-      filters: [{ name: "Video", extensions: ["mp4", "mkv", "webm", "mov"] }]
+      filters: [{ name: "Video", extensions: ["mp4", "mkv", "webm", "mov", "avi"] }]
     });
     return selected && !Array.isArray(selected) ? selected : null;
   },
@@ -64,6 +94,33 @@ export const desktopApi: DesktopApi = {
     }
 
     return invoke<SourceVideoSummary>("probe_source_video", { sourcePath });
+  },
+
+  async startSourceConversionToMp4(sourcePath: string) {
+    const mock = mockApi();
+    if (mock?.startSourceConversionToMp4) {
+      return mock.startSourceConversionToMp4(sourcePath);
+    }
+
+    return invoke<string>("start_source_conversion_to_mp4", { sourcePath });
+  },
+
+  async getSourceConversionJob(jobId: string) {
+    const mock = mockApi();
+    if (mock?.getSourceConversionJob) {
+      return mock.getSourceConversionJob(jobId);
+    }
+
+    return invoke<SourceConversionJobStatus>("get_source_conversion_job", { jobId });
+  },
+
+  async cancelSourceConversionJob(jobId: string) {
+    const mock = mockApi();
+    if (mock?.cancelSourceConversionJob) {
+      return mock.cancelSourceConversionJob(jobId);
+    }
+
+    return invoke<void>("cancel_source_conversion_job", { jobId });
   },
 
   async getAppConfig() {
@@ -111,6 +168,51 @@ export const desktopApi: DesktopApi = {
     return invoke<PipelineJobStatus>("get_realesrgan_pipeline_job", { jobId });
   },
 
+  async cancelPipelineJob(jobId: string) {
+    const mock = mockApi();
+    if (mock?.cancelPipelineJob) {
+      return mock.cancelPipelineJob(jobId);
+    }
+
+    return invoke<void>("cancel_realesrgan_pipeline_job", { jobId });
+  },
+
+  async getPathStats(path: string) {
+    const mock = mockApi();
+    if (mock?.getPathStats) {
+      return mock.getPathStats(path);
+    }
+
+    return invoke<PathStats>("get_path_stats", { path });
+  },
+
+  async getScratchStorageSummary() {
+    const mock = mockApi();
+    if (mock?.getScratchStorageSummary) {
+      return mock.getScratchStorageSummary();
+    }
+
+    return invoke<ScratchStorageSummary>("get_scratch_storage_summary");
+  },
+
+  async listManagedJobs() {
+    const mock = mockApi();
+    if (mock?.listManagedJobs) {
+      return mock.listManagedJobs();
+    }
+
+    return invoke<ManagedJobSummary[]>("list_managed_jobs");
+  },
+
+  async deleteManagedPath(path: string) {
+    const mock = mockApi();
+    if (mock?.deleteManagedPath) {
+      return mock.deleteManagedPath(path);
+    }
+
+    return invoke<void>("delete_managed_path", { path });
+  },
+
   async openPathInDefaultApp(path: string) {
     const mock = mockApi();
     if (mock?.openPathInDefaultApp) {
@@ -120,12 +222,30 @@ export const desktopApi: DesktopApi = {
     return invoke<void>("open_path_in_default_app", { path });
   },
 
+  async loadPreviewUrl(path: string) {
+    const mock = mockApi();
+    if (mock?.loadPreviewUrl) {
+      return mock.loadPreviewUrl(path);
+    }
+    if (mock?.toPreviewSrc) {
+      return mock.toPreviewSrc(path);
+    }
+
+    if (/^(https?:|blob:|\/)/i.test(path)) {
+      return this.toPreviewSrc(path);
+    }
+
+    const normalized = path.replace(/\\/g, "/");
+    const encoded = await invoke<string>("read_preview_file_base64", { path: normalized });
+    return base64ToBlobUrl(encoded, inferPreviewMimeType(normalized));
+  },
+
   toPreviewSrc(path: string) {
     const mock = mockApi();
     if (mock?.toPreviewSrc) {
       return mock.toPreviewSrc(path);
     }
 
-    return convertFileSrc(path);
+    return convertFileSrc(path.replace(/\\/g, "/"));
   }
 };

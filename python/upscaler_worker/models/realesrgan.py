@@ -8,6 +8,7 @@ from upscaler_worker.model_catalog import (
     model_label,
     model_runtime_name,
 )
+from upscaler_worker.models.pytorch_sr import resolve_precision_mode
 
 
 def build_realesrgan_job_plan(
@@ -29,13 +30,24 @@ def build_realesrgan_job_plan(
     crop_height: float | None,
     preview_mode: bool = False,
     preview_duration_seconds: float | None = None,
+    segment_duration_seconds: float | None = None,
     output_path: str,
     codec: str,
     container: str,
     tile_size: int,
     fp16: bool,
+    bf16: bool = False,
+    precision: str | None = None,
+    torch_compile_enabled: bool = False,
+    torch_compile_mode: str = "reduce-overhead",
+    torch_compile_cudagraphs: bool = False,
+    channels_last: bool = False,
+    pytorch_execution_path: str | None = None,
+    pytorch_runner: str | None = None,
     crf: int,
 ) -> dict[str, object]:
+    precision_mode = resolve_precision_mode(fp16=fp16, bf16=bf16, precision=precision)
+
     ensure_runnable_model(model_id)
     cache_material = "|".join(
         [
@@ -56,11 +68,18 @@ def build_realesrgan_job_plan(
             f"{crop_height or 0:.4f}",
             str(int(preview_mode)),
             str(preview_duration_seconds or 0),
+            str(segment_duration_seconds or 0),
             output_path,
             codec,
             container,
             str(tile_size),
-            str(int(fp16)),
+            precision_mode,
+            str(int(torch_compile_enabled)),
+            torch_compile_mode,
+            str(int(torch_compile_cudagraphs)),
+            str(int(channels_last)),
+            pytorch_execution_path or "auto",
+            pytorch_runner or "torch",
             str(crf),
         ]
     )
@@ -117,8 +136,26 @@ def build_realesrgan_job_plan(
         command.append("--preview-mode")
     if preview_duration_seconds is not None:
         command.extend(["--preview-duration-seconds", str(preview_duration_seconds)])
+    if segment_duration_seconds is not None:
+        command.extend(["--segment-duration-seconds", str(segment_duration_seconds)])
     if fp16:
         command.append("--fp16")
+    if bf16:
+        command.append("--bf16")
+    if precision is not None:
+        command.extend(["--precision", precision_mode])
+    if torch_compile_enabled:
+        command.append("--torch-compile")
+    if torch_compile_mode != "reduce-overhead":
+        command.extend(["--torch-compile-mode", torch_compile_mode])
+    if torch_compile_cudagraphs:
+        command.append("--torch-compile-cudagraphs")
+    if channels_last:
+        command.append("--channels-last")
+    if pytorch_execution_path:
+        command.extend(["--pytorch-execution-path", pytorch_execution_path])
+    if pytorch_runner:
+        command.extend(["--pytorch-runner", pytorch_runner])
 
     notes = [
         "Prepared for the current multi-backend Python pipeline entrypoint.",
@@ -136,13 +173,29 @@ def build_realesrgan_job_plan(
         f"Codec: {codec}",
         f"Container: {container}",
         f"CRF: {crf}",
+        f"Precision: {precision_mode}",
     ]
     if custom_aspect_width and custom_aspect_height:
         notes.append(f"Custom aspect ratio: {custom_aspect_width}:{custom_aspect_height}")
     if preview_mode:
         notes.append(f"Preview mode: {preview_duration_seconds or 8:.1f}s")
-    if fp16:
+    else:
+        notes.append(f"Segment duration: {segment_duration_seconds or 10:.1f}s")
+    if precision_mode == "fp16":
         notes.append("FP16 requested for model paths that support half precision.")
+    if precision_mode == "bf16":
+        notes.append("BF16 requested for model paths that support bfloat16 precision.")
+    if torch_compile_enabled:
+        notes.append("torch.compile requested for PyTorch image SR execution.")
+        notes.append(f"torch.compile mode: {torch_compile_mode}")
+    if torch_compile_cudagraphs:
+        notes.append("torch.compile cudagraphs requested.")
+    if channels_last:
+        notes.append("channels_last memory format requested for PyTorch image SR execution.")
+    if pytorch_execution_path:
+        notes.append(f"PyTorch execution path: {pytorch_execution_path}")
+    if pytorch_runner:
+        notes.append(f"PyTorch runner: {pytorch_runner}")
 
     return {
         "model": model_label(model_id),

@@ -1,10 +1,11 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,6 +17,7 @@ struct RealesrganJobRequest {
     model_id: String,
     output_mode: String,
     quality_preset: String,
+    pytorch_runner: String,
     gpu_id: Option<u32>,
     aspect_ratio_preset: String,
     custom_aspect_width: Option<u32>,
@@ -29,6 +31,7 @@ struct RealesrganJobRequest {
     crop_height: Option<f64>,
     preview_mode: bool,
     preview_duration_seconds: Option<f64>,
+    segment_duration_seconds: Option<f64>,
     output_path: String,
     codec: String,
     container: String,
@@ -101,6 +104,7 @@ struct BlindComparisonSelectionInput {
 #[serde(rename_all = "camelCase")]
 struct SourceVideoSummary {
     path: String,
+    preview_path: String,
     width: u32,
     height: u32,
     duration_seconds: f64,
@@ -134,6 +138,44 @@ struct PipelineProgress {
     upscaled_frames: usize,
     encoded_frames: usize,
     remuxed_frames: usize,
+    #[serde(default)]
+    segment_index: Option<usize>,
+    #[serde(default)]
+    segment_count: Option<usize>,
+    #[serde(default)]
+    segment_processed_frames: Option<usize>,
+    #[serde(default)]
+    segment_total_frames: Option<usize>,
+    #[serde(default)]
+    batch_index: Option<usize>,
+    #[serde(default)]
+    batch_count: Option<usize>,
+    #[serde(default)]
+    elapsed_seconds: Option<f64>,
+    #[serde(default)]
+    average_frames_per_second: Option<f64>,
+    #[serde(default)]
+    rolling_frames_per_second: Option<f64>,
+    #[serde(default)]
+    estimated_remaining_seconds: Option<f64>,
+    #[serde(default)]
+    process_rss_bytes: Option<u64>,
+    #[serde(default)]
+    gpu_memory_used_bytes: Option<u64>,
+    #[serde(default)]
+    gpu_memory_total_bytes: Option<u64>,
+    #[serde(default)]
+    scratch_size_bytes: Option<u64>,
+    #[serde(default)]
+    output_size_bytes: Option<u64>,
+    #[serde(default)]
+    extract_stage_seconds: Option<f64>,
+    #[serde(default)]
+    upscale_stage_seconds: Option<f64>,
+    #[serde(default)]
+    encode_stage_seconds: Option<f64>,
+    #[serde(default)]
+    remux_stage_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,13 +191,73 @@ struct PipelineJobStatus {
 #[derive(Debug, Clone)]
 struct PipelineJobRecord {
     state: String,
+    source_path: String,
     progress_path: PathBuf,
+    cancel_path: PathBuf,
     result: Option<PipelineResult>,
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceConversionJobStatus {
+    job_id: String,
+    state: String,
+    progress: PipelineProgress,
+    result: Option<SourceVideoSummary>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceConversionJobRecord {
+    state: String,
+    source_path: String,
+    progress_path: PathBuf,
+    cancel_path: PathBuf,
+    result: Option<SourceVideoSummary>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PathStats {
+    path: String,
+    exists: bool,
+    is_directory: bool,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScratchStorageSummary {
+    jobs_root: PathStats,
+    converted_sources_root: PathStats,
+    source_previews_root: PathStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedJobSummary {
+    job_id: String,
+    job_kind: String,
+    label: String,
+    state: String,
+    source_path: Option<String>,
+    model_id: Option<String>,
+    codec: Option<String>,
+    container: Option<String>,
+    progress: PipelineProgress,
+    recorded_count: usize,
+    scratch_path: Option<String>,
+    scratch_stats: Option<PathStats>,
+    output_path: Option<String>,
+    output_stats: Option<PathStats>,
+    updated_at: String,
+}
+
 struct AppState {
     jobs: Arc<Mutex<HashMap<String, PipelineJobRecord>>>,
+    source_conversion_jobs: Arc<Mutex<HashMap<String, SourceConversionJobRecord>>>,
 }
 
 fn repo_root() -> PathBuf {
@@ -163,6 +265,26 @@ fn repo_root() -> PathBuf {
         .parent()
         .expect("src-tauri must have a parent repository directory")
         .to_path_buf()
+}
+
+fn artifacts_root() -> PathBuf {
+    repo_root().join("artifacts")
+}
+
+fn jobs_root() -> PathBuf {
+    artifacts_root().join("jobs")
+}
+
+fn converted_sources_root() -> PathBuf {
+    artifacts_root().join("runtime").join("converted-sources")
+}
+
+fn source_previews_root() -> PathBuf {
+    artifacts_root().join("runtime").join("source-previews")
+}
+
+fn managed_job_summary_path(job_id: &str) -> PathBuf {
+    jobs_root().join(format!("job_{job_id}_summary.json"))
 }
 
 fn python_command() -> String {
@@ -242,6 +364,7 @@ fn build_cache_key(request: &RealesrganJobRequest) -> String {
     hasher.update(request.model_id.as_bytes());
     hasher.update(request.output_mode.as_bytes());
     hasher.update(request.quality_preset.as_bytes());
+    hasher.update(request.pytorch_runner.as_bytes());
     hasher.update(request.gpu_id.unwrap_or_default().to_le_bytes());
     hasher.update(request.aspect_ratio_preset.as_bytes());
     hasher.update(request.custom_aspect_width.unwrap_or_default().to_le_bytes());
@@ -255,6 +378,7 @@ fn build_cache_key(request: &RealesrganJobRequest) -> String {
     hasher.update(request.crop_height.unwrap_or_default().to_le_bytes());
     hasher.update([request.preview_mode as u8]);
     hasher.update(request.preview_duration_seconds.unwrap_or_default().to_le_bytes());
+    hasher.update(request.segment_duration_seconds.unwrap_or_default().to_le_bytes());
     hasher.update(request.output_path.as_bytes());
     hasher.update(request.codec.as_bytes());
     hasher.update(request.container.as_bytes());
@@ -275,7 +399,87 @@ fn default_progress(phase: &str, percent: u32, message: &str) -> PipelineProgres
         upscaled_frames: 0,
         encoded_frames: 0,
         remuxed_frames: 0,
+        segment_index: None,
+        segment_count: None,
+        segment_processed_frames: None,
+        segment_total_frames: None,
+        batch_index: None,
+        batch_count: None,
+        elapsed_seconds: None,
+        average_frames_per_second: None,
+        rolling_frames_per_second: None,
+        estimated_remaining_seconds: None,
+        process_rss_bytes: None,
+        gpu_memory_used_bytes: None,
+        gpu_memory_total_bytes: None,
+        scratch_size_bytes: None,
+        output_size_bytes: None,
+        extract_stage_seconds: None,
+        upscale_stage_seconds: None,
+        encode_stage_seconds: None,
+        remux_stage_seconds: None,
     }
+}
+
+fn write_cancel_signal(cancel_path: &PathBuf, message: &str) -> Result<(), String> {
+    if let Some(parent) = cancel_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create cancel directory {}: {error}", parent.display()))?;
+    }
+    fs::write(cancel_path, message)
+        .map_err(|error| format!("Failed to write cancel signal at {}: {error}", cancel_path.display()))
+}
+
+fn path_size_bytes(path: &Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
+
+    if path.is_file() {
+        return fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0);
+    }
+
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .map(|entry| path_size_bytes(&entry.path()))
+        .sum()
+}
+
+fn collect_path_stats(path: &Path) -> PathStats {
+    PathStats {
+        path: path.display().to_string(),
+        exists: path.exists(),
+        is_directory: path.is_dir(),
+        size_bytes: path_size_bytes(path),
+    }
+}
+
+fn canonicalize_for_management(requested_path: &str) -> Result<PathBuf, String> {
+    if requested_path.trim().is_empty() {
+        return Err("Path cannot be empty".to_string());
+    }
+
+    let candidate = PathBuf::from(requested_path);
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        repo_root().join(candidate)
+    };
+
+    let artifacts = artifacts_root()
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve artifacts root: {error}"))?;
+    let canonical = resolved
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve managed path {}: {error}", resolved.display()))?;
+
+    if !canonical.starts_with(&artifacts) {
+        return Err(format!("Refusing to manage path outside app artifacts: {}", canonical.display()));
+    }
+
+    Ok(canonical)
 }
 
 fn read_progress(progress_path: &PathBuf, fallback: &PipelineProgress) -> PipelineProgress {
@@ -283,6 +487,148 @@ fn read_progress(progress_path: &PathBuf, fallback: &PipelineProgress) -> Pipeli
         Ok(content) => serde_json::from_str::<PipelineProgress>(&content).unwrap_or_else(|_| fallback.clone()),
         Err(_) => fallback.clone(),
     }
+}
+
+fn path_modified_timestamp(path: &Path) -> String {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(timestamp_string)
+}
+
+fn build_managed_job_summary(
+    job_id: &str,
+    job_kind: &str,
+    label: &str,
+    state: &str,
+    source_path: Option<&Path>,
+    model_id: Option<&str>,
+    codec: Option<&str>,
+    container: Option<&str>,
+    progress_path: &PathBuf,
+    scratch_path: Option<&Path>,
+    output_path: Option<&Path>,
+) -> ManagedJobSummary {
+    let fallback = match state {
+        "queued" => default_progress("queued", 0, "Job queued"),
+        "running" => default_progress("queued", 0, "Job running"),
+        "succeeded" => default_progress("completed", 100, "Job completed"),
+        "cancelled" => default_progress("failed", 100, "Job cancelled"),
+        "failed" => default_progress("failed", 100, "Job failed"),
+        _ => default_progress("queued", 0, "Job recorded"),
+    };
+    let progress = read_progress(progress_path, &fallback);
+    let scratch_stats = scratch_path.map(collect_path_stats);
+    let output_stats = output_path.map(collect_path_stats);
+
+    ManagedJobSummary {
+        job_id: job_id.to_string(),
+        job_kind: job_kind.to_string(),
+        label: label.to_string(),
+        state: state.to_string(),
+        source_path: source_path.map(|path| path.display().to_string()),
+        model_id: model_id.map(|value| value.to_string()),
+        codec: codec.map(|value| value.to_string()),
+        container: container.map(|value| value.to_string()),
+        recorded_count: progress.total_frames,
+        progress,
+        scratch_path: scratch_path.map(|path| path.display().to_string()),
+        scratch_stats,
+        output_path: output_path.map(|path| path.display().to_string()),
+        output_stats,
+        updated_at: path_modified_timestamp(progress_path),
+    }
+}
+
+fn write_managed_job_summary(summary: &ManagedJobSummary) -> Result<(), String> {
+    fs::create_dir_all(jobs_root())
+        .map_err(|error| format!("Failed to create jobs directory {}: {error}", jobs_root().display()))?;
+    let payload = serde_json::to_string_pretty(summary)
+        .map_err(|error| format!("Failed to serialize managed job summary: {error}"))?;
+    let target = managed_job_summary_path(&summary.job_id);
+    fs::write(&target, payload)
+        .map_err(|error| format!("Failed to write managed job summary {}: {error}", target.display()))
+}
+
+fn read_managed_job_summaries() -> Result<Vec<ManagedJobSummary>, String> {
+    let root = jobs_root();
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let entries = fs::read_dir(&root)
+        .map_err(|error| format!("Failed to read jobs directory {}: {error}", root.display()))?;
+    let mut summaries = Vec::new();
+    let mut seen_job_ids = HashSet::new();
+    let mut legacy_progress = Vec::new();
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+
+        if file_name.ends_with("_summary.json") {
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(summary) = serde_json::from_str::<ManagedJobSummary>(&content) {
+                    seen_job_ids.insert(summary.job_id.clone());
+                    summaries.push(summary);
+                }
+            }
+            continue;
+        }
+
+        if file_name.starts_with("job_") && file_name.ends_with("_progress.json") {
+            legacy_progress.push(path);
+        }
+    }
+
+    for progress_path in legacy_progress {
+        let Some(file_name) = progress_path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(job_id) = file_name
+            .strip_prefix("job_")
+            .and_then(|value| value.strip_suffix("_progress.json"))
+        else {
+            continue;
+        };
+
+        if seen_job_ids.contains(job_id) {
+            continue;
+        }
+
+        let is_conversion = job_id.starts_with("conv_");
+        let scratch_path = if is_conversion {
+            None
+        } else {
+            Some(jobs_root().join(format!("job_{job_id}")))
+        };
+        summaries.push(build_managed_job_summary(
+            job_id,
+            if is_conversion { "sourceConversion" } else { "pipeline" },
+            if is_conversion { "Source Conversion" } else { "Upscale Job" },
+            "succeeded",
+            None,
+            None,
+            None,
+            None,
+            &progress_path,
+            scratch_path.as_deref(),
+            None,
+        ));
+    }
+
+    summaries.sort_by(|left, right| {
+        right
+            .updated_at
+            .parse::<u64>()
+            .unwrap_or(0)
+            .cmp(&left.updated_at.parse::<u64>().unwrap_or(0))
+    });
+    Ok(summaries)
 }
 
 fn model_label(model_id: &str) -> &str {
@@ -312,6 +658,8 @@ fn prepare_realesrgan_job(request: RealesrganJobRequest) -> RealesrganJobPlan {
         request.output_mode.clone(),
         "--preset".to_string(),
         request.quality_preset.clone(),
+        "--pytorch-runner".to_string(),
+        request.pytorch_runner.clone(),
         "--gpu-id".to_string(),
         request.gpu_id.unwrap_or_default().to_string(),
         "--aspect-ratio-preset".to_string(),
@@ -379,6 +727,11 @@ fn prepare_realesrgan_job(request: RealesrganJobRequest) -> RealesrganJobPlan {
         command.push(preview_duration_seconds.to_string());
     }
 
+    if let Some(segment_duration_seconds) = request.segment_duration_seconds {
+        command.push("--segment-duration-seconds".to_string());
+        command.push(segment_duration_seconds.to_string());
+    }
+
     if request.fp16 {
         command.push("--fp16".to_string());
     }
@@ -408,6 +761,181 @@ fn ensure_runtime_assets() -> Result<RuntimeStatus, String> {
 fn probe_source_video(source_path: String) -> Result<SourceVideoSummary, String> {
     let value = run_python_json(&["probe-video", "--source", &source_path])?;
     serde_json::from_value(value).map_err(|error| format!("Failed to deserialize source metadata: {error}"))
+}
+
+#[tauri::command]
+fn start_source_conversion_to_mp4(state: tauri::State<AppState>, source_path: String) -> Result<String, String> {
+    let job_id = format!(
+        "conv_{}",
+        &Sha256::digest(source_path.as_bytes())
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect::<String>()[..12]
+    );
+    let progress_path = jobs_root().join(format!("job_{job_id}_progress.json"));
+    let cancel_path = jobs_root().join(format!("job_{job_id}_cancel.signal"));
+    let _ = fs::remove_file(&cancel_path);
+
+    {
+        let mut jobs = state
+            .source_conversion_jobs
+            .lock()
+            .map_err(|_| "Failed to lock source conversion job store".to_string())?;
+        jobs.insert(
+            job_id.clone(),
+            SourceConversionJobRecord {
+                state: "queued".to_string(),
+                source_path: source_path.clone(),
+                progress_path: progress_path.clone(),
+                cancel_path: cancel_path.clone(),
+                result: None,
+                error: None,
+            },
+        );
+    }
+
+    let jobs = Arc::clone(&state.source_conversion_jobs);
+    let job_id_for_thread = job_id.clone();
+    std::thread::spawn(move || {
+        if let Ok(mut job_store) = jobs.lock() {
+            if let Some(record) = job_store.get_mut(&job_id_for_thread) {
+                record.state = "running".to_string();
+            }
+        }
+
+        let run_result = run_python_json(&[
+            "convert-source-to-mp4",
+            "--source",
+            &source_path,
+            "--progress-path",
+            &progress_path.display().to_string(),
+            "--cancel-path",
+            &cancel_path.display().to_string(),
+        ])
+        .and_then(|value| {
+            serde_json::from_value::<SourceVideoSummary>(value)
+                .map_err(|error| format!("Failed to deserialize converted source metadata: {error}"))
+        });
+
+        if let Ok(mut job_store) = jobs.lock() {
+            if let Some(record) = job_store.get_mut(&job_id_for_thread) {
+                match run_result {
+                    Ok(result) => {
+                        record.state = "succeeded".to_string();
+                        record.result = Some(result);
+                        record.error = None;
+                    }
+                    Err(error) => {
+                        let was_cancelled = record.cancel_path.exists();
+                        record.state = if was_cancelled { "cancelled".to_string() } else { "failed".to_string() };
+                        record.result = None;
+                        record.error = Some(if was_cancelled { "Job cancelled by user".to_string() } else { error.clone() });
+                        let _ = fs::write(
+                            &record.progress_path,
+                            serde_json::to_string(&PipelineProgress {
+                                phase: "failed".to_string(),
+                                percent: 100,
+                                message: if was_cancelled { "Job cancelled by user".to_string() } else { error },
+                                processed_frames: 0,
+                                total_frames: 0,
+                                extracted_frames: 0,
+                                upscaled_frames: 0,
+                                encoded_frames: 0,
+                                remuxed_frames: 0,
+                                segment_index: None,
+                                segment_count: None,
+                                segment_processed_frames: None,
+                                segment_total_frames: None,
+                                batch_index: None,
+                                batch_count: None,
+                                elapsed_seconds: None,
+                                average_frames_per_second: None,
+                                rolling_frames_per_second: None,
+                                estimated_remaining_seconds: None,
+                                process_rss_bytes: None,
+                                gpu_memory_used_bytes: None,
+                                gpu_memory_total_bytes: None,
+                                scratch_size_bytes: None,
+                                output_size_bytes: None,
+                                extract_stage_seconds: None,
+                                upscale_stage_seconds: None,
+                                encode_stage_seconds: None,
+                                remux_stage_seconds: None,
+                            })
+                            .unwrap_or_else(|_| "{}".to_string()),
+                        );
+                    }
+                }
+
+                let summary = build_managed_job_summary(
+                    &job_id_for_thread,
+                    "sourceConversion",
+                    "Source Conversion",
+                    &record.state,
+                    Some(Path::new(&record.source_path)),
+                    None,
+                    None,
+                    record.result.as_ref().map(|value| value.container.as_str()),
+                    &record.progress_path,
+                    None,
+                    record.result.as_ref().map(|value| Path::new(&value.path)),
+                );
+                let _ = write_managed_job_summary(&summary);
+            }
+        }
+    });
+
+    Ok(job_id)
+}
+
+#[tauri::command]
+fn get_source_conversion_job(state: tauri::State<AppState>, job_id: String) -> Result<SourceConversionJobStatus, String> {
+    let jobs = state
+        .source_conversion_jobs
+        .lock()
+        .map_err(|_| "Failed to lock source conversion job store".to_string())?;
+    let record = jobs
+        .get(&job_id)
+        .cloned()
+        .ok_or_else(|| format!("Unknown source conversion job: {job_id}"))?;
+    drop(jobs);
+
+    let fallback = match record.state.as_str() {
+        "queued" => default_progress("queued", 0, "Conversion queued"),
+        "running" => default_progress("encoding", 0, "Preparing source conversion"),
+        "succeeded" => default_progress("completed", 100, "Source conversion completed"),
+        "cancelled" => default_progress("failed", 100, "Source conversion cancelled"),
+        "failed" => default_progress("failed", 100, record.error.as_deref().unwrap_or("Source conversion failed")),
+        _ => default_progress("queued", 0, "Preparing source conversion"),
+    };
+    let progress = read_progress(&record.progress_path, &fallback);
+
+    Ok(SourceConversionJobStatus {
+        job_id,
+        state: record.state,
+        progress,
+        result: record.result,
+        error: record.error,
+    })
+}
+
+#[tauri::command]
+fn cancel_source_conversion_job(state: tauri::State<AppState>, job_id: String) -> Result<(), String> {
+    let mut jobs = state
+        .source_conversion_jobs
+        .lock()
+        .map_err(|_| "Failed to lock source conversion job store".to_string())?;
+    let record = jobs
+        .get_mut(&job_id)
+        .ok_or_else(|| format!("Unknown source conversion job: {job_id}"))?;
+
+    if matches!(record.state.as_str(), "succeeded" | "failed" | "cancelled") {
+        return Ok(());
+    }
+
+    write_cancel_signal(&record.cancel_path, "cancelled")?;
+    record.error = Some("Job cancellation requested".to_string());
+    Ok(())
 }
 
 #[tauri::command]
@@ -470,10 +998,9 @@ fn record_blind_comparison_selection(selection: BlindComparisonSelectionInput) -
 #[tauri::command]
 fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJobRequest) -> Result<String, String> {
     let job_id = build_cache_key(&request)[..12].to_string();
-    let progress_path = repo_root()
-        .join("artifacts")
-        .join("jobs")
-        .join(format!("job_{job_id}_progress.json"));
+    let progress_path = jobs_root().join(format!("job_{job_id}_progress.json"));
+    let cancel_path = jobs_root().join(format!("job_{job_id}_cancel.signal"));
+    let _ = fs::remove_file(&cancel_path);
 
     {
         let mut jobs = state.jobs.lock().map_err(|_| "Failed to lock pipeline job store".to_string())?;
@@ -481,7 +1008,9 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
             job_id.clone(),
             PipelineJobRecord {
                 state: "queued".to_string(),
+                source_path: request.source_path.clone(),
                 progress_path: progress_path.clone(),
+                cancel_path: cancel_path.clone(),
                 result: None,
                 error: None,
             },
@@ -498,6 +1027,8 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
         request.output_mode.clone(),
         "--preset".to_string(),
         request.quality_preset.clone(),
+        "--pytorch-runner".to_string(),
+        request.pytorch_runner.clone(),
         "--gpu-id".to_string(),
         request.gpu_id.unwrap_or_default().to_string(),
         "--aspect-ratio-preset".to_string(),
@@ -558,6 +1089,8 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
 
     owned_args.push("--progress-path".to_string());
     owned_args.push(progress_path.display().to_string());
+    owned_args.push("--cancel-path".to_string());
+    owned_args.push(cancel_path.display().to_string());
 
     if request.preview_mode {
         owned_args.push("--preview-mode".to_string());
@@ -568,16 +1101,24 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
         owned_args.push(preview_duration_seconds.to_string());
     }
 
+    if let Some(segment_duration_seconds) = request.segment_duration_seconds {
+        owned_args.push("--segment-duration-seconds".to_string());
+        owned_args.push(segment_duration_seconds.to_string());
+    }
+
     if request.fp16 {
         owned_args.push("--fp16".to_string());
     }
 
     if request.gpu_id.is_none() {
-        owned_args.drain(8..10);
+        owned_args.drain(11..13);
     }
 
     let owned_args_for_thread = owned_args;
     let job_id_for_thread = job_id.clone();
+    let model_id_for_summary = request.model_id.clone();
+    let codec_for_summary = request.codec.clone();
+    let container_for_summary = request.container.clone();
     let jobs = Arc::clone(&state.jobs);
 
     std::thread::spawn(move || {
@@ -600,26 +1141,67 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
                         record.error = None;
                     }
                     Err(error) => {
-                        record.state = "failed".to_string();
+                        let was_cancelled = record.cancel_path.exists();
+                        record.state = if was_cancelled { "cancelled".to_string() } else { "failed".to_string() };
                         record.result = None;
-                        record.error = Some(error.clone());
+                        record.error = Some(if was_cancelled { "Job cancelled by user".to_string() } else { error.clone() });
                         let _ = fs::write(
                             &record.progress_path,
                             serde_json::to_string(&PipelineProgress {
                                 phase: "failed".to_string(),
                                 percent: 100,
-                                message: error,
+                                message: if was_cancelled { "Job cancelled by user".to_string() } else { error },
                                 processed_frames: 0,
                                 total_frames: 0,
                                 extracted_frames: 0,
                                 upscaled_frames: 0,
                                 encoded_frames: 0,
                                 remuxed_frames: 0,
+                                segment_index: None,
+                                segment_count: None,
+                                segment_processed_frames: None,
+                                segment_total_frames: None,
+                                batch_index: None,
+                                batch_count: None,
+                                elapsed_seconds: None,
+                                average_frames_per_second: None,
+                                rolling_frames_per_second: None,
+                                estimated_remaining_seconds: None,
+                                process_rss_bytes: None,
+                                gpu_memory_used_bytes: None,
+                                gpu_memory_total_bytes: None,
+                                scratch_size_bytes: None,
+                                output_size_bytes: None,
+                                extract_stage_seconds: None,
+                                upscale_stage_seconds: None,
+                                encode_stage_seconds: None,
+                                remux_stage_seconds: None,
                             })
                             .unwrap_or_else(|_| "{}".to_string()),
                         );
                     }
                 }
+
+                let scratch_dir = jobs_root().join(format!("job_{job_id_for_thread}"));
+                let summary_scratch_path = record
+                    .result
+                    .as_ref()
+                    .map(|value| PathBuf::from(&value.work_dir))
+                    .unwrap_or(scratch_dir);
+                let summary = build_managed_job_summary(
+                    &job_id_for_thread,
+                    "pipeline",
+                    if record.result.is_some() { "Upscale Export" } else { "Upscale Job" },
+                    &record.state,
+                    Some(Path::new(&record.source_path)),
+                    Some(&model_id_for_summary),
+                    Some(&codec_for_summary),
+                    Some(&container_for_summary),
+                    &record.progress_path,
+                    Some(summary_scratch_path.as_path()),
+                    record.result.as_ref().map(|value| Path::new(&value.output_path)),
+                );
+                let _ = write_managed_job_summary(&summary);
             }
         }
     });
@@ -637,6 +1219,7 @@ fn get_realesrgan_pipeline_job(state: tauri::State<AppState>, job_id: String) ->
         "queued" => default_progress("queued", 0, "Job queued"),
         "running" => default_progress("queued", 0, "Preparing pipeline"),
         "succeeded" => default_progress("completed", 100, "Pipeline completed"),
+        "cancelled" => default_progress("failed", 100, "Pipeline cancelled"),
         "failed" => default_progress("failed", 100, record.error.as_deref().unwrap_or("Pipeline failed")),
         _ => default_progress("queued", 0, "Preparing pipeline"),
     };
@@ -652,8 +1235,89 @@ fn get_realesrgan_pipeline_job(state: tauri::State<AppState>, job_id: String) ->
 }
 
 #[tauri::command]
+fn cancel_realesrgan_pipeline_job(state: tauri::State<AppState>, job_id: String) -> Result<(), String> {
+    let mut jobs = state.jobs.lock().map_err(|_| "Failed to lock pipeline job store".to_string())?;
+    let record = jobs.get_mut(&job_id).ok_or_else(|| format!("Unknown pipeline job: {job_id}"))?;
+
+    if matches!(record.state.as_str(), "succeeded" | "failed" | "cancelled") {
+        return Ok(());
+    }
+
+    write_cancel_signal(&record.cancel_path, "cancelled")?;
+    record.error = Some("Job cancellation requested".to_string());
+    Ok(())
+}
+
+#[tauri::command]
+fn get_path_stats(path: String) -> Result<PathStats, String> {
+    if path.trim().is_empty() {
+        return Err("Path cannot be empty".to_string());
+    }
+
+    let candidate = PathBuf::from(&path);
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        repo_root().join(candidate)
+    };
+
+    Ok(collect_path_stats(&resolved))
+}
+
+#[tauri::command]
+fn get_scratch_storage_summary() -> ScratchStorageSummary {
+    ScratchStorageSummary {
+        jobs_root: collect_path_stats(&jobs_root()),
+        converted_sources_root: collect_path_stats(&converted_sources_root()),
+        source_previews_root: collect_path_stats(&source_previews_root()),
+    }
+}
+
+#[tauri::command]
+fn list_managed_jobs() -> Result<Vec<ManagedJobSummary>, String> {
+    read_managed_job_summaries()
+}
+
+#[tauri::command]
+fn delete_managed_path(path: String) -> Result<(), String> {
+    let canonical = canonicalize_for_management(&path)?;
+    if canonical.is_dir() {
+        fs::remove_dir_all(&canonical)
+            .map_err(|error| format!("Failed to delete directory {}: {error}", canonical.display()))?;
+    } else if canonical.is_file() {
+        fs::remove_file(&canonical)
+            .map_err(|error| format!("Failed to delete file {}: {error}", canonical.display()))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 fn open_path_in_default_app(path: String) -> Result<(), String> {
-    open::that(path).map_err(|error| format!("Failed to open media in the default app: {error}"))
+    if path.trim().is_empty() {
+        return Err("Cannot open an empty path".to_string());
+    }
+
+    let requested_path = PathBuf::from(&path);
+    let resolved_path = if requested_path.is_absolute() {
+        requested_path
+    } else {
+        repo_root().join(requested_path)
+    };
+
+    open::that(&resolved_path).map_err(|error| {
+        format!(
+            "Failed to open media in the default app: {} ({})",
+            error,
+            resolved_path.display()
+        )
+    })
+}
+
+#[tauri::command]
+fn read_preview_file_base64(path: String) -> Result<String, String> {
+    let bytes = fs::read(&path).map_err(|error| format!("Failed to read preview file {}: {error}", path))?;
+    Ok(STANDARD.encode(bytes))
 }
 
 #[tauri::command]
@@ -670,18 +1334,28 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState {
             jobs: Arc::new(Mutex::new(HashMap::new())),
+            source_conversion_jobs: Arc::new(Mutex::new(HashMap::new())),
         })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             prepare_realesrgan_job,
             ensure_runtime_assets,
             probe_source_video,
+            start_source_conversion_to_mp4,
+            get_source_conversion_job,
+            cancel_source_conversion_job,
             get_app_config,
             save_model_rating,
             record_blind_comparison_selection,
             start_realesrgan_pipeline,
             get_realesrgan_pipeline_job,
+            cancel_realesrgan_pipeline_job,
+            get_path_stats,
+            get_scratch_storage_summary,
+            list_managed_jobs,
+            delete_managed_path,
             open_path_in_default_app,
+            read_preview_file_base64,
             scaffold_status
         ])
         .run(tauri::generate_context!())

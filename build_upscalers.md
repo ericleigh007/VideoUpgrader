@@ -10,7 +10,7 @@ It is intentionally separate from AGENTS.md.
 - Node.js 20 or newer
 - npm
 - Cargo and the Rust toolchain
-- Python 3.10 or newer in a virtual environment or available via an explicit environment variable
+- Python 3.10 or newer in a virtual environment which is in the .venv directory under the project directory.
 - FFmpeg available on PATH for future media execution work
 
 Preferred Python variable:
