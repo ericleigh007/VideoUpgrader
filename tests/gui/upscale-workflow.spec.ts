@@ -77,6 +77,7 @@ test.beforeEach(async ({ page }) => {
             totalFrames: 55000,
             extractedFrames: 0,
             upscaledFrames: 0,
+            interpolatedFrames: 0,
             encodedFrames: 0,
             remuxedFrames: 0
           },
@@ -147,6 +148,7 @@ test.beforeEach(async ({ page }) => {
               totalFrames: 1200,
               extractedFrames: 1200,
               upscaledFrames: 1200,
+              interpolatedFrames: 0,
               encodedFrames: 1200,
               remuxedFrames: 1200,
               elapsedSeconds: 80,
@@ -160,6 +162,7 @@ test.beforeEach(async ({ page }) => {
               outputSizeBytes: 1024 * 1024 * 18,
               extractStageSeconds: 6,
               upscaleStageSeconds: 52,
+              interpolateStageSeconds: 0,
               encodeStageSeconds: 15,
               remuxStageSeconds: 7
             },
@@ -197,6 +200,7 @@ test.beforeEach(async ({ page }) => {
               totalFrames: 55000,
               extractedFrames: 0,
               upscaledFrames: 0,
+              interpolatedFrames: 0,
               encodedFrames: 0,
               remuxedFrames: 0
             },
@@ -251,6 +255,12 @@ test.beforeEach(async ({ page }) => {
         if (request.previewMode === false && request.segmentDurationSeconds !== 10) {
           throw new Error(`Expected export chunk duration 10, received ${request.segmentDurationSeconds}`);
         }
+        if (!["off", "afterUpscale", "interpolateOnly"].includes(request.interpolationMode)) {
+          throw new Error(`Expected a valid interpolation mode, received ${request.interpolationMode}`);
+        }
+        if (request.interpolationMode === "off" && request.interpolationTargetFps !== null) {
+          throw new Error(`Expected null interpolation target when interpolation is off, received ${request.interpolationTargetFps}`);
+        }
         if (![
           "realesrgan-x4plus",
           "realesrnet-x4plus",
@@ -271,6 +281,7 @@ test.beforeEach(async ({ page }) => {
             totalFrames: 300,
             extractedFrames: 300,
             upscaledFrames: 180,
+            interpolatedFrames: 0,
             encodedFrames: 0,
             remuxedFrames: 0,
             segmentIndex: 1,
@@ -290,6 +301,7 @@ test.beforeEach(async ({ page }) => {
             outputSizeBytes: 1024 * 1024 * 3,
             extractStageSeconds: 4,
             upscaleStageSeconds: 18,
+            interpolateStageSeconds: 0,
             encodeStageSeconds: 5,
             remuxStageSeconds: 3
           },
@@ -338,6 +350,7 @@ test.beforeEach(async ({ page }) => {
             totalFrames: 300,
             extractedFrames: 300,
             upscaledFrames: 300,
+            interpolatedFrames: 0,
             encodedFrames: 300,
             remuxedFrames: 300
           }
@@ -428,6 +441,11 @@ test("plays a real preview fixture through the GUI controls", async ({ page }) =
 test("selects a source, previews it, chooses output, and runs the workflow", async ({ page }) => {
   await page.goto("/");
 
+  await expect(page.getByRole("heading", { name: "VideoUpgrader" })).toBeVisible();
+  await expect(page.getByTestId("upscaler-section-card")).toContainText("Spatial detail pipeline");
+  await expect(page.getByTestId("interpolator-section-card")).toContainText("Motion interpolation workspace");
+  await expect(page.getByTestId("frame-rate-workspace-section")).toContainText("Interpolation Workspace");
+
   await page.evaluate(() => {
     Object.defineProperty(HTMLMediaElement.prototype, "paused", {
       configurable: true,
@@ -497,9 +515,10 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
   await page.getByTestId("source-preview-play-toggle").click();
   await expect(page.getByTestId("source-preview")).toHaveJSProperty("paused", true);
   await expect(page.locator('[data-testid="model-select"] optgroup[label="Available Now"] option')).toHaveCount(4);
-  await expect(page.locator('[data-testid="model-select"] optgroup[label="Planned"] option')).toHaveCount(2);
-  await expect(page.locator('[data-testid="model-select"] option[disabled]')).toHaveCount(2);
+  await expect(page.locator('[data-testid="model-select"] optgroup[label="Planned"] option')).toHaveCount(3);
+  await expect(page.locator('[data-testid="model-select"] option[disabled]')).toHaveCount(3);
   await expect(page.locator('[data-testid="model-select"] option[value="hat-realhat-gan-x4"]')).toContainText("not implemented");
+  await expect(page.locator('[data-testid="model-select"] option[value="rife-v4.6"]')).toContainText("not implemented");
   await expect(page.getByTestId("target-model-set-card")).toHaveCount(0);
   await expect(page.getByTestId("selected-model-label")).toContainText("Real-ESRGAN x4 Plus");
   await expect(page.getByTestId("selected-model-summary")).toContainText("photographic");
@@ -594,6 +613,9 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
 
   await page.getByTestId("container-select").selectOption("mkv");
   await page.getByTestId("codec-select").selectOption("h265");
+  await page.getByTestId("frame-rate-mode-select").selectOption("afterUpscale");
+  await page.getByTestId("frame-rate-target-select").selectOption("60");
+  await expect(page.getByTestId("interpolation-workspace-summary")).toContainText("Post-upscale interpolation");
   await page.getByTestId("preview-mode-checkbox").check();
   await page.getByTestId("preview-duration-input").fill("8");
   await page.getByTestId("save-output-button").click();
@@ -637,6 +659,10 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
   await expect(page.getByText("Original audio remuxed")).toBeVisible();
   await expect(page.getByTestId("result-preview")).toBeVisible();
   await expect(page.getByText("Blind Picks Logged")).toBeVisible();
+
+  const { lastRequest: workflowRequest } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+  expect(workflowRequest?.interpolationMode).toBe("afterUpscale");
+  expect(workflowRequest?.interpolationTargetFps).toBe(60);
 });
 
 test("shows the PyTorch runner selector only for PyTorch image SR models and passes the selection through", async ({ page }) => {
@@ -664,6 +690,40 @@ test("shows the PyTorch runner selector only for PyTorch image SR models and pas
   const { lastRequest } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
   expect(lastRequest?.modelId).toBe("swinir-realworld-x4");
   expect(lastRequest?.pytorchRunner).toBe("tensorrt");
+  expect(lastRequest?.interpolationMode).toBe("off");
+  expect(lastRequest?.interpolationTargetFps).toBeNull();
+});
+
+test("warns per job when the interpolation target is not higher than the source frame rate", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    if (!window.__UPSCALER_MOCK__) {
+      return;
+    }
+
+    window.__UPSCALER_MOCK__.probeSourceVideo = async (sourcePath) => ({
+      path: sourcePath,
+      previewPath: "C:/fixtures/sample-input-preview.mp4",
+      width: 1280,
+      height: 720,
+      durationSeconds: 12.5,
+      frameRate: 30,
+      hasAudio: true,
+      container: "mp4"
+    });
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await page.getByTestId("frame-rate-mode-select").selectOption("interpolateOnly");
+  await page.getByTestId("frame-rate-target-select").selectOption("30");
+  await page.getByTestId("run-upscale-button").click();
+
+  const { confirmMessages, lastRequest } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+  expect(confirmMessages).toHaveLength(1);
+  expect(confirmMessages[0]).toContain("selected interpolation target of 30 fps is not higher");
+  expect(lastRequest?.interpolationMode).toBe("interpolateOnly");
+  expect(lastRequest?.interpolationTargetFps).toBe(30);
 });
 
 test("shows not-implemented models in the selector and blocks export when one becomes current", async ({ page }) => {

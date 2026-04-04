@@ -545,6 +545,42 @@ input {
   margin-bottom: 16px;
 }
 
+.workflow-track-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.workflow-track-card,
+.workflow-section {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid rgba(116, 49, 24, 0.12);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.48);
+}
+
+.workflow-track-card-active {
+  border-color: rgba(176, 74, 47, 0.38);
+  box-shadow: inset 0 0 0 1px rgba(176, 74, 47, 0.12);
+}
+
+.workflow-section-planned {
+  background: rgba(116, 49, 24, 0.05);
+}
+
+.workflow-track-header,
+.workflow-section-heading {
+  display: grid;
+  gap: 6px;
+}
+
+.workflow-section-heading h3 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
 .catalog-card-header,
 .blind-sample-header {
   display: flex;
@@ -1061,6 +1097,7 @@ input {
 
   .dual-field-grid,
   .path-picker-row,
+  .workflow-track-grid,
   .comparison-grid,
   .phase-progress-grid,
   .progress-stat-grid,

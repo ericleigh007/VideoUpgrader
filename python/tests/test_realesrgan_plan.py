@@ -10,6 +10,8 @@ class RealesrganPlanTests(unittest.TestCase):
             model_id="realesrgan-x4plus",
             output_mode="preserveAspect4k",
             preset="qualityBalanced",
+            interpolation_mode="afterUpscale",
+            interpolation_target_fps=60,
             gpu_id=1,
             aspect_ratio_preset="1:1",
             custom_aspect_width=None,
@@ -42,6 +44,10 @@ class RealesrganPlanTests(unittest.TestCase):
         self.assertIn("--tile-size", plan["command"])
         self.assertIn("--segment-duration-seconds", plan["command"])
         self.assertIn("20", plan["command"])
+        self.assertIn("--interpolation-mode", plan["command"])
+        self.assertIn("afterUpscale", plan["command"])
+        self.assertIn("--interpolation-target-fps", plan["command"])
+        self.assertIn("60", plan["command"])
         self.assertIn("--precision", plan["command"])
         self.assertIn("bf16", plan["command"])
         self.assertIn("--torch-compile", plan["command"])
@@ -55,6 +61,8 @@ class RealesrganPlanTests(unittest.TestCase):
         self.assertIn("Aspect ratio: 1:1", plan["notes"])
         self.assertIn("Target width: 2048", plan["notes"])
         self.assertIn("Crop rect: 0.10, 0.20, 0.75, 0.75", plan["notes"])
+        self.assertIn("Interpolation mode: afterUpscale", plan["notes"])
+        self.assertIn("Interpolation target fps: 60", plan["notes"])
         self.assertIn("Segment duration: 20.0s", plan["notes"])
         self.assertIn("Codec: h264", plan["notes"])
         self.assertIn("Precision: bf16", plan["notes"])

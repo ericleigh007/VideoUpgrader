@@ -2,9 +2,12 @@ import { Fragment, useEffect, useRef, useState, type MouseEvent as ReactMouseEve
 import { desktopApi } from "./lib/desktopApi";
 import { getBackendDefinition, getBlindComparisonModels, getModelDefinition, getUiModels } from "./lib/catalog";
 import { defaultCropRect, planOutputFraming, resolveAspectRatio, resolveCropRect, type NormalizedCropRect } from "./lib/framing";
+import { buildInterpolationRunLabel, buildInterpolationWarning, interpolationModes, interpolationTargetFpsOptions, isInterpolationEnabled } from "./lib/interpolation";
 import type {
   AppConfig,
   AspectRatioPreset,
+  InterpolationMode,
+  InterpolationTargetFps,
   ManagedJobSummary,
   ModelId,
   OutputContainer,
@@ -57,6 +60,9 @@ const pytorchRunners: Array<{ value: PytorchRunner; label: string }> = [
   { value: "tensorrt", label: "TensorRT" }
 ];
 
+const APP_NAME = "VideoUpgrader";
+const MOTION_SECTION_NAME = "Frame Rate Booster";
+const OUTPUT_ROOT = "artifacts/video-upgrader/outputs";
 function recommendedPytorchRunner(modelId: ModelId): PytorchRunner {
   const model = getModelDefinition(modelId);
   if (model.backendId === "pytorch-image-sr" && model.value === "swinir-realworld-x4") {
@@ -159,9 +165,9 @@ interface ProgressEventEntry {
 type CleanupJobFilter = "all" | "running" | "succeeded" | "cancelled" | "failed";
 type CleanupJobSort = "largest" | "newest" | "oldest";
 
-const CLEANUP_FILTER_STORAGE_KEY = "upscaler.cleanup.filter";
-const CLEANUP_SEARCH_STORAGE_KEY = "upscaler.cleanup.search";
-const CLEANUP_SORT_STORAGE_KEY = "upscaler.cleanup.sort";
+const CLEANUP_FILTER_STORAGE_KEY = "videoupgrader.cleanup.filter";
+const CLEANUP_SEARCH_STORAGE_KEY = "videoupgrader.cleanup.search";
+const CLEANUP_SORT_STORAGE_KEY = "videoupgrader.cleanup.sort";
 const EMBEDDED_PREVIEW_COMPATIBLE_CONTAINERS = new Set(["mp4"]);
 const AUTO_PREVIEW_UPGRADE_MAX_DURATION_SECONDS = 300;
 
@@ -217,9 +223,9 @@ function normalizeOutputPath(path: string, container: OutputContainer): string {
 }
 
 function defaultOutputPath(source: SourceVideoSummary | null, container: OutputContainer, modelId: ModelId): string {
-  const stem = source?.path.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") ?? "upscaled_output";
+  const stem = source?.path.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") ?? "video_upgrader_output";
   const modelStem = modelId.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
-  return `artifacts/outputs/${stem}_${modelStem}.${container}`;
+  return `${OUTPUT_ROOT}/${stem}_${modelStem}.${container}`;
 }
 
 function pathLeaf(path: string | null | undefined): string {
@@ -248,7 +254,7 @@ function blindComparisonOutputPath(
   const stem = source.path.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") ?? "comparison_source";
   const modelStem = modelId.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
   const labelStem = anonymousLabel.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
-  return `artifacts/outputs/blind/${stem}_${runToken}_${labelStem}_${modelStem}.${container}`;
+  return `${OUTPUT_ROOT}/blind/${stem}_${runToken}_${labelStem}_${modelStem}.${container}`;
 }
 
 function parsePositiveIntegerInput(value: string): number | null {
@@ -333,6 +339,7 @@ function createQueuedJob(jobId: string): PipelineJobStatus {
       totalFrames: 0,
       extractedFrames: 0,
       upscaledFrames: 0,
+      interpolatedFrames: 0,
       encodedFrames: 0,
       remuxedFrames: 0,
     },
@@ -353,6 +360,7 @@ function createPendingComparisonJob(): PipelineJobStatus {
       totalFrames: 0,
       extractedFrames: 0,
       upscaledFrames: 0,
+      interpolatedFrames: 0,
       encodedFrames: 0,
       remuxedFrames: 0,
     },
@@ -379,6 +387,7 @@ function createQueuedConversionJob(jobId: string): SourceConversionJobStatus {
       totalFrames: 0,
       extractedFrames: 0,
       upscaledFrames: 0,
+      interpolatedFrames: 0,
       encodedFrames: 0,
       remuxedFrames: 0,
     },
@@ -446,6 +455,9 @@ function formatStageTimings(progress: PipelineProgress): string {
   const parts = [
     `extract ${formatElapsedSeconds(progress.extractStageSeconds)}`,
     `upscale ${formatElapsedSeconds(progress.upscaleStageSeconds)}`,
+    ...(progress.interpolateStageSeconds !== null && progress.interpolateStageSeconds !== undefined && progress.interpolateStageSeconds > 0
+      ? [`interpolate ${formatElapsedSeconds(progress.interpolateStageSeconds)}`]
+      : []),
     `encode ${formatElapsedSeconds(progress.encodeStageSeconds)}`,
     `remux ${formatElapsedSeconds(progress.remuxStageSeconds)}`,
   ];
@@ -520,6 +532,9 @@ function buildPipelineActivityTitle(progress: PipelineProgress): string {
   }
   if (progress.phase === "upscaling") {
     return progress.batchCount ? "Upscaling the current batch" : "Upscaling extracted frames";
+  }
+  if (progress.phase === "interpolating") {
+    return "Interpolating additional frames";
   }
   if (progress.phase === "encoding") {
     return "Encoding upscaled frames";
@@ -702,6 +717,8 @@ export default function App() {
   const [container, setContainer] = useState<OutputContainer>("mp4");
   const [tileSize, setTileSize] = useState<number>(0);
   const [crf, setCrf] = useState<number>(18);
+  const [interpolationMode, setInterpolationMode] = useState<InterpolationMode>("off");
+  const [interpolationTargetFps, setInterpolationTargetFps] = useState<InterpolationTargetFps>(60);
   const [pytorchRunner, setPytorchRunner] = useState<PytorchRunner>(() => recommendedPytorchRunner(modelId));
   const [previewMode, setPreviewMode] = useState<boolean>(true);
   const [previewDurationInput, setPreviewDurationInput] = useState<string>("8");
@@ -832,6 +849,8 @@ export default function App() {
     && isSourceConversionRunning
   );
   const isRunDisabled = isBusy || !source || isBlindComparisonRunning || isPipelineRunning || isBlockingSourceConversionRunning || !isSelectedModelImplemented;
+  const interpolationEnabled = isInterpolationEnabled(interpolationMode);
+  const runButtonLabel = buildInterpolationRunLabel(interpolationMode, isPipelineRunning);
   const isBlindComparisonDisabled = isBusy || !source || isBlindComparisonRunning || isPipelineRunning || isBlockingSourceConversionRunning || blindComparisonCandidates.length < 2;
   const nowTimestamp = uiNow;
   const trackedJobCandidates: Array<TrackedJobEntry | null> = [
@@ -1634,6 +1653,8 @@ export default function App() {
       modelId: targetModelId,
       outputMode,
       qualityPreset,
+      interpolationMode,
+      interpolationTargetFps: interpolationEnabled ? interpolationTargetFps : null,
       pytorchRunner: supportsPytorchRunner ? pytorchRunner : "torch",
       gpuId: selectedGpuId,
       aspectRatioPreset,
@@ -1656,6 +1677,14 @@ export default function App() {
       fp16: false,
       crf,
     };
+  }
+
+  async function confirmInterpolationPolicy(): Promise<boolean> {
+    const message = buildInterpolationWarning(source, interpolationMode, interpolationTargetFps);
+    if (!message) {
+      return true;
+    }
+    return window.confirm(message);
   }
 
   async function selectVideo(): Promise<void> {
@@ -1775,6 +1804,10 @@ export default function App() {
     try {
       setIsBusy(true);
       setError(null);
+      if (!(await confirmInterpolationPolicy())) {
+        setStatus("Interpolation start cancelled.");
+        return;
+      }
       const selectedOutputPath = outputPath ?? await chooseOutputFile();
       if (!selectedOutputPath) {
         setStatus("Output selection cancelled.");
@@ -2190,11 +2223,11 @@ export default function App() {
     <main className="app-shell">
       <section className="hero-panel">
         <div>
-          <p className="eyebrow">Windows-first video upscaler evaluation</p>
-          <h1>Upscaler</h1>
+          <p className="eyebrow">Windows-first video upgrade workbench</p>
+          <h1>{APP_NAME}</h1>
           <p className="summary">
-            Compare Real-ESRGAN-first outputs, inspect 4K framing behavior, rate models from the
-            shared catalog, and run blind sample comparisons before committing to a full export.
+            Compare spatial upscaling results, inspect 4K framing behavior, and prepare for
+            frame-rate upgrades from the same desktop workflow before committing to a full export.
           </p>
         </div>
         <div className="status-card">
@@ -2413,6 +2446,34 @@ export default function App() {
           onToggle={() => setIsOutputPanelOpen((current) => !current)}
           testId="output-panel"
         >
+          <section className="workflow-track-grid" data-testid="processing-track-grid">
+            <article className="workflow-track-card workflow-track-card-active" data-testid="upscaler-section-card">
+              <div className="workflow-track-header">
+                <span className="catalog-chip">Upscaler</span>
+                <strong>Spatial detail pipeline</strong>
+              </div>
+              <p className="summary">
+                This is the active export path today: model selection, framing, quality tuning, blind comparison, and full render output.
+              </p>
+            </article>
+            <article className="workflow-track-card" data-testid="interpolator-section-card">
+              <div className="workflow-track-header">
+                <span className="catalog-chip execution-planned">{MOTION_SECTION_NAME}</span>
+                <strong>Motion interpolation workspace</strong>
+              </div>
+              <p className="summary" data-testid="interpolator-roadmap-summary">
+                This section will handle 30 fps and 60 fps frame generation, both as a standalone video upgrade path and as a follow-on stage after upscaling.
+              </p>
+            </article>
+          </section>
+          <section className="workflow-section" data-testid="upscaler-workspace-section">
+            <div className="workflow-section-heading">
+              <p className="eyebrow">Upscaler</p>
+              <h3>Upscale Workspace</h3>
+              <p className="summary">
+                Configure the current model-driven pipeline here. This section remains the runnable export path until motion interpolation is implemented.
+              </p>
+            </div>
           <label>
             Model
             <select data-testid="model-select" value={modelId} onChange={(event) => setModelId(event.target.value as ModelId)}>
@@ -2648,7 +2709,7 @@ export default function App() {
             </div>
           ) : null}
           <button data-testid="run-upscale-button" className="action-button" onClick={() => void runPipeline()} disabled={isRunDisabled}>
-            {isPipelineRunning ? "Upscaling..." : "Run Upscale"}
+            {runButtonLabel}
           </button>
           {!isSelectedModelImplemented ? (
             <p className="summary" data-testid="run-disabled-reason">
@@ -2668,6 +2729,41 @@ export default function App() {
           ) : (
             <p className="summary">Runtime assets download on first use.</p>
           )}
+          </section>
+          <section className="workflow-section workflow-section-planned" data-testid="frame-rate-workspace-section">
+            <div className="workflow-section-heading">
+              <p className="eyebrow">{MOTION_SECTION_NAME}</p>
+              <h3>Interpolation Workspace</h3>
+              <p className="summary">
+                Use this workspace to define how frame synthesis should run. The runtime stage is still being implemented, but the app contract and job planning can already be configured here.
+              </p>
+            </div>
+            <div className="dual-field-grid">
+              <label>
+                Target Frame Rate
+                <select data-testid="frame-rate-target-select" value={String(interpolationTargetFps)} onChange={(event) => setInterpolationTargetFps(Number(event.target.value) as InterpolationTargetFps)} disabled={!interpolationEnabled}>
+                  {interpolationTargetFpsOptions.map((fps) => (
+                    <option key={fps} value={String(fps)}>{fps} fps</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Motion Workflow
+                <select data-testid="frame-rate-mode-select" value={interpolationMode} onChange={(event) => setInterpolationMode(event.target.value as InterpolationMode)}>
+                  {interpolationModes.map((mode) => (
+                    <option key={mode.value} value={mode.value}>{mode.label}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <p className="summary" data-testid="interpolation-workspace-summary">
+              {interpolationMode === "interpolateOnly"
+                ? "Interpolate-only mode is wired first so existing videos can move to a higher frame rate without requiring spatial upscaling."
+                : interpolationMode === "afterUpscale"
+                  ? "Post-upscale interpolation will synthesize frames after the spatial upscale stage so the generated motion runs at final output resolution."
+                  : "Turn motion interpolation on here when you want to test frame-rate upgrades alongside the upscaler workflow."}
+            </p>
+          </section>
           {sourceConversionJob && !pipelineJob ? (
             <div className="job-progress-panel" data-testid="conversion-progress-panel">
               <div className="catalog-card-header">

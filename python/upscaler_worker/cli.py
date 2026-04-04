@@ -7,7 +7,7 @@ from pathlib import Path
 from upscaler_worker.benchmark import benchmark_fixture, compare_precision_quality, _parse_tile_sizes
 from upscaler_worker.benchmark_pytorch_pipeline_paths import benchmark_pytorch_pipeline_paths, _parse_execution_paths
 from upscaler_worker.media import convert_source_to_mp4, probe_video
-from upscaler_worker.models.pytorch_sr import resolve_precision_mode
+from upscaler_worker.precision import resolve_precision_mode
 from upscaler_worker.models.realesrgan import build_realesrgan_job_plan
 from upscaler_worker.pipeline import run_realesrgan_pipeline
 from upscaler_worker.runtime import ensure_runtime_assets
@@ -24,6 +24,8 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--model-id", default="realesrgan-x4plus")
     prepare.add_argument("--output-mode", required=True)
     prepare.add_argument("--preset", required=True)
+    prepare.add_argument("--interpolation-mode", choices=["off", "afterUpscale", "interpolateOnly"], default="off")
+    prepare.add_argument("--interpolation-target-fps", choices=[30, 60], type=int)
     prepare.add_argument("--gpu-id", type=int)
     prepare.add_argument("--aspect-ratio-preset", default="16:9")
     prepare.add_argument("--custom-aspect-width", type=int)
@@ -68,6 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_job.add_argument("--model-id", default="realesrgan-x4plus")
     run_job.add_argument("--output-mode", required=True)
     run_job.add_argument("--preset", required=True)
+    run_job.add_argument("--interpolation-mode", choices=["off", "afterUpscale", "interpolateOnly"], default="off")
+    run_job.add_argument("--interpolation-target-fps", choices=[30, 60], type=int)
     run_job.add_argument("--gpu-id", type=int)
     run_job.add_argument("--aspect-ratio-preset", default="16:9")
     run_job.add_argument("--custom-aspect-width", type=int)
@@ -190,6 +194,8 @@ def main() -> int:
             model_id=args.model_id,
             output_mode=args.output_mode,
             preset=args.preset,
+            interpolation_mode=args.interpolation_mode,
+            interpolation_target_fps=args.interpolation_target_fps,
             gpu_id=args.gpu_id,
             aspect_ratio_preset=args.aspect_ratio_preset,
             custom_aspect_width=args.custom_aspect_width,
@@ -243,6 +249,8 @@ def main() -> int:
             model_id=args.model_id,
             output_mode=args.output_mode,
             preset=args.preset,
+            interpolation_mode=args.interpolation_mode,
+            interpolation_target_fps=args.interpolation_target_fps,
             gpu_id=args.gpu_id,
             aspect_ratio_preset=args.aspect_ratio_preset,
             custom_aspect_width=args.custom_aspect_width,

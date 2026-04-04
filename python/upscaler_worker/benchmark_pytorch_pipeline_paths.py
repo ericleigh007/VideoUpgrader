@@ -18,7 +18,8 @@ if __package__ in {None, ""}:
 
 from upscaler_worker.measure_ffmpeg_overhead import _build_fixture
 from upscaler_worker.model_catalog import model_backend_id
-from upscaler_worker.models.pytorch_sr import FRAME_BATCH_SIZE_OVERRIDE_ENV, resolve_frame_batch_size_override, resolve_precision_mode, resolve_pytorch_runner
+from upscaler_worker.models.pytorch_sr import FRAME_BATCH_SIZE_OVERRIDE_ENV, resolve_frame_batch_size_override, resolve_pytorch_runner
+from upscaler_worker.precision import resolve_precision_mode
 from upscaler_worker.pipeline import (
     PYTORCH_EXECUTION_PATH_FILE_IO,
     PYTORCH_EXECUTION_PATH_STREAMING,

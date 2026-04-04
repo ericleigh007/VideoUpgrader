@@ -17,6 +17,8 @@ struct RealesrganJobRequest {
     model_id: String,
     output_mode: String,
     quality_preset: String,
+    interpolation_mode: String,
+    interpolation_target_fps: Option<u32>,
     pytorch_runner: String,
     gpu_id: Option<u32>,
     aspect_ratio_preset: String,
@@ -136,6 +138,8 @@ struct PipelineProgress {
     total_frames: usize,
     extracted_frames: usize,
     upscaled_frames: usize,
+    #[serde(default)]
+    interpolated_frames: usize,
     encoded_frames: usize,
     remuxed_frames: usize,
     #[serde(default)]
@@ -172,6 +176,8 @@ struct PipelineProgress {
     extract_stage_seconds: Option<f64>,
     #[serde(default)]
     upscale_stage_seconds: Option<f64>,
+    #[serde(default)]
+    interpolate_stage_seconds: Option<f64>,
     #[serde(default)]
     encode_stage_seconds: Option<f64>,
     #[serde(default)]
@@ -364,6 +370,8 @@ fn build_cache_key(request: &RealesrganJobRequest) -> String {
     hasher.update(request.model_id.as_bytes());
     hasher.update(request.output_mode.as_bytes());
     hasher.update(request.quality_preset.as_bytes());
+    hasher.update(request.interpolation_mode.as_bytes());
+    hasher.update(request.interpolation_target_fps.unwrap_or_default().to_le_bytes());
     hasher.update(request.pytorch_runner.as_bytes());
     hasher.update(request.gpu_id.unwrap_or_default().to_le_bytes());
     hasher.update(request.aspect_ratio_preset.as_bytes());
@@ -397,6 +405,7 @@ fn default_progress(phase: &str, percent: u32, message: &str) -> PipelineProgres
         total_frames: 0,
         extracted_frames: 0,
         upscaled_frames: 0,
+        interpolated_frames: 0,
         encoded_frames: 0,
         remuxed_frames: 0,
         segment_index: None,
@@ -416,6 +425,7 @@ fn default_progress(phase: &str, percent: u32, message: &str) -> PipelineProgres
         output_size_bytes: None,
         extract_stage_seconds: None,
         upscale_stage_seconds: None,
+        interpolate_stage_seconds: None,
         encode_stage_seconds: None,
         remux_stage_seconds: None,
     }
@@ -658,6 +668,8 @@ fn prepare_realesrgan_job(request: RealesrganJobRequest) -> RealesrganJobPlan {
         request.output_mode.clone(),
         "--preset".to_string(),
         request.quality_preset.clone(),
+        "--interpolation-mode".to_string(),
+        request.interpolation_mode.clone(),
         "--pytorch-runner".to_string(),
         request.pytorch_runner.clone(),
         "--gpu-id".to_string(),
@@ -730,6 +742,11 @@ fn prepare_realesrgan_job(request: RealesrganJobRequest) -> RealesrganJobPlan {
     if let Some(segment_duration_seconds) = request.segment_duration_seconds {
         command.push("--segment-duration-seconds".to_string());
         command.push(segment_duration_seconds.to_string());
+    }
+
+    if let Some(interpolation_target_fps) = request.interpolation_target_fps {
+        command.push("--interpolation-target-fps".to_string());
+        command.push(interpolation_target_fps.to_string());
     }
 
     if request.fp16 {
@@ -840,6 +857,7 @@ fn start_source_conversion_to_mp4(state: tauri::State<AppState>, source_path: St
                                 total_frames: 0,
                                 extracted_frames: 0,
                                 upscaled_frames: 0,
+                                interpolated_frames: 0,
                                 encoded_frames: 0,
                                 remuxed_frames: 0,
                                 segment_index: None,
@@ -859,6 +877,7 @@ fn start_source_conversion_to_mp4(state: tauri::State<AppState>, source_path: St
                                 output_size_bytes: None,
                                 extract_stage_seconds: None,
                                 upscale_stage_seconds: None,
+                                interpolate_stage_seconds: None,
                                 encode_stage_seconds: None,
                                 remux_stage_seconds: None,
                             })
@@ -1027,6 +1046,8 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
         request.output_mode.clone(),
         "--preset".to_string(),
         request.quality_preset.clone(),
+        "--interpolation-mode".to_string(),
+        request.interpolation_mode.clone(),
         "--pytorch-runner".to_string(),
         request.pytorch_runner.clone(),
         "--gpu-id".to_string(),
@@ -1106,6 +1127,11 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
         owned_args.push(segment_duration_seconds.to_string());
     }
 
+    if let Some(interpolation_target_fps) = request.interpolation_target_fps {
+        owned_args.push("--interpolation-target-fps".to_string());
+        owned_args.push(interpolation_target_fps.to_string());
+    }
+
     if request.fp16 {
         owned_args.push("--fp16".to_string());
     }
@@ -1155,6 +1181,7 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
                                 total_frames: 0,
                                 extracted_frames: 0,
                                 upscaled_frames: 0,
+                                interpolated_frames: 0,
                                 encoded_frames: 0,
                                 remuxed_frames: 0,
                                 segment_index: None,
@@ -1174,6 +1201,7 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
                                 output_size_bytes: None,
                                 extract_stage_seconds: None,
                                 upscale_stage_seconds: None,
+                                interpolate_stage_seconds: None,
                                 encode_stage_seconds: None,
                                 remux_stage_seconds: None,
                             })

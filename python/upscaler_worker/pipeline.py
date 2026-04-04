@@ -17,7 +17,7 @@ import numpy as np
 from upscaler_worker.cancellation import JobCancelledError, cancellation_requested, ensure_not_cancelled, terminate_process
 from upscaler_worker.media import probe_video
 from upscaler_worker.model_catalog import ensure_runnable_model, model_backend_id
-from upscaler_worker.models.pytorch_sr import resolve_precision_mode
+from upscaler_worker.precision import resolve_precision_mode
 from upscaler_worker.models.realesrgan import model_label
 from upscaler_worker.runtime import ensure_runtime_assets, repo_root
 
@@ -60,6 +60,7 @@ class StreamingPixelBatch:
 class PipelineProgressState:
     extracted_frames: int = 0
     upscaled_frames: int = 0
+    interpolated_frames: int = 0
     encoded_frames: int = 0
     remuxed_frames: int = 0
 
@@ -94,6 +95,7 @@ class PipelineTelemetryState:
     batch_count: int | None = None
     extract_stage_seconds: float = 0.0
     upscale_stage_seconds: float = 0.0
+    interpolate_stage_seconds: float = 0.0
     encode_stage_seconds: float = 0.0
     remux_stage_seconds: float = 0.0
 
@@ -418,6 +420,7 @@ def _sample_progress_telemetry(
         "outputSizeBytes": resources.output_size_bytes,
         "extractStageSeconds": telemetry_state.extract_stage_seconds,
         "upscaleStageSeconds": telemetry_state.upscale_stage_seconds,
+        "interpolateStageSeconds": telemetry_state.interpolate_stage_seconds,
         "encodeStageSeconds": telemetry_state.encode_stage_seconds,
         "remuxStageSeconds": telemetry_state.remux_stage_seconds,
     }
@@ -431,6 +434,9 @@ def _record_stage_duration(telemetry_state: PipelineTelemetryState, stage: str, 
         return
     if stage == "upscale":
         telemetry_state.upscale_stage_seconds += duration_seconds
+        return
+    if stage == "interpolate":
+        telemetry_state.interpolate_stage_seconds += duration_seconds
         return
     if stage == "encode":
         telemetry_state.encode_stage_seconds += duration_seconds
@@ -467,6 +473,7 @@ def _write_progress(
     total_frames: int,
     extracted_frames: int = 0,
     upscaled_frames: int = 0,
+    interpolated_frames: int = 0,
     encoded_frames: int = 0,
     remuxed_frames: int = 0,
     telemetry_state: PipelineTelemetryState | None = None,
@@ -484,6 +491,7 @@ def _write_progress(
         "totalFrames": total_frames,
         "extractedFrames": extracted_frames,
         "upscaledFrames": upscaled_frames,
+        "interpolatedFrames": interpolated_frames,
         "encodedFrames": encoded_frames,
         "remuxedFrames": remuxed_frames,
     }
@@ -665,6 +673,7 @@ def _pipeline_percent(total_frames: int, progress_state: PipelineProgressState) 
     aggregate = (
         _pipeline_ratio(progress_state.extracted_frames, total_frames) * extract_weight
         + _pipeline_ratio(progress_state.upscaled_frames, total_frames) * upscale_weight
+        + _pipeline_ratio(progress_state.interpolated_frames, total_frames) * 0
         + _pipeline_ratio(progress_state.encoded_frames, total_frames) * encode_weight
         + _pipeline_ratio(progress_state.remuxed_frames, total_frames) * remux_weight
     )
@@ -694,6 +703,7 @@ def _emit_pipeline_progress(
         total_frames=total_frames,
         extracted_frames=progress_state.extracted_frames,
         upscaled_frames=progress_state.upscaled_frames,
+        interpolated_frames=progress_state.interpolated_frames,
         encoded_frames=progress_state.encoded_frames,
         remuxed_frames=progress_state.remuxed_frames,
         telemetry_state=telemetry_state,
@@ -1521,6 +1531,8 @@ def run_realesrgan_pipeline(
     model_id: str,
     output_mode: str,
     preset: str,
+    interpolation_mode: str = "off",
+    interpolation_target_fps: int | None = None,
     gpu_id: int | None,
     aspect_ratio_preset: str,
     custom_aspect_width: int | None,
@@ -1563,6 +1575,12 @@ def run_realesrgan_pipeline(
     resolved_pytorch_execution_path = _resolve_pytorch_execution_path(model_id, pytorch_execution_path)
     runtime = ensure_runtime_assets()
     metadata = probe_video(source_path)
+    if interpolation_mode != "off":
+        if interpolation_target_fps not in {30, 60}:
+            raise ValueError("Interpolation currently requires an explicit target fps of 30 or 60")
+        raise NotImplementedError(
+            f"Interpolation mode '{interpolation_mode}' is wired through the app contract, but the RIFE execution stage is not implemented yet. Requested target: {interpolation_target_fps} fps."
+        )
     requested_output = Path(output_path)
     if not requested_output.is_absolute():
         requested_output = repo_root() / requested_output
@@ -1579,6 +1597,8 @@ def run_realesrgan_pipeline(
                 model_id,
                 output_mode,
                 preset,
+                interpolation_mode,
+                str(interpolation_target_fps or 0),
                 str(gpu_id if gpu_id is not None else -1),
                 aspect_ratio_preset,
                 str(custom_aspect_width or 0),
