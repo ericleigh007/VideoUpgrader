@@ -23,6 +23,14 @@
       "runtime": "python-torch",
       "supportsGpuSelection": true,
       "frameTransport": "sequence-native"
+    },
+    {
+      "id": "pytorch-video-interpolation",
+      "label": "PyTorch Video Interpolation",
+      "loader": "pytorch-checkpoint",
+      "runtime": "python-torch",
+      "supportsGpuSelection": true,
+      "frameTransport": "sequence-native"
     }
   ],
   "models": [

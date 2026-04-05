@@ -1,16 +1,18 @@
-# Upscaler Requirements
+# VideoUpgrader Requirements
 
 ## Status
 
-This document is the current baseline specification for Upscaler.
+This document is the current baseline specification for VideoUpgrader.
 
-It replaces the inconsistent placeholder naming and prior carry-over text. It is written to match the current objective: a Windows-first desktop workstation for evaluating and comparing video upscaler quality, with performance as a secondary concern.
+It replaces the inconsistent placeholder naming and prior carry-over text. It is written to match the current objective: a Windows-first desktop workstation for evaluating both video upscaling quality and frame-rate interpolation quality, with performance as a secondary concern.
 
 ## Product Summary
 
-Upscaler is a Windows-first desktop application for:
+VideoUpgrader is a Windows-first desktop application for:
 
 - Comparing multiple video upscaler models on the same source content.
+- Interpolating existing video to higher frame rates such as 30 fps and 60 fps.
+- Running interpolation after upscaling when the user wants final-resolution motion synthesis.
 - Exporting full-length upscaled video while preserving or reattaching the original audio.
 - Analyzing output quality at the frame, pixel, and temporal level.
 - Running repeatable synthetic benchmark scenarios for objective regression testing.
@@ -28,6 +30,7 @@ Upscaler is a Windows-first desktop application for:
 3. Preserve full video duration during upscale and export.
 4. Keep the original audio synchronized in exported outputs.
 5. Support reproducible model comparisons on both real and synthetic content.
+6. Preserve exact audio-video sync through interpolation-only and post-upscale interpolation pipelines.
 
 ## MVP Scope
 
@@ -36,6 +39,7 @@ The first deliverable must support:
 - Importing a local video file.
 - Inspecting source metadata.
 - Selecting the Real-ESRGAN x4 Plus model.
+- Configuring interpolation-only or after-upscale frame-rate upgrades.
 - Choosing one of the supported 4K framing modes.
 - Preparing and running a first-end-to-end upscale job.
 - Exporting an output video with original audio remuxed back in.
@@ -58,6 +62,14 @@ The first deliverable must support:
 - The app must support native model-scale output where needed for analysis.
 - The app must allow different models to be run against the same decoded source sequence.
 - The app must cache intermediate work so repeated comparisons do not re-run unnecessary steps.
+
+### Interpolation
+
+- The app must support interpolation-only processing for existing videos.
+- The app must support interpolation after upscaling in the main export pipeline.
+- The app must support explicit interpolation targets of 30 fps and 60 fps.
+- The app must warn per job when the selected interpolation target fps is not higher than the source fps.
+- The app must preserve exact playback duration unless the user explicitly changes timing semantics in a future feature.
 
 ### Output Framing
 
@@ -83,6 +95,7 @@ The first deliverable must support:
 - The exported result must preserve exact playback length unless the user explicitly changes timing.
 - The app must reattach the original audio to the exported video when audio is present.
 - The app must validate that output duration and audio duration remain in sync.
+- The app must validate that interpolation pipelines keep audio sync within the configured tolerance across source, intermediate, and exported media.
 
 ### Project Persistence
 
@@ -122,6 +135,8 @@ The first deliverable must support:
 - The backend must coordinate media probing, decode, job scheduling, caching, export, and diagnostics.
 - The backend may use GPU resources up to approximately 12 GB of VRAM.
 - The backend must support memory-safe execution options such as tiling.
+- The backend must expose progress telemetry for extracting, upscaling, interpolating, encoding, and remuxing stages.
+- The backend must expose average fps, rolling fps, elapsed time, ETA, RAM usage, GPU memory usage, scratch growth, and output growth while jobs are running.
 
 ### Model Integration
 
@@ -133,8 +148,11 @@ The first deliverable must support:
 
 - Testing must take place without human intervention.
 - Unit tests must target at least 80 percent coverage in the maintained codebase.
-- Integration tests must cover end-to-end flows including video loading, job preparation, export, and project restore.
-- Automated GUI tests must verify the real desktop workflow.
+- Integration tests must cover end-to-end flows including video loading, job preparation, interpolation planning, export, audio remux, and project restore.
+- Automated GUI tests must verify the real desktop workflow for both upscaling and interpolation controls.
+- Integration tests must include synthetic AV-sync fixtures that validate source-to-output sync across interpolation-only and post-upscale interpolation flows.
+- Unit tests must cover interpolation request validation, target-fps mapping, frame-count planning, and progress telemetry helpers.
+- Integration and GUI tests must assert that interpolation progress, fps throughput, RAM usage, and GPU usage are surfaced correctly to the user.
 - Synthetic benchmark tests must generate known reference content, degrade it deterministically, upscale it, and compare outputs against the original high-resolution master.
 
 ## Development And Build Requirements

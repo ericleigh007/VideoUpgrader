@@ -14,6 +14,10 @@ export type OutputContainer = "mp4" | "mkv";
 
 export type PytorchRunner = "torch" | "tensorrt";
 
+export type InterpolationMode = "off" | "afterUpscale" | "interpolateOnly";
+
+export type InterpolationTargetFps = 30 | 60;
+
 export type GpuKind = "discrete" | "integrated" | "unknown";
 
 export interface GpuDevice {
@@ -31,12 +35,23 @@ export interface SourceVideoSummary {
   frameRate: number;
   hasAudio: boolean;
   container: string;
+  videoCodec: string;
+  sourceBitrateKbps?: number | null;
+  videoProfile?: string | null;
+  pixelFormat?: string | null;
+  audioCodec?: string | null;
+  audioProfile?: string | null;
+  audioSampleRate?: number | null;
+  audioChannels?: string | null;
+  audioBitrateKbps?: number | null;
 }
 
 export interface RuntimeStatus {
   ffmpegPath: string;
   realesrganPath: string;
   modelDir: string;
+  rifePath?: string;
+  rifeModelRoot?: string;
   availableGpus: GpuDevice[];
   defaultGpuId: number | null;
 }
@@ -84,6 +99,8 @@ export interface RealesrganJobRequest extends OutputSizingOptions {
   modelId: ModelId;
   outputMode: OutputMode;
   qualityPreset: QualityPreset;
+  interpolationMode: InterpolationMode;
+  interpolationTargetFps: InterpolationTargetFps | null;
   pytorchRunner: PytorchRunner;
   gpuId: number | null;
   previewMode: boolean;
@@ -97,7 +114,7 @@ export interface RealesrganJobRequest extends OutputSizingOptions {
   crf: number;
 }
 
-export type PipelinePhase = "queued" | "extracting" | "upscaling" | "encoding" | "remuxing" | "completed" | "failed";
+export type PipelinePhase = "queued" | "extracting" | "upscaling" | "interpolating" | "encoding" | "remuxing" | "completed" | "failed";
 
 export interface PipelineProgress {
   phase: PipelinePhase;
@@ -107,6 +124,7 @@ export interface PipelineProgress {
   totalFrames: number;
   extractedFrames: number;
   upscaledFrames: number;
+  interpolatedFrames: number;
   encodedFrames: number;
   remuxedFrames: number;
   segmentIndex?: number | null;
@@ -126,8 +144,20 @@ export interface PipelineProgress {
   outputSizeBytes?: number | null;
   extractStageSeconds?: number | null;
   upscaleStageSeconds?: number | null;
+  interpolateStageSeconds?: number | null;
   encodeStageSeconds?: number | null;
   remuxStageSeconds?: number | null;
+}
+
+export interface InterpolationDiagnostics {
+  mode: string;
+  sourceFps: number;
+  outputFps: number;
+  sourceFrameCount: number;
+  outputFrameCount: number;
+  segmentCount: number;
+  segmentFrameLimit: number;
+  segmentOverlapFrames: number;
 }
 
 export interface RealesrganJobPlan {
@@ -144,6 +174,7 @@ export interface PipelineResult {
   hadAudio: boolean;
   codec: VideoCodec;
   container: OutputContainer;
+  interpolationDiagnostics?: InterpolationDiagnostics | null;
   runtime: RuntimeStatus;
   log: string[];
 }

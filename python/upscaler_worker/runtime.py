@@ -15,6 +15,10 @@ REALESRGAN_ZIP_URL = (
     "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
     "realesrgan-ncnn-vulkan-20220424-windows.zip"
 )
+RIFE_ZIP_URL = (
+    "https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/"
+    "rife-ncnn-vulkan-20221029-windows.zip"
+)
 GPU_LINE_PATTERN = re.compile(r"^\[(\d+)\s+([^\]]+)\]")
 
 
@@ -26,36 +30,65 @@ def runtime_root() -> Path:
     return repo_root() / "artifacts" / "runtime"
 
 
+def _flatten_runtime_install(install_dir: Path, executable_name: str) -> Path:
+    nested_exe = next(install_dir.rglob(executable_name), None)
+    if nested_exe is None:
+        raise RuntimeError(f"Downloaded runtime package did not contain {executable_name}")
+    if nested_exe != install_dir / executable_name:
+        for child in nested_exe.parent.iterdir():
+            destination = install_dir / child.name
+            if child == destination:
+                continue
+            if destination.exists():
+                if destination.is_dir():
+                    shutil.rmtree(destination)
+                else:
+                    destination.unlink()
+            shutil.move(str(child), str(destination))
+    return install_dir / executable_name
+
+
+def _ensure_portable_runtime(*, install_dir: Path, zip_name: str, zip_url: str, executable_name: str) -> Path:
+    exe_path = install_dir / executable_name
+    if exe_path.exists():
+        return exe_path
+
+    install_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = runtime_root() / zip_name
+    urllib.request.urlretrieve(zip_url, zip_path)
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(install_dir)
+    zip_path.unlink(missing_ok=True)
+    return _flatten_runtime_install(install_dir, executable_name)
+
+
 def ensure_realesrgan_runtime() -> dict[str, str]:
     install_dir = runtime_root() / "realesrgan-ncnn-vulkan"
-    exe_path = install_dir / "realesrgan-ncnn-vulkan.exe"
-
-    if not exe_path.exists():
-        install_dir.mkdir(parents=True, exist_ok=True)
-        zip_path = runtime_root() / "realesrgan-ncnn-vulkan.zip"
-        urllib.request.urlretrieve(REALESRGAN_ZIP_URL, zip_path)
-        with zipfile.ZipFile(zip_path) as archive:
-            archive.extractall(install_dir)
-        zip_path.unlink(missing_ok=True)
-
-        nested_exe = next(install_dir.rglob("realesrgan-ncnn-vulkan.exe"), None)
-        if nested_exe is None:
-            raise RuntimeError("Downloaded Real-ESRGAN package did not contain realesrgan-ncnn-vulkan.exe")
-        if nested_exe != exe_path:
-            for child in nested_exe.parent.iterdir():
-                destination = install_dir / child.name
-                if child == destination:
-                    continue
-                if destination.exists():
-                    if destination.is_dir():
-                        shutil.rmtree(destination)
-                    else:
-                        destination.unlink()
-                shutil.move(str(child), str(destination))
+    exe_path = _ensure_portable_runtime(
+        install_dir=install_dir,
+        zip_name="realesrgan-ncnn-vulkan.zip",
+        zip_url=REALESRGAN_ZIP_URL,
+        executable_name="realesrgan-ncnn-vulkan.exe",
+    )
 
     return {
         "realesrganPath": str(exe_path),
         "modelDir": str(install_dir / "models"),
+    }
+
+
+def ensure_rife_runtime() -> dict[str, str]:
+    install_dir = runtime_root() / "rife-ncnn-vulkan"
+    exe_path = _ensure_portable_runtime(
+        install_dir=install_dir,
+        zip_name="rife-ncnn-vulkan.zip",
+        zip_url=RIFE_ZIP_URL,
+        executable_name="rife-ncnn-vulkan.exe",
+    )
+
+    return {
+        "rifePath": str(exe_path),
+        "rifeModelRoot": str(install_dir),
     }
 
 

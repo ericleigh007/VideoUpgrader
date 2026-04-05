@@ -15,11 +15,18 @@ from pathlib import Path
 import numpy as np
 
 from upscaler_worker.cancellation import JobCancelledError, cancellation_requested, ensure_not_cancelled, terminate_process
+from upscaler_worker.interpolation import (
+    build_rife_command,
+    resolve_output_fps,
+    resolve_segment_output_frame_count,
+    should_skip_interpolation,
+    validate_interpolation_request,
+)
 from upscaler_worker.media import probe_video
 from upscaler_worker.model_catalog import ensure_runnable_model, model_backend_id
-from upscaler_worker.models.pytorch_sr import resolve_precision_mode
+from upscaler_worker.precision import resolve_precision_mode
 from upscaler_worker.models.realesrgan import model_label
-from upscaler_worker.runtime import ensure_runtime_assets, repo_root
+from upscaler_worker.runtime import ensure_rife_runtime, ensure_runtime_assets, repo_root
 
 
 BATCH_FRAME_COUNT = 12
@@ -45,6 +52,22 @@ class PipelineSegment:
 
 
 @dataclass(frozen=True)
+class InterpolationSegmentPlan:
+    index: int
+    source_start_frame: int
+    source_frame_count: int
+    expanded_start_frame: int
+    expanded_frame_count: int
+    overlap_before_frames: int
+    overlap_after_frames: int
+    output_start_frame: int
+    output_frame_count: int
+    expanded_output_frame_count: int
+    expanded_start_seconds: float
+    expanded_duration_seconds: float
+
+
+@dataclass(frozen=True)
 class StreamingFrameBatch:
     batch_index: int
     frames: list[np.ndarray]
@@ -56,10 +79,25 @@ class StreamingPixelBatch:
     pixels: list[np.ndarray]
 
 
+@dataclass(frozen=True)
+class InterpolationEncodeTask:
+    segment_index: int
+    output_dir: Path
+    output_file: Path
+    frame_start_number: int
+    frame_limit: int
+    segment_total_frames: int
+    extracted_frames: int
+    upscaled_frames: int
+    interpolated_frames: int
+    cleanup_paths: tuple[Path, ...]
+
+
 @dataclass
 class PipelineProgressState:
     extracted_frames: int = 0
     upscaled_frames: int = 0
+    interpolated_frames: int = 0
     encoded_frames: int = 0
     remuxed_frames: int = 0
 
@@ -94,13 +132,140 @@ class PipelineTelemetryState:
     batch_count: int | None = None
     extract_stage_seconds: float = 0.0
     upscale_stage_seconds: float = 0.0
+    interpolate_stage_seconds: float = 0.0
     encode_stage_seconds: float = 0.0
     remux_stage_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class VideoEncoderConfig:
+    encoder: str
+    quality_args: tuple[str, ...]
+    label: str
+    hardware_accelerated: bool
 
 
 def _round_dimension(value: float) -> int:
     rounded = max(2, int(round(value)))
     return rounded if rounded % 2 == 0 else rounded + 1
+
+
+def _software_video_encoder_config(codec: str, crf: int) -> VideoEncoderConfig:
+    return VideoEncoderConfig(
+        encoder="libx265" if codec == "h265" else "libx264",
+        quality_args=("-preset", "medium", "-crf", str(crf)),
+        label="software-cpu",
+        hardware_accelerated=False,
+    )
+
+
+def _select_runtime_gpu(runtime: dict[str, object], gpu_id: int | None) -> dict[str, object] | None:
+    available_gpus = runtime.get("availableGpus", [])
+    if not isinstance(available_gpus, list) or not available_gpus:
+        return None
+
+    if gpu_id is not None:
+        selected = next(
+            (
+                device
+                for device in available_gpus
+                if isinstance(device, dict) and device.get("id") == gpu_id
+            ),
+            None,
+        )
+        if selected is not None:
+            return selected
+
+    discrete = next(
+        (
+            device
+            for device in available_gpus
+            if isinstance(device, dict) and device.get("kind") == "discrete"
+        ),
+        None,
+    )
+    if discrete is not None:
+        return discrete
+
+    return next((device for device in available_gpus if isinstance(device, dict)), None)
+
+
+def _hardware_video_encoder_config(codec: str, crf: int, gpu_name: str) -> VideoEncoderConfig | None:
+    normalized_name = gpu_name.lower()
+    if any(token in normalized_name for token in ["nvidia", "geforce", "rtx", "quadro"]):
+        return VideoEncoderConfig(
+            encoder="hevc_nvenc" if codec == "h265" else "h264_nvenc",
+            quality_args=("-preset", "p5", "-cq", str(crf), "-b:v", "0"),
+            label=f"nvidia-nvenc ({gpu_name})",
+            hardware_accelerated=True,
+        )
+    return None
+
+
+def _probe_video_encoder(ffmpeg: str, config: VideoEncoderConfig) -> bool:
+    probe_command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=16x16:d=0.1:r=1",
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        config.encoder,
+        *config.quality_args,
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        completed = subprocess.run(
+            probe_command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _resolve_video_encoder_config(
+    *,
+    ffmpeg: str,
+    runtime: dict[str, object],
+    gpu_id: int | None,
+    codec: str,
+    crf: int,
+    log: list[str],
+) -> VideoEncoderConfig:
+    software_config = _software_video_encoder_config(codec, crf)
+    selected_gpu = _select_runtime_gpu(runtime, gpu_id)
+    if selected_gpu is None:
+        log.append(f"Video encoder: {software_config.encoder} ({software_config.label})")
+        return software_config
+
+    gpu_name = str(selected_gpu.get("name", "")).strip()
+    hardware_config = _hardware_video_encoder_config(codec, crf, gpu_name)
+    if hardware_config is None:
+        log.append(f"Video encoder: {software_config.encoder} ({software_config.label})")
+        return software_config
+
+    if _probe_video_encoder(ffmpeg, hardware_config):
+        log.append(f"Video encoder: {hardware_config.encoder} ({hardware_config.label})")
+        return hardware_config
+
+    log.append(
+        f"Hardware encoder probe failed for {hardware_config.encoder} on {gpu_name}; falling back to {software_config.encoder}."
+    )
+    log.append(f"Video encoder: {software_config.encoder} ({software_config.label})")
+    return software_config
 
 
 def _clamp_ratio_position(value: float) -> float:
@@ -418,6 +583,7 @@ def _sample_progress_telemetry(
         "outputSizeBytes": resources.output_size_bytes,
         "extractStageSeconds": telemetry_state.extract_stage_seconds,
         "upscaleStageSeconds": telemetry_state.upscale_stage_seconds,
+        "interpolateStageSeconds": telemetry_state.interpolate_stage_seconds,
         "encodeStageSeconds": telemetry_state.encode_stage_seconds,
         "remuxStageSeconds": telemetry_state.remux_stage_seconds,
     }
@@ -431,6 +597,9 @@ def _record_stage_duration(telemetry_state: PipelineTelemetryState, stage: str, 
         return
     if stage == "upscale":
         telemetry_state.upscale_stage_seconds += duration_seconds
+        return
+    if stage == "interpolate":
+        telemetry_state.interpolate_stage_seconds += duration_seconds
         return
     if stage == "encode":
         telemetry_state.encode_stage_seconds += duration_seconds
@@ -467,6 +636,7 @@ def _write_progress(
     total_frames: int,
     extracted_frames: int = 0,
     upscaled_frames: int = 0,
+    interpolated_frames: int = 0,
     encoded_frames: int = 0,
     remuxed_frames: int = 0,
     telemetry_state: PipelineTelemetryState | None = None,
@@ -484,6 +654,7 @@ def _write_progress(
         "totalFrames": total_frames,
         "extractedFrames": extracted_frames,
         "upscaledFrames": upscaled_frames,
+        "interpolatedFrames": interpolated_frames,
         "encodedFrames": encoded_frames,
         "remuxedFrames": remuxed_frames,
     }
@@ -505,6 +676,7 @@ def _run_ffmpeg_with_frame_progress(
     message_prefix: str,
     extracted_frames: int,
     upscaled_frames: int,
+    interpolated_frames: int,
     encoded_frames: int,
     remuxed_frames: int,
     telemetry_state: PipelineTelemetryState | None,
@@ -549,6 +721,7 @@ def _run_ffmpeg_with_frame_progress(
                 total_frames=total_frames,
                 extracted_frames=extracted_frames,
                 upscaled_frames=upscaled_frames,
+                interpolated_frames=interpolated_frames,
                 encoded_frames=stage_progress_frames if phase == "encoding" else encoded_frames,
                 remuxed_frames=stage_progress_frames if phase == "remuxing" else remuxed_frames,
                 telemetry_state=telemetry_state,
@@ -583,6 +756,85 @@ def _run_realesrgan_batch(
     cancel_path: str | None = None,
 ) -> None:
     _run(command, log, cancel_path)
+
+
+def _run_rife_segment(
+    *,
+    runtime: dict[str, object],
+    input_dir: Path,
+    output_dir: Path,
+    target_frame_count: int,
+    gpu_id: int | None,
+    width: int,
+    height: int,
+    log: list[str],
+    cancel_path: str | None,
+    progress_callback=None,
+) -> int:
+    input_frames = sorted(input_dir.glob("frame_*.png"))
+    if not input_frames:
+        raise RuntimeError("No frames were available for interpolation.")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rife_command = build_rife_command(
+        executable_path=str(runtime["rifePath"]),
+        model_root=str(runtime["rifeModelRoot"]),
+        input_dir=input_dir,
+        output_dir=output_dir,
+        target_frame_count=target_frame_count,
+        gpu_id=gpu_id,
+        uhd_mode=width >= 1920 or height >= 1080,
+    )
+    log.append("$ " + " ".join(rife_command))
+    process = subprocess.Popen(rife_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    output_lines: list[str] = []
+    output_lock = threading.Lock()
+
+    def drain_stream(stream: object) -> None:
+        if stream is None:
+            return
+        try:
+            for line in stream:
+                text = line.rstrip()
+                if text:
+                    with output_lock:
+                        output_lines.append(text)
+        finally:
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    stdout_thread = threading.Thread(target=drain_stream, args=(process.stdout,), daemon=True)
+    stderr_thread = threading.Thread(target=drain_stream, args=(process.stderr,), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    last_reported_count = -1
+    try:
+        while process.poll() is None:
+            if cancellation_requested(cancel_path):
+                terminate_process(process)
+                raise JobCancelledError("Job cancelled by user")
+            current_count = len(list(output_dir.glob("frame_*.png")))
+            if progress_callback is not None and current_count != last_reported_count:
+                progress_callback(current_count, target_frame_count)
+                last_reported_count = current_count
+            time.sleep(0.25)
+    finally:
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+
+    final_count = len(list(output_dir.glob("frame_*.png")))
+    if progress_callback is not None and final_count != last_reported_count:
+        progress_callback(final_count, target_frame_count)
+    if output_lines:
+        log.append("\n".join(output_lines))
+    if process.returncode != 0:
+        raise RuntimeError(f"Command failed with exit code {process.returncode}: {' '.join(rife_command)}")
+    if final_count <= 0:
+        raise RuntimeError("Interpolation completed without producing output frames")
+    return final_count
 
 
 def _read_exact_bytes(stream, expected_size: int) -> bytes:
@@ -651,20 +903,144 @@ def _plan_pipeline_segments(
     return segments
 
 
+def _plan_interpolation_segments(
+    source_segments: list[PipelineSegment],
+    *,
+    total_source_frames: int,
+    source_fps: float,
+    output_fps: float,
+) -> list[InterpolationSegmentPlan]:
+    if not source_segments:
+        return []
+
+    ratio = output_fps / source_fps
+    plans: list[InterpolationSegmentPlan] = []
+    for index, segment in enumerate(source_segments):
+        overlap_before_frames = 1 if index > 0 else 0
+        overlap_after_frames = 1 if index < len(source_segments) - 1 else 0
+        expanded_start_frame = max(0, segment.start_frame - overlap_before_frames)
+        expanded_end_frame = min(total_source_frames, segment.start_frame + segment.frame_count + overlap_after_frames)
+        expanded_frame_count = max(1, expanded_end_frame - expanded_start_frame)
+        expanded_output_frame_count = resolve_segment_output_frame_count(
+            start_frame=expanded_start_frame,
+            frame_count=expanded_frame_count,
+            source_fps=source_fps,
+            output_fps=output_fps,
+        )
+        output_start_frame = max(0, round(segment.start_frame * ratio) - round(expanded_start_frame * ratio))
+        output_frame_count = resolve_segment_output_frame_count(
+            start_frame=segment.start_frame,
+            frame_count=segment.frame_count,
+            source_fps=source_fps,
+            output_fps=output_fps,
+        )
+        plans.append(
+            InterpolationSegmentPlan(
+                index=segment.index,
+                source_start_frame=segment.start_frame,
+                source_frame_count=segment.frame_count,
+                expanded_start_frame=expanded_start_frame,
+                expanded_frame_count=expanded_frame_count,
+                overlap_before_frames=segment.start_frame - expanded_start_frame,
+                overlap_after_frames=max(0, expanded_end_frame - (segment.start_frame + segment.frame_count)),
+                output_start_frame=output_start_frame,
+                output_frame_count=output_frame_count,
+                expanded_output_frame_count=expanded_output_frame_count,
+                expanded_start_seconds=expanded_start_frame / source_fps if source_fps > 0 else 0.0,
+                expanded_duration_seconds=expanded_frame_count / source_fps if source_fps > 0 else 0.0,
+            )
+        )
+    return plans
+
+
+def _shrink_final_interpolation_segment_plan(
+    segment_plan: InterpolationSegmentPlan,
+    *,
+    actual_expanded_frame_count: int,
+    source_fps: float,
+    output_fps: float,
+) -> InterpolationSegmentPlan:
+    if actual_expanded_frame_count >= segment_plan.expanded_frame_count:
+        return segment_plan
+
+    adjusted_source_frame_count = max(1, actual_expanded_frame_count - segment_plan.overlap_before_frames)
+    adjusted_expanded_output_frame_count = resolve_segment_output_frame_count(
+        start_frame=segment_plan.expanded_start_frame,
+        frame_count=actual_expanded_frame_count,
+        source_fps=source_fps,
+        output_fps=output_fps,
+    )
+    adjusted_output_frame_count = resolve_segment_output_frame_count(
+        start_frame=segment_plan.source_start_frame,
+        frame_count=adjusted_source_frame_count,
+        source_fps=source_fps,
+        output_fps=output_fps,
+    )
+    ratio = output_fps / source_fps if source_fps > 0 else 1.0
+    adjusted_output_start_frame = max(
+        0,
+        round(segment_plan.source_start_frame * ratio) - round(segment_plan.expanded_start_frame * ratio),
+    )
+    return InterpolationSegmentPlan(
+        index=segment_plan.index,
+        source_start_frame=segment_plan.source_start_frame,
+        source_frame_count=adjusted_source_frame_count,
+        expanded_start_frame=segment_plan.expanded_start_frame,
+        expanded_frame_count=actual_expanded_frame_count,
+        overlap_before_frames=min(segment_plan.overlap_before_frames, max(0, actual_expanded_frame_count - 1)),
+        overlap_after_frames=0,
+        output_start_frame=adjusted_output_start_frame,
+        output_frame_count=adjusted_output_frame_count,
+        expanded_output_frame_count=adjusted_expanded_output_frame_count,
+        expanded_start_seconds=segment_plan.expanded_start_seconds,
+        expanded_duration_seconds=actual_expanded_frame_count / source_fps if source_fps > 0 else 0.0,
+    )
+
+
 def _pipeline_ratio(processed_frames: int, total_frames: int) -> float:
     if total_frames <= 0:
         return 0.0
     return max(0.0, min(1.0, processed_frames / total_frames))
 
 
-def _pipeline_percent(total_frames: int, progress_state: PipelineProgressState) -> int:
-    extract_weight = 10
-    upscale_weight = 70
-    encode_weight = 15
-    remux_weight = 5
+def _pipeline_percent(
+    total_frames: int,
+    progress_state: PipelineProgressState,
+    *,
+    source_total_frames: int | None = None,
+    interpolation_mode: str = "off",
+) -> int:
+    if interpolation_mode == "interpolateOnly":
+        extract_weight = 10
+        upscale_weight = 0
+        interpolate_weight = 70
+        encode_weight = 15
+        remux_weight = 5
+    elif interpolation_mode == "afterUpscale":
+        extract_weight = 10
+        upscale_weight = 35
+        interpolate_weight = 35
+        encode_weight = 15
+        remux_weight = 5
+    else:
+        extract_weight = 10
+        upscale_weight = 70
+        interpolate_weight = 0
+        encode_weight = 15
+        remux_weight = 5
+
+    effective_source_total_frames = source_total_frames if source_total_frames is not None and source_total_frames > 0 else total_frames
+    if interpolation_mode == "off":
+        effective_extracted_frames = progress_state.extracted_frames
+        effective_upscaled_frames = progress_state.upscaled_frames
+    else:
+        effective_extracted_frames = _scaled_pipeline_frames(progress_state.extracted_frames, effective_source_total_frames, total_frames)
+        effective_upscaled_frames = _scaled_pipeline_frames(progress_state.upscaled_frames, effective_source_total_frames, total_frames)
+
     aggregate = (
-        _pipeline_ratio(progress_state.extracted_frames, total_frames) * extract_weight
-        + _pipeline_ratio(progress_state.upscaled_frames, total_frames) * upscale_weight
+        _pipeline_ratio(effective_extracted_frames, total_frames) * extract_weight
+        + _pipeline_ratio(effective_upscaled_frames, total_frames) * upscale_weight
+        + _pipeline_ratio(progress_state.interpolated_frames, total_frames) * interpolate_weight
         + _pipeline_ratio(progress_state.encoded_frames, total_frames) * encode_weight
         + _pipeline_ratio(progress_state.remuxed_frames, total_frames) * remux_weight
     )
@@ -678,22 +1054,39 @@ def _emit_pipeline_progress(
     message: str,
     total_frames: int,
     progress_state: PipelineProgressState,
+    source_total_frames: int | None = None,
+    interpolation_mode: str = "off",
     telemetry_state: PipelineTelemetryState | None = None,
 ) -> None:
+    effective_source_total_frames = source_total_frames if source_total_frames is not None and source_total_frames > 0 else total_frames
+    if interpolation_mode == "off":
+        effective_extracted_frames = progress_state.extracted_frames
+        effective_upscaled_frames = progress_state.upscaled_frames
+    else:
+        effective_extracted_frames = _scaled_pipeline_frames(progress_state.extracted_frames, effective_source_total_frames, total_frames)
+        effective_upscaled_frames = _scaled_pipeline_frames(progress_state.upscaled_frames, effective_source_total_frames, total_frames)
+
     _write_progress(
         progress_path,
         phase=phase,
-        percent=_pipeline_percent(total_frames, progress_state),
+        percent=_pipeline_percent(
+            total_frames,
+            progress_state,
+            source_total_frames=effective_source_total_frames,
+            interpolation_mode=interpolation_mode,
+        ),
         message=message,
         processed_frames=max(
-            progress_state.extracted_frames,
-            progress_state.upscaled_frames,
+            effective_extracted_frames,
+            effective_upscaled_frames,
+            progress_state.interpolated_frames,
             progress_state.encoded_frames,
             progress_state.remuxed_frames,
         ),
         total_frames=total_frames,
         extracted_frames=progress_state.extracted_frames,
         upscaled_frames=progress_state.upscaled_frames,
+        interpolated_frames=progress_state.interpolated_frames,
         encoded_frames=progress_state.encoded_frames,
         remuxed_frames=progress_state.remuxed_frames,
         telemetry_state=telemetry_state,
@@ -810,6 +1203,7 @@ def _run_streaming_pytorch_pipeline(
     silent_video: Path,
     codec: str,
     crf: int,
+    video_encoder_config: VideoEncoderConfig,
     filter_chain: str | None,
     loaded_model,
     effective_tile: int,
@@ -865,15 +1259,11 @@ def _run_streaming_pytorch_pipeline(
     if filter_chain is not None:
         encode_command.extend(["-vf", filter_chain])
 
-    video_encoder = "libx265" if codec == "h265" else "libx264"
     encode_command.extend(
         [
             "-c:v",
-            video_encoder,
-            "-preset",
-            "medium",
-            "-crf",
-            str(crf),
+            video_encoder_config.encoder,
+            *video_encoder_config.quality_args,
             "-pix_fmt",
             "yuv420p",
             str(silent_video),
@@ -1112,6 +1502,7 @@ def _encode_segment_video(
     fps: str,
     codec: str,
     crf: int,
+    video_encoder_config: VideoEncoderConfig,
     filter_chain: str | None,
     model_name: str,
     output_mode: str,
@@ -1124,12 +1515,15 @@ def _encode_segment_video(
     crop_width: float | None,
     crop_height: float | None,
     container: str,
+    input_start_number: int = 1,
+    input_frame_limit: int | None = None,
     log: list[str],
     progress_path: str | None,
     cancel_path: str | None,
     total_frames: int,
     extracted_frames: int,
     upscaled_frames: int,
+    interpolated_frames: int,
     encoded_frames_before_segment: int,
     telemetry_state: PipelineTelemetryState | None,
 ) -> int:
@@ -1139,21 +1533,21 @@ def _encode_segment_video(
         "-y",
         "-framerate",
         fps,
+        "-start_number",
+        str(max(1, input_start_number)),
         "-i",
         str(upscaled_dir / "frame_%08d.png"),
     ]
     if filter_chain is not None:
         encode_command.extend(["-vf", filter_chain])
+    if input_frame_limit is not None:
+        encode_command.extend(["-frames:v", str(max(1, input_frame_limit))])
 
-    video_encoder = "libx265" if codec == "h265" else "libx264"
     encode_command.extend(
         [
             "-c:v",
-            video_encoder,
-            "-preset",
-            "medium",
-            "-crf",
-            str(crf),
+            video_encoder_config.encoder,
+            *video_encoder_config.quality_args,
             "-pix_fmt",
             "yuv420p",
             "-metadata",
@@ -1195,6 +1589,7 @@ def _encode_segment_video(
         message_prefix=f"Encoding segment video {output_file.name}",
         extracted_frames=extracted_frames,
         upscaled_frames=upscaled_frames,
+        interpolated_frames=interpolated_frames,
         encoded_frames=encoded_frames_before_segment,
         remuxed_frames=0,
         telemetry_state=telemetry_state,
@@ -1214,6 +1609,7 @@ def _concat_segment_videos(
     total_frames: int,
     extracted_frames: int,
     upscaled_frames: int,
+    interpolated_frames: int,
     encoded_frames: int,
     log: list[str],
     telemetry_state: PipelineTelemetryState | None = None,
@@ -1248,11 +1644,22 @@ def _concat_segment_videos(
         message_prefix="Concatenating encoded segments",
         extracted_frames=extracted_frames,
         upscaled_frames=upscaled_frames,
+        interpolated_frames=interpolated_frames,
         encoded_frames=encoded_frames,
         remuxed_frames=0,
         telemetry_state=telemetry_state,
     )
     return concatenated_frames
+
+
+def _fps_text(value: float) -> str:
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def _scaled_pipeline_frames(processed_frames: int, source_total_frames: int, pipeline_total_frames: int) -> int:
+    if source_total_frames <= 0:
+        return 0
+    return min(pipeline_total_frames, max(0, int(round((processed_frames / source_total_frames) * pipeline_total_frames))))
 
 
 def _upscale_frames_in_batches(
@@ -1521,6 +1928,8 @@ def run_realesrgan_pipeline(
     model_id: str,
     output_mode: str,
     preset: str,
+    interpolation_mode: str = "off",
+    interpolation_target_fps: int | None = None,
     gpu_id: int | None,
     aspect_ratio_preset: str,
     custom_aspect_width: int | None,
@@ -1563,6 +1972,7 @@ def run_realesrgan_pipeline(
     resolved_pytorch_execution_path = _resolve_pytorch_execution_path(model_id, pytorch_execution_path)
     runtime = ensure_runtime_assets()
     metadata = probe_video(source_path)
+    validate_interpolation_request(interpolation_mode, interpolation_target_fps)
     requested_output = Path(output_path)
     if not requested_output.is_absolute():
         requested_output = repo_root() / requested_output
@@ -1579,6 +1989,8 @@ def run_realesrgan_pipeline(
                 model_id,
                 output_mode,
                 preset,
+                interpolation_mode,
+                str(interpolation_target_fps or 0),
                 str(gpu_id if gpu_id is not None else -1),
                 aspect_ratio_preset,
                 str(custom_aspect_width or 0),
@@ -1619,6 +2031,14 @@ def run_realesrgan_pipeline(
     log: list[str] = []
     model_runtime: dict[str, object] | None = None
     ffmpeg = runtime["ffmpegPath"]
+    video_encoder_config = _resolve_video_encoder_config(
+        ffmpeg=str(ffmpeg),
+        runtime=runtime,
+        gpu_id=gpu_id,
+        codec=codec,
+        crf=crf,
+        log=log,
+    )
     fps = f"{metadata['frameRate']:.6f}".rstrip("0").rstrip(".")
     effective_duration = float(metadata["durationSeconds"])
     if preview_mode:
@@ -1658,6 +2078,656 @@ def run_realesrgan_pipeline(
         crop_width,
         crop_height,
     )
+
+    if interpolation_mode != "off":
+        runtime.update(ensure_rife_runtime())
+        source_fps = float(metadata["frameRate"])
+        output_fps = resolve_output_fps(source_fps, interpolation_mode, interpolation_target_fps)
+        if output_fps < source_fps - 0.01:
+            raise ValueError(
+                f"Interpolation target fps {output_fps:.2f} is lower than source fps {source_fps:.2f}. Choose a target that preserves playback duration."
+            )
+
+        total_output_frames = resolve_segment_output_frame_count(
+            start_frame=0,
+            frame_count=total_frames,
+            source_fps=source_fps,
+            output_fps=output_fps,
+        )
+        encode_fps = _fps_text(output_fps)
+        encode_width = resolved_width
+        encode_height = resolved_height
+        encode_filter_chain = filter_chain
+        if interpolation_mode == "interpolateOnly":
+            encode_width = int(metadata["width"])
+            encode_height = int(metadata["height"])
+            encode_filter_chain = None
+
+        interpolation_segments = _plan_interpolation_segments(
+            segments,
+            total_source_frames=total_frames,
+            source_fps=source_fps,
+            output_fps=output_fps,
+        )
+        if backend_id == "pytorch-image-sr" and resolved_pytorch_execution_path == PYTORCH_EXECUTION_PATH_STREAMING:
+            raise NotImplementedError(
+                "PyTorch streaming execution path is not supported when interpolation is enabled yet. Use file-io for now."
+            )
+
+        progress_state = PipelineProgressState()
+        telemetry_state = PipelineTelemetryState(started_at=time.time(), scratch_path=work_dir, output_path=output_file)
+        _write_progress(
+            progress_path,
+            phase="queued",
+            percent=0,
+            message="Job queued",
+            processed_frames=0,
+            total_frames=total_output_frames,
+            telemetry_state=telemetry_state,
+        )
+
+        loaded_model = None
+        segment_outputs: list[Path | None] = [None] * len(interpolation_segments)
+        concat_manifest = encoded_dir / "segments.txt"
+        progress_lock = threading.Lock()
+        stage_errors: queue.Queue[BaseException] = queue.Queue()
+        stop_event = threading.Event()
+        encode_queue: queue.Queue[InterpolationEncodeTask | object] = queue.Queue(maxsize=PIPELINE_STAGE_QUEUE_DEPTH)
+        sentinel = object()
+
+        def _record_error(error: BaseException) -> None:
+            if stage_errors.empty():
+                stage_errors.put(error)
+            stop_event.set()
+
+        def _queue_put(target_queue: queue.Queue[object], value: object) -> None:
+            while not stop_event.is_set():
+                try:
+                    target_queue.put(value, timeout=0.5)
+                    return
+                except queue.Full:
+                    continue
+
+        def _queue_get(target_queue: queue.Queue[object]) -> object:
+            while True:
+                if stop_event.is_set() and target_queue.empty():
+                    return sentinel
+                try:
+                    return target_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if stop_event.is_set():
+                        return sentinel
+
+        def _publish_progress(phase: str, message: str) -> None:
+            with progress_lock:
+                _emit_pipeline_progress(
+                    progress_path,
+                    phase=phase,
+                    message=message,
+                    total_frames=total_output_frames,
+                    progress_state=progress_state,
+                    source_total_frames=total_frames,
+                    interpolation_mode=interpolation_mode,
+                    telemetry_state=telemetry_state,
+                )
+
+        def preprocess_worker() -> None:
+            nonlocal loaded_model, model_runtime
+            try:
+                if interpolation_mode == "afterUpscale" and backend_id == "pytorch-image-sr":
+                    from upscaler_worker.models.pytorch_sr import load_runtime_model
+
+                    loaded_model = load_runtime_model(
+                        model_id,
+                        gpu_id,
+                        fp16_enabled,
+                        effective_tile,
+                        log,
+                        preset=preset,
+                        torch_compile_enabled=torch_compile_enabled,
+                        torch_compile_mode=torch_compile_mode,
+                        torch_compile_cudagraphs=torch_compile_cudagraphs,
+                        bf16=bf16_enabled,
+                        precision=precision_mode,
+                        pytorch_runner=pytorch_runner,
+                        channels_last_enabled=channels_last,
+                    )
+                    log.append(f"Loaded PyTorch model checkpoint: {loaded_model.checkpoint_path}")
+                    model_runtime = {
+                        "runner": loaded_model.runner,
+                        "precision": precision_mode,
+                        "dtype": str(loaded_model.dtype).replace("torch.", ""),
+                        "frameBatchSize": loaded_model.frame_batch_size,
+                        "channelsLast": loaded_model.channels_last,
+                        "torchCompileRequested": loaded_model.torch_compile_requested,
+                        "torchCompileEnabled": loaded_model.torch_compile_enabled,
+                        "torchCompileMode": loaded_model.torch_compile_mode,
+                        "torchCompileCudagraphs": loaded_model.torch_compile_cudagraphs,
+                    }
+
+                for segment_plan in interpolation_segments:
+                    if stop_event.is_set():
+                        break
+
+                    active_segment_plan = segment_plan
+
+                    expanded_segment = PipelineSegment(
+                        index=active_segment_plan.index,
+                        start_frame=active_segment_plan.expanded_start_frame,
+                        frame_count=active_segment_plan.expanded_frame_count,
+                        start_seconds=active_segment_plan.expanded_start_seconds,
+                        duration_seconds=active_segment_plan.expanded_duration_seconds,
+                    )
+                    segment_dir = segment_root / f"segment_{active_segment_plan.index:04d}"
+                    segment_input_dir = segment_dir / "in"
+                    segment_upscaled_dir = segment_dir / "upscaled"
+                    segment_interpolated_dir = segment_dir / "interpolated"
+                    segment_file = encoded_dir / f"segment_{active_segment_plan.index:04d}.{PIPELINE_INTERMEDIATE_CONTAINER}"
+                    frame_stage_output_dir = segment_input_dir
+
+                    with progress_lock:
+                        _set_segment_progress(
+                            telemetry_state,
+                            segment_index=active_segment_plan.index + 1,
+                            segment_count=len(interpolation_segments),
+                            segment_processed_frames=0,
+                            segment_total_frames=active_segment_plan.source_frame_count,
+                        )
+                    _publish_progress(
+                        "extracting",
+                        f"Extracting segment {active_segment_plan.index + 1}/{len(interpolation_segments)} (0/{active_segment_plan.source_frame_count} frames)",
+                    )
+
+                    extract_stage_started_at = time.time()
+                    extracted_count = _extract_segment_frames(
+                        ffmpeg=str(ffmpeg),
+                        source_path=source_path,
+                        segment=expanded_segment,
+                        input_dir=segment_input_dir,
+                        log=log,
+                        cancel_path=cancel_path,
+                    )
+                    if extracted_count != active_segment_plan.expanded_frame_count:
+                        if (
+                            extracted_count < active_segment_plan.expanded_frame_count
+                            and active_segment_plan.index == len(interpolation_segments) - 1
+                            and extracted_count > active_segment_plan.overlap_before_frames
+                        ):
+                            active_segment_plan = _shrink_final_interpolation_segment_plan(
+                                active_segment_plan,
+                                actual_expanded_frame_count=extracted_count,
+                                source_fps=source_fps,
+                                output_fps=output_fps,
+                            )
+                            expanded_segment = PipelineSegment(
+                                index=active_segment_plan.index,
+                                start_frame=active_segment_plan.expanded_start_frame,
+                                frame_count=active_segment_plan.expanded_frame_count,
+                                start_seconds=active_segment_plan.expanded_start_seconds,
+                                duration_seconds=active_segment_plan.expanded_duration_seconds,
+                            )
+                            log.append(
+                                f"Final interpolation segment {active_segment_plan.index + 1} reached EOF early; adjusting expected extracted frames from {segment_plan.expanded_frame_count} to {extracted_count}."
+                            )
+                        else:
+                            raise RuntimeError(
+                                f"Expected {active_segment_plan.expanded_frame_count} extracted frames for segment {active_segment_plan.index + 1}, received {extracted_count}"
+                            )
+                    with progress_lock:
+                        _record_stage_duration(telemetry_state, "extract", time.time() - extract_stage_started_at)
+                        progress_state.extracted_frames = min(total_frames, progress_state.extracted_frames + active_segment_plan.source_frame_count)
+                        extracted_snapshot = progress_state.extracted_frames
+                        _set_segment_progress(
+                            telemetry_state,
+                            segment_index=active_segment_plan.index + 1,
+                            segment_count=len(interpolation_segments),
+                            segment_processed_frames=active_segment_plan.source_frame_count,
+                            segment_total_frames=active_segment_plan.source_frame_count,
+                        )
+                    _publish_progress(
+                        "extracting",
+                        f"Extracted segment {active_segment_plan.index + 1}/{len(interpolation_segments)} ({extracted_snapshot}/{total_frames} source frames)",
+                    )
+
+                    if interpolation_mode == "afterUpscale":
+                        with progress_lock:
+                            upscaled_before_segment = progress_state.upscaled_frames
+
+                        def report_upscale_batch(batch_index: int, batch_count: int, processed_in_segment: int, _total_in_segment: int) -> None:
+                            processed_without_overlap = max(0, processed_in_segment - active_segment_plan.overlap_before_frames)
+                            unique_processed = min(active_segment_plan.source_frame_count, processed_without_overlap)
+                            with progress_lock:
+                                current_upscaled_frames = min(total_frames, upscaled_before_segment + unique_processed)
+                                _set_segment_progress(
+                                    telemetry_state,
+                                    segment_index=active_segment_plan.index + 1,
+                                    segment_count=len(interpolation_segments),
+                                    segment_processed_frames=unique_processed,
+                                    segment_total_frames=active_segment_plan.source_frame_count,
+                                    batch_index=batch_index,
+                                    batch_count=batch_count,
+                                )
+                            _publish_progress(
+                                "upscaling",
+                                f"Upscaling segment {active_segment_plan.index + 1}/{len(interpolation_segments)} batch {batch_index}/{batch_count} ({unique_processed}/{active_segment_plan.source_frame_count} frames)",
+                            )
+
+                        upscale_stage_started_at = time.time()
+                        if backend_id == "realesrgan-ncnn":
+                            upscaled_count = _upscale_ncnn_segment(
+                                runtime=runtime,
+                                input_dir=segment_input_dir,
+                                output_dir=segment_upscaled_dir,
+                                model_id=model_id,
+                                gpu_id=gpu_id,
+                                effective_tile=effective_tile,
+                                log=log,
+                                cancel_path=cancel_path,
+                            )
+                        elif backend_id == "pytorch-image-sr":
+                            upscaled_count = _upscale_pytorch_segment(
+                                loaded_model=loaded_model,
+                                input_dir=segment_input_dir,
+                                output_dir=segment_upscaled_dir,
+                                effective_tile=effective_tile,
+                                cancel_path=cancel_path,
+                                progress_callback=report_upscale_batch,
+                            )
+                        else:
+                            raise RuntimeError(f"Backend '{backend_id}' is cataloged but not runnable in the current app build")
+                        if upscaled_count != active_segment_plan.expanded_frame_count:
+                            raise RuntimeError(
+                                f"Expected {active_segment_plan.expanded_frame_count} upscaled frames for segment {active_segment_plan.index + 1}, received {upscaled_count}"
+                            )
+                        with progress_lock:
+                            _record_stage_duration(telemetry_state, "upscale", time.time() - upscale_stage_started_at)
+                            progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + active_segment_plan.source_frame_count)
+                            upscaled_snapshot = progress_state.upscaled_frames
+                            _set_segment_progress(
+                                telemetry_state,
+                                segment_index=active_segment_plan.index + 1,
+                                segment_count=len(interpolation_segments),
+                                segment_processed_frames=active_segment_plan.source_frame_count,
+                                segment_total_frames=active_segment_plan.source_frame_count,
+                                batch_index=None,
+                                batch_count=None,
+                            )
+                        _publish_progress(
+                            "upscaling",
+                            f"Upscaled segment {active_segment_plan.index + 1}/{len(interpolation_segments)} ({upscaled_snapshot}/{total_frames} source frames)",
+                        )
+                        frame_stage_output_dir = segment_upscaled_dir
+                    else:
+                        with progress_lock:
+                            upscaled_snapshot = progress_state.upscaled_frames
+
+                    if should_skip_interpolation(
+                        input_frame_count=active_segment_plan.expanded_frame_count,
+                        target_frame_count=active_segment_plan.expanded_output_frame_count,
+                    ):
+                        frame_start_number = active_segment_plan.overlap_before_frames + 1
+                        frame_limit = active_segment_plan.source_frame_count
+                        with progress_lock:
+                            progress_state.interpolated_frames = min(total_output_frames, progress_state.interpolated_frames + active_segment_plan.output_frame_count)
+                            interpolated_snapshot = progress_state.interpolated_frames
+                            _set_segment_progress(
+                                telemetry_state,
+                                segment_index=active_segment_plan.index + 1,
+                                segment_count=len(interpolation_segments),
+                                segment_processed_frames=active_segment_plan.output_frame_count,
+                                segment_total_frames=active_segment_plan.output_frame_count,
+                            )
+                        _publish_progress(
+                            "interpolating",
+                            f"Interpolation skipped for segment {active_segment_plan.index + 1}/{len(interpolation_segments)}; using {active_segment_plan.output_frame_count} source frames",
+                        )
+                    else:
+                        with progress_lock:
+                            interpolated_before_segment = progress_state.interpolated_frames
+
+                        def report_interpolation_progress(processed_in_segment: int, _total_in_segment: int) -> None:
+                            trimmed_processed = max(0, processed_in_segment - active_segment_plan.output_start_frame)
+                            unique_processed = min(active_segment_plan.output_frame_count, trimmed_processed)
+                            with progress_lock:
+                                current_interpolated_frames = min(total_output_frames, interpolated_before_segment + unique_processed)
+                                _set_segment_progress(
+                                    telemetry_state,
+                                    segment_index=active_segment_plan.index + 1,
+                                    segment_count=len(interpolation_segments),
+                                    segment_processed_frames=unique_processed,
+                                    segment_total_frames=active_segment_plan.output_frame_count,
+                                )
+                            _publish_progress(
+                                "interpolating",
+                                f"Interpolating segment {active_segment_plan.index + 1}/{len(interpolation_segments)} ({unique_processed}/{active_segment_plan.output_frame_count} frames)",
+                            )
+
+                        interpolate_stage_started_at = time.time()
+                        interpolated_count = _run_rife_segment(
+                            runtime=runtime,
+                            input_dir=frame_stage_output_dir,
+                            output_dir=segment_interpolated_dir,
+                            target_frame_count=active_segment_plan.expanded_output_frame_count,
+                            gpu_id=gpu_id,
+                            width=encode_width,
+                            height=encode_height,
+                            log=log,
+                            cancel_path=cancel_path,
+                            progress_callback=report_interpolation_progress,
+                        )
+                        if interpolated_count < active_segment_plan.output_start_frame + active_segment_plan.output_frame_count:
+                            raise RuntimeError(
+                                f"Interpolated segment {active_segment_plan.index + 1} produced {interpolated_count} frames, which is not enough to trim {active_segment_plan.output_frame_count} frames starting at {active_segment_plan.output_start_frame}."
+                            )
+                        with progress_lock:
+                            _record_stage_duration(telemetry_state, "interpolate", time.time() - interpolate_stage_started_at)
+                            progress_state.interpolated_frames = min(total_output_frames, interpolated_before_segment + active_segment_plan.output_frame_count)
+                            interpolated_snapshot = progress_state.interpolated_frames
+                        frame_stage_output_dir = segment_interpolated_dir
+                        frame_start_number = active_segment_plan.output_start_frame + 1
+                        frame_limit = active_segment_plan.output_frame_count
+
+                    _queue_put(
+                        encode_queue,
+                        InterpolationEncodeTask(
+                            segment_index=active_segment_plan.index,
+                            output_dir=frame_stage_output_dir,
+                            output_file=segment_file,
+                            frame_start_number=frame_start_number,
+                            frame_limit=frame_limit,
+                            segment_total_frames=active_segment_plan.output_frame_count,
+                            extracted_frames=extracted_snapshot,
+                            upscaled_frames=upscaled_snapshot,
+                            interpolated_frames=interpolated_snapshot,
+                            cleanup_paths=(segment_input_dir, segment_upscaled_dir, segment_interpolated_dir),
+                        ),
+                    )
+            except BaseException as error:  # noqa: BLE001
+                _record_error(error)
+            finally:
+                if loaded_model is not None and getattr(loaded_model.device, "type", "cpu") == "cuda":
+                    import torch
+
+                    torch.cuda.synchronize(loaded_model.device)
+                _queue_put(encode_queue, sentinel)
+
+        def encoder_worker() -> None:
+            try:
+                while True:
+                    item = _queue_get(encode_queue)
+                    if item is sentinel:
+                        break
+                    if not isinstance(item, InterpolationEncodeTask):
+                        continue
+
+                    with progress_lock:
+                        encoded_before_segment = progress_state.encoded_frames
+                        _set_segment_progress(
+                            telemetry_state,
+                            segment_index=item.segment_index + 1,
+                            segment_count=len(interpolation_segments),
+                            segment_processed_frames=0,
+                            segment_total_frames=item.segment_total_frames,
+                        )
+                    encode_stage_started_at = time.time()
+                    encoded_count = _encode_segment_video(
+                        ffmpeg=str(ffmpeg),
+                        upscaled_dir=item.output_dir,
+                        output_file=item.output_file,
+                        fps=encode_fps,
+                        codec=codec,
+                        crf=crf,
+                        video_encoder_config=video_encoder_config,
+                        filter_chain=encode_filter_chain,
+                        model_name=model_name,
+                        output_mode=output_mode,
+                        aspect_ratio_preset=aspect_ratio_preset,
+                        resolution_basis=resolution_basis,
+                        resolved_width=encode_width,
+                        resolved_height=encode_height,
+                        crop_left=crop_left,
+                        crop_top=crop_top,
+                        crop_width=crop_width,
+                        crop_height=crop_height,
+                        container=container,
+                        input_start_number=item.frame_start_number,
+                        input_frame_limit=item.frame_limit,
+                        log=log,
+                        progress_path=progress_path,
+                        cancel_path=cancel_path,
+                        total_frames=total_output_frames,
+                        extracted_frames=item.extracted_frames,
+                        upscaled_frames=item.upscaled_frames,
+                        interpolated_frames=item.interpolated_frames,
+                        encoded_frames_before_segment=encoded_before_segment,
+                        telemetry_state=telemetry_state,
+                    )
+                    for cleanup_path in item.cleanup_paths:
+                        shutil.rmtree(cleanup_path, ignore_errors=True)
+                    segment_outputs[item.segment_index] = item.output_file
+                    with progress_lock:
+                        _record_stage_duration(telemetry_state, "encode", time.time() - encode_stage_started_at)
+                        progress_state.encoded_frames = min(total_output_frames, progress_state.encoded_frames + max(encoded_count, item.segment_total_frames))
+                        encoded_snapshot = progress_state.encoded_frames
+                        _set_segment_progress(
+                            telemetry_state,
+                            segment_index=item.segment_index + 1,
+                            segment_count=len(interpolation_segments),
+                            segment_processed_frames=max(encoded_count, item.segment_total_frames),
+                            segment_total_frames=item.segment_total_frames,
+                        )
+                    _publish_progress(
+                        "encoding",
+                        f"Encoded segment {item.segment_index + 1}/{len(interpolation_segments)} ({encoded_snapshot}/{total_output_frames} frames)",
+                    )
+            except BaseException as error:  # noqa: BLE001
+                _record_error(error)
+
+        _publish_progress("extracting", "Starting overlapped extract/upscale/interpolate/encode pipeline")
+        try:
+            workers = [
+                threading.Thread(target=preprocess_worker, name="interpolation-preprocess", daemon=True),
+                threading.Thread(target=encoder_worker, name="interpolation-encoder", daemon=True),
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+
+            if not stage_errors.empty():
+                raise stage_errors.get()
+
+            segment_files = [segment_file for segment_file in segment_outputs if segment_file is not None]
+            if len(segment_files) != len(interpolation_segments):
+                raise RuntimeError("Failed to encode one or more interpolation segments")
+
+            concat_stage_started_at = time.time()
+            concatenated_frame_count = _concat_segment_videos(
+                ffmpeg=str(ffmpeg),
+                segment_files=segment_files,
+                concat_manifest=concat_manifest,
+                output_file=silent_video,
+                progress_path=progress_path,
+                cancel_path=cancel_path,
+                total_frames=total_output_frames,
+                extracted_frames=progress_state.extracted_frames,
+                upscaled_frames=progress_state.upscaled_frames,
+                interpolated_frames=progress_state.interpolated_frames,
+                encoded_frames=progress_state.encoded_frames,
+                log=log,
+                telemetry_state=telemetry_state,
+            )
+            _record_stage_duration(telemetry_state, "remux", time.time() - concat_stage_started_at)
+            progress_state.remuxed_frames = min(total_output_frames, concatenated_frame_count)
+        finally:
+            if loaded_model is not None and getattr(loaded_model.device, "type", "cpu") == "cuda":
+                import torch
+
+                torch.cuda.synchronize(loaded_model.device)
+
+        if bool(metadata["hasAudio"]):
+            remux_command = [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(silent_video),
+                "-i",
+                source_path,
+                *( ["-t", f"{effective_duration:.3f}"] if preview_mode else [] ),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a?",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-shortest",
+                "-metadata",
+                "upscaler_audio_source=original",
+                "-metadata",
+                f"upscaler_model={model_id}",
+                "-metadata",
+                f"upscaler_codec={codec}",
+                "-metadata",
+                f"upscaler_container={container}",
+                "-metadata",
+                f"upscaler_interpolation_mode={interpolation_mode}",
+                "-metadata",
+                f"upscaler_interpolation_target_fps={int(round(output_fps))}",
+                str(output_file),
+            ]
+            remux_stage_started_at = time.time()
+            remuxed_frame_count, _ = _run_ffmpeg_with_frame_progress(
+                remux_command,
+                log,
+                progress_path,
+                cancel_path,
+                phase="remuxing",
+                percent_base=97,
+                percent_span=3,
+                total_frames=total_output_frames,
+                message_prefix="Remuxing original audio",
+                extracted_frames=progress_state.extracted_frames,
+                upscaled_frames=progress_state.upscaled_frames,
+                interpolated_frames=progress_state.interpolated_frames,
+                encoded_frames=progress_state.encoded_frames,
+                remuxed_frames=progress_state.remuxed_frames,
+                telemetry_state=telemetry_state,
+            )
+            _record_stage_duration(telemetry_state, "remux", time.time() - remux_stage_started_at)
+        else:
+            finalize_command = [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(silent_video),
+                "-c",
+                "copy",
+                str(output_file),
+            ]
+            remux_stage_started_at = time.time()
+            remuxed_frame_count, _ = _run_ffmpeg_with_frame_progress(
+                finalize_command,
+                log,
+                progress_path,
+                cancel_path,
+                phase="remuxing",
+                percent_base=97,
+                percent_span=3,
+                total_frames=total_output_frames,
+                message_prefix="Finalizing video output",
+                extracted_frames=progress_state.extracted_frames,
+                upscaled_frames=progress_state.upscaled_frames,
+                interpolated_frames=progress_state.interpolated_frames,
+                encoded_frames=progress_state.encoded_frames,
+                remuxed_frames=progress_state.remuxed_frames,
+                telemetry_state=telemetry_state,
+            )
+            _record_stage_duration(telemetry_state, "remux", time.time() - remux_stage_started_at)
+
+        progress_state.remuxed_frames = min(total_output_frames, remuxed_frame_count)
+        _write_progress(
+            progress_path,
+            phase="completed",
+            percent=100,
+            message="Pipeline completed",
+            processed_frames=total_output_frames,
+            total_frames=total_output_frames,
+            extracted_frames=progress_state.extracted_frames,
+            upscaled_frames=progress_state.upscaled_frames,
+            interpolated_frames=progress_state.interpolated_frames,
+            encoded_frames=progress_state.encoded_frames,
+            remuxed_frames=progress_state.remuxed_frames,
+            telemetry_state=telemetry_state,
+        )
+
+        silent_video.unlink(missing_ok=True)
+        for segment_file in segment_files:
+            segment_file.unlink(missing_ok=True)
+        concat_manifest.unlink(missing_ok=True)
+        total_elapsed_seconds = max(0.0, time.time() - telemetry_state.started_at)
+        resolved_frame_count = max(
+            1,
+            progress_state.remuxed_frames or progress_state.encoded_frames or progress_state.interpolated_frames or total_output_frames,
+        )
+        average_throughput = resolved_frame_count / max(0.001, total_elapsed_seconds)
+        return {
+            "outputPath": str(output_file),
+            "workDir": str(work_dir),
+            "executionPath": "rife-ncnn-vulkan",
+            "videoEncoder": video_encoder_config.encoder,
+            "videoEncoderLabel": video_encoder_config.label,
+            "runner": pytorch_runner or "torch",
+            "precision": precision_mode,
+            "torchCompileEnabled": torch_compile_enabled,
+            "torchCompileMode": torch_compile_mode,
+            "torchCompileCudagraphs": torch_compile_cudagraphs,
+            "frameCount": resolved_frame_count,
+            "hadAudio": bool(metadata["hasAudio"]),
+            "codec": codec,
+            "container": container,
+            "interpolationDiagnostics": {
+                "mode": interpolation_mode,
+                "sourceFps": source_fps,
+                "outputFps": output_fps,
+                "sourceFrameCount": progress_state.extracted_frames or total_frames,
+                "outputFrameCount": resolved_frame_count,
+                "segmentCount": len(interpolation_segments),
+                "segmentFrameLimit": segment_frame_limit,
+                "segmentOverlapFrames": 1 if len(interpolation_segments) > 1 else 0,
+            },
+            "runtime": runtime,
+            "stageTimings": {
+                "extractSeconds": telemetry_state.extract_stage_seconds,
+                "upscaleSeconds": telemetry_state.upscale_stage_seconds,
+                "interpolateSeconds": telemetry_state.interpolate_stage_seconds,
+                "encodeSeconds": telemetry_state.encode_stage_seconds,
+                "remuxSeconds": telemetry_state.remux_stage_seconds,
+            },
+            "resourcePeaks": {
+                "processRssBytes": telemetry_state.resources.peak_process_rss_bytes,
+                "gpuMemoryUsedBytes": telemetry_state.resources.peak_gpu_memory_used_bytes,
+                "gpuMemoryTotalBytes": telemetry_state.resources.gpu_memory_total_bytes,
+                "scratchSizeBytes": telemetry_state.resources.peak_scratch_size_bytes,
+                "outputSizeBytes": telemetry_state.resources.peak_output_size_bytes,
+            },
+            "modelRuntime": model_runtime,
+            "averageThroughputFps": average_throughput,
+            "segmentCount": len(interpolation_segments),
+            "segmentFrameLimit": segment_frame_limit,
+            "log": log + [
+                f"Model: {model_name} ({model_id})",
+                f"Interpolation mode: {interpolation_mode}",
+                f"Resolved output fps: {encode_fps}",
+                f"Resolved output canvas: {encode_width}x{encode_height}",
+                f"Chunked interpolation segments: {len(interpolation_segments)} at up to {segment_frame_limit} source frames each with one-frame boundary overlap",
+                f"Processed duration: {effective_duration:.2f}s",
+                f"Average throughput: {average_throughput:.2f} fps",
+                f"Rolling throughput: {(telemetry_state.resources.rolling_frames_per_second or 0.0):.2f} fps",
+                f"Stage timings: extract {telemetry_state.extract_stage_seconds:.2f}s, upscale {telemetry_state.upscale_stage_seconds:.2f}s, interpolate {telemetry_state.interpolate_stage_seconds:.2f}s, encode {telemetry_state.encode_stage_seconds:.2f}s, remux {telemetry_state.remux_stage_seconds:.2f}s",
+            ],
+        }
 
     progress_state = PipelineProgressState()
     telemetry_state = PipelineTelemetryState(started_at=time.time(), scratch_path=work_dir, output_path=output_file)
@@ -1927,6 +2997,7 @@ def run_realesrgan_pipeline(
                     fps=fps,
                     codec=codec,
                     crf=crf,
+                    video_encoder_config=video_encoder_config,
                     filter_chain=filter_chain,
                     model_name=model_name,
                     output_mode=output_mode,
@@ -1945,6 +3016,7 @@ def run_realesrgan_pipeline(
                     total_frames=total_frames,
                     extracted_frames=progress_state.extracted_frames,
                     upscaled_frames=progress_state.upscaled_frames,
+                    interpolated_frames=progress_state.interpolated_frames,
                     encoded_frames_before_segment=progress_state.encoded_frames,
                     telemetry_state=telemetry_state,
                 )
@@ -2021,6 +3093,7 @@ def run_realesrgan_pipeline(
             silent_video=silent_video,
             codec=codec,
             crf=crf,
+            video_encoder_config=video_encoder_config,
             filter_chain=filter_chain,
             loaded_model=loaded_model,
             effective_tile=effective_tile,
@@ -2067,6 +3140,7 @@ def run_realesrgan_pipeline(
             total_frames=total_frames,
             extracted_frames=progress_state.extracted_frames,
             upscaled_frames=progress_state.upscaled_frames,
+            interpolated_frames=progress_state.interpolated_frames,
             encoded_frames=progress_state.encoded_frames,
             log=log,
             telemetry_state=telemetry_state,
@@ -2118,6 +3192,7 @@ def run_realesrgan_pipeline(
             message_prefix="Remuxing original audio",
             extracted_frames=progress_state.extracted_frames,
             upscaled_frames=progress_state.upscaled_frames,
+            interpolated_frames=progress_state.interpolated_frames,
             encoded_frames=progress_state.encoded_frames,
             remuxed_frames=progress_state.remuxed_frames,
             telemetry_state=telemetry_state,
@@ -2147,6 +3222,7 @@ def run_realesrgan_pipeline(
             message_prefix="Finalizing video output",
             extracted_frames=progress_state.extracted_frames,
             upscaled_frames=progress_state.upscaled_frames,
+            interpolated_frames=progress_state.interpolated_frames,
             encoded_frames=progress_state.encoded_frames,
             remuxed_frames=progress_state.remuxed_frames,
             telemetry_state=telemetry_state,
@@ -2176,18 +3252,21 @@ def run_realesrgan_pipeline(
     silent_video.unlink(missing_ok=True)
 
     total_elapsed_seconds = max(0.0, time.time() - telemetry_state.started_at)
-    average_throughput = total_frames / max(0.001, total_elapsed_seconds)
+    resolved_frame_count = max(1, progress_state.remuxed_frames or progress_state.encoded_frames or total_frames)
+    average_throughput = resolved_frame_count / max(0.001, total_elapsed_seconds)
 
     return {
         "outputPath": str(output_file),
         "workDir": str(work_dir),
         "executionPath": resolved_pytorch_execution_path or "external-executable",
+        "videoEncoder": video_encoder_config.encoder,
+        "videoEncoderLabel": video_encoder_config.label,
         "runner": pytorch_runner or "torch",
         "precision": precision_mode,
         "torchCompileEnabled": torch_compile_enabled,
         "torchCompileMode": torch_compile_mode,
         "torchCompileCudagraphs": torch_compile_cudagraphs,
-        "frameCount": total_frames,
+        "frameCount": resolved_frame_count,
         "hadAudio": bool(metadata["hasAudio"]),
         "codec": codec,
         "container": container,
@@ -2195,6 +3274,7 @@ def run_realesrgan_pipeline(
         "stageTimings": {
             "extractSeconds": telemetry_state.extract_stage_seconds,
             "upscaleSeconds": telemetry_state.upscale_stage_seconds,
+            "interpolateSeconds": telemetry_state.interpolate_stage_seconds,
             "encodeSeconds": telemetry_state.encode_stage_seconds,
             "remuxSeconds": telemetry_state.remux_stage_seconds,
         },
@@ -2221,6 +3301,6 @@ def run_realesrgan_pipeline(
             f"Processed duration: {effective_duration:.2f}s",
             f"Average throughput: {average_throughput:.2f} fps",
             f"Rolling throughput: {(telemetry_state.resources.rolling_frames_per_second or 0.0):.2f} fps",
-            f"Stage timings: extract {telemetry_state.extract_stage_seconds:.2f}s, upscale {telemetry_state.upscale_stage_seconds:.2f}s, encode {telemetry_state.encode_stage_seconds:.2f}s, remux {telemetry_state.remux_stage_seconds:.2f}s",
+            f"Stage timings: extract {telemetry_state.extract_stage_seconds:.2f}s, upscale {telemetry_state.upscale_stage_seconds:.2f}s, interpolate {telemetry_state.interpolate_stage_seconds:.2f}s, encode {telemetry_state.encode_stage_seconds:.2f}s, remux {telemetry_state.remux_stage_seconds:.2f}s",
         ],
     }

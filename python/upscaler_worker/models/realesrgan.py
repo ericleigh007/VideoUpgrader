@@ -8,7 +8,7 @@ from upscaler_worker.model_catalog import (
     model_label,
     model_runtime_name,
 )
-from upscaler_worker.models.pytorch_sr import resolve_precision_mode
+from upscaler_worker.precision import resolve_precision_mode
 
 
 def build_realesrgan_job_plan(
@@ -17,6 +17,8 @@ def build_realesrgan_job_plan(
     model_id: str,
     output_mode: str,
     preset: str,
+    interpolation_mode: str = "off",
+    interpolation_target_fps: int | None = None,
     gpu_id: int | None,
     aspect_ratio_preset: str,
     custom_aspect_width: int | None,
@@ -55,6 +57,8 @@ def build_realesrgan_job_plan(
             model_id,
             output_mode,
             preset,
+            interpolation_mode,
+            str(interpolation_target_fps or 0),
             str(gpu_id if gpu_id is not None else -1),
             aspect_ratio_preset,
             str(custom_aspect_width or 0),
@@ -98,6 +102,8 @@ def build_realesrgan_job_plan(
         output_mode,
         "--preset",
         preset,
+        "--interpolation-mode",
+        interpolation_mode,
         "--aspect-ratio-preset",
         aspect_ratio_preset,
         "--resolution-basis",
@@ -138,6 +144,8 @@ def build_realesrgan_job_plan(
         command.extend(["--preview-duration-seconds", str(preview_duration_seconds)])
     if segment_duration_seconds is not None:
         command.extend(["--segment-duration-seconds", str(segment_duration_seconds)])
+    if interpolation_target_fps is not None:
+        command.extend(["--interpolation-target-fps", str(interpolation_target_fps)])
     if fp16:
         command.append("--fp16")
     if bf16:
@@ -164,6 +172,8 @@ def build_realesrgan_job_plan(
         f"Runtime name: {model_runtime_name(model_id)}",
         f"Output mode: {output_mode}",
         f"Preset: {preset}",
+        f"Interpolation mode: {interpolation_mode}",
+        f"Interpolation target fps: {interpolation_target_fps or 'off'}",
         f"GPU: {gpu_id if gpu_id is not None else 'auto'}",
         f"Aspect ratio: {aspect_ratio_preset}",
         f"Resolution basis: {resolution_basis}",

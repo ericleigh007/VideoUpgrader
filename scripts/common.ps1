@@ -3,6 +3,12 @@ function Get-UpscalerPython {
         return $env:UPSCALER_PYTHON
     }
 
+    $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    $repoLocalPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
+    if (Test-Path $repoLocalPython) {
+        return $repoLocalPython
+    }
+
     return "python"
 }
 
@@ -22,7 +28,7 @@ function Assert-CommandAvailable {
 function Assert-Prerequisites {
     Assert-CommandAvailable -Command "npm" -HelpText "Install Node.js and npm before running repository scripts."
     Assert-CommandAvailable -Command "cargo" -HelpText "Install the Rust toolchain before running repository scripts."
-    Assert-CommandAvailable -Command (Get-UpscalerPython) -HelpText "Provide Python 3.10+ or set UPSCALER_PYTHON."
+    Assert-CommandAvailable -Command (Get-UpscalerPython) -HelpText "Provide Python 3.10+, keep the repo .venv available, or set UPSCALER_PYTHON explicitly."
 }
 
 function Invoke-CheckedCommand {

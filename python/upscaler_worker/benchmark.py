@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image
 
 from upscaler_worker.model_catalog import ensure_runnable_model, model_backend_id, model_label
-from upscaler_worker.models.pytorch_sr import resolve_precision_mode
+from upscaler_worker.precision import resolve_precision_mode
 from upscaler_worker.runtime import ensure_runtime_assets
 
 
