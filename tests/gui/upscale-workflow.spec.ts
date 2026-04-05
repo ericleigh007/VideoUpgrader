@@ -557,6 +557,7 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
   await expect(page.getByTestId("target-model-set-card")).toHaveCount(0);
   await expect(page.getByTestId("selected-model-label")).toContainText("Real-ESRGAN x4 Plus");
   await expect(page.getByTestId("selected-model-summary")).toContainText("photographic");
+  await page.getByTestId("model-details-card").locator("summary").click();
   await page.getByTestId("model-rating-select").selectOption("4");
   await expect(page.getByTestId("rating-summary")).toContainText("Saved rating: 4/5");
   await expect(page.getByTestId("gpu-select")).toHaveValue("1");
@@ -699,9 +700,11 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
   await expect(page.getByTestId("interpolation-diagnostics-overlap")).toContainText("1 frame");
   await expect(page.getByTestId("pipeline-log")).toContainText("Completed mock pipeline for realesrgan-x4plus");
   await expect(page.getByTestId("pipeline-log")).toContainText("Stage timings: extract 4s, upscale 18s, interpolate 11s, encode 5s, remux 3s");
-  await expect(page.getByText("Original audio remuxed")).toBeVisible();
+  await page.getByTestId("result-output-details").locator("summary").click();
+  await expect(page.getByTestId("result-output-details")).toContainText("Original audio remuxed");
   await expect(page.getByTestId("result-preview")).toBeVisible();
-  await expect(page.getByText("Blind Picks Logged")).toBeVisible();
+  await page.locator(".pipeline-runtime-disclosure").locator("summary").click();
+  await expect(page.locator(".pipeline-runtime-disclosure")).toContainText("Blind Picks Logged");
 
   const { lastRequest: workflowRequest } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
   expect(workflowRequest?.interpolationMode).toBe("afterUpscale");
@@ -988,7 +991,8 @@ test("shows historical cleanup jobs and runs cleanup actions", async ({ page }) 
   await page.goto("/");
 
   await page.getByTestId("job-cleanup-panel-toggle").click();
-  await expect(page.getByTestId("cleanup-sort-select")).toHaveValue("largest");
+  await expect(page.getByTestId("cleanup-sort-size")).toContainText("↓");
+  await expect(page.getByTestId("cleanup-sort-size")).toHaveClass(/cleanup-sort-button-active/);
   await expect(page.getByTestId("cleanup-jobs-table")).toBeVisible();
   await expect(page.getByTestId("cleanup-job-historic-pipeline-job")).toContainText("Historical Upscale Job");
   await expect(page.getByTestId("cleanup-job-conv_historic-source-job")).toContainText("Historical Conversion");
