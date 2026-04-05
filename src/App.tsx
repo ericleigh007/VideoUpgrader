@@ -3272,7 +3272,15 @@ export default function App() {
                 <section className="pipeline-stage-body" data-testid="upscaler-workspace-section">
                   <label>
                     Model
-                    <select data-testid="model-select" value={modelId} onChange={(event) => setModelId(event.target.value as ModelId)}>
+                    <select
+                      data-testid="model-select"
+                      value={modelId}
+                      onChange={(event) => {
+                        const nextModelId = event.target.value as ModelId;
+                        setModelId(nextModelId);
+                        setPytorchRunner(recommendedPytorchRunner(nextModelId));
+                      }}
+                    >
                       <optgroup label="Available Now">
                         {runnableModels.map((model) => (
                           <option key={model.value} value={model.value}>{model.label}</option>
