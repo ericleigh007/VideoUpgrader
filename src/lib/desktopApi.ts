@@ -25,32 +25,6 @@ function mockApi(): Partial<DesktopApi> | undefined {
   return window.__UPSCALER_MOCK__;
 }
 
-function inferPreviewMimeType(path: string): string {
-  const normalized = path.toLowerCase();
-  if (normalized.endsWith(".mp4")) {
-    return "video/mp4";
-  }
-  if (normalized.endsWith(".webm")) {
-    return "video/webm";
-  }
-  if (normalized.endsWith(".mov")) {
-    return "video/quicktime";
-  }
-  if (normalized.endsWith(".mkv")) {
-    return "video/x-matroska";
-  }
-  return "application/octet-stream";
-}
-
-function base64ToBlobUrl(base64: string, mimeType: string): string {
-  const binary = window.atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
-}
-
 export const desktopApi: DesktopApi = {
   async selectVideoFile() {
     const mock = mockApi();
@@ -235,9 +209,7 @@ export const desktopApi: DesktopApi = {
       return this.toPreviewSrc(path);
     }
 
-    const normalized = path.replace(/\\/g, "/");
-    const encoded = await invoke<string>("read_preview_file_base64", { path: normalized });
-    return base64ToBlobUrl(encoded, inferPreviewMimeType(normalized));
+    return this.toPreviewSrc(path);
   },
 
   toPreviewSrc(path: string) {

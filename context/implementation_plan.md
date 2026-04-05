@@ -1,8 +1,8 @@
-# Upscaler App Implementation Plan
+# VideoUpgrader App Implementation Plan
 
 ## Objective
 
-Build a Windows-first desktop application for comparing video upscaler models with the primary goal of maximizing output quality and the secondary goal of measuring performance. The app should ingest source video, upscale it up to 4K UHD, optionally preserve aspect ratio or crop to a fixed 4K frame, and produce analytical comparisons of competing models at the pixel level and over time.
+Build a Windows-first desktop application for comparing video upscaler models and frame interpolation workflows with the primary goal of maximizing output quality and the secondary goal of measuring performance. The app should ingest source video, upscale it up to 4K UHD, optionally preserve aspect ratio or crop to a fixed 4K frame, interpolate to higher frame rates where requested, and produce analytical comparisons of competing models at the pixel level and over time.
 
 This plan is based on the current baseline in [requirements.md](requirements.md) and the existing build/runbook direction in [build_upscalers.md](../build_upscalers.md).
 
@@ -11,9 +11,11 @@ This plan is based on the current baseline in [requirements.md](requirements.md)
 - Windows is the primary platform.
 - The app is desktop-first, mouse-first, and workspace-first.
 - Long videos must remain full-length, with original audio re-synced into the exported output.
+- Interpolation-only and after-upscale interpolation must preserve audio sync within the configured AV tolerance.
 - Settings changes should be reflected immediately in the preview window where feasible.
 - Build and test flow must be hands-off from the repository.
 - Automated testing is required, including GUI verification.
+- Progress telemetry must expose phase progress, throughput, ETA, RAM, and GPU usage for long-running jobs.
 - Model artifacts may come from GitHub or Hugging Face and should be locally cached.
 - GPU usage can target up to roughly 12 GB of VRAM.
 
@@ -26,6 +28,7 @@ The product should be built as a quality-analysis workstation, not just an upsca
 3. Pixel-level and temporal analytics.
 4. Full-job export with original audio retained.
 5. Reliable execution on a single Windows GPU with tiling and resumable jobs.
+6. Strong unit, integration, AV-sync, and GUI coverage before enabling real interpolation by default.
 
 ## Recommended Architecture
 
@@ -56,6 +59,7 @@ The product should be built as a quality-analysis workstation, not just an upsca
 7. Export pipeline with audio remux
 8. Synthetic test generator
 9. Automation and verification harness
+10. Interpolation pipeline and AV-sync validation harness
 
 ## Model Investigation
 
@@ -257,11 +261,29 @@ The main workspace should include:
 1. Probe source with FFprobe.
 2. Decode frames to a managed cache.
 3. Run selected model adapters against the same normalized frame stream.
-4. Store per-frame outputs and job metadata.
-5. Compute metrics against reference data where available.
-6. Render preview and overlays from cached outputs.
-7. Encode final video.
-8. Remux original audio with frame-accurate duration checks.
+4. Run interpolation when requested, either on the original frame stream or after upscale depending on the selected workflow.
+5. Store per-frame outputs and job metadata.
+6. Compute metrics against reference data where available.
+7. Render preview and overlays from cached outputs.
+8. Encode final video at the resolved output fps.
+9. Remux original audio with frame-accurate duration checks.
+
+## Interpolation Strategy
+
+### Initial Runtime Recommendation
+
+- Use `rife-ncnn-vulkan` as the first runnable interpolation backend on Windows.
+- Treat interpolation as a dedicated pipeline stage with explicit progress and telemetry rather than folding it into encode.
+- Support two modes from the same runtime contract:
+	1. `interpolateOnly`
+	2. `afterUpscale`
+
+### Sync Requirements For Interpolation
+
+- The interpolation stage must preserve source playback duration.
+- The encode stage must use the resolved output fps derived from the interpolation target.
+- The remux stage must preserve the source audio track without drift.
+- Synthetic AV-sync fixtures must be validated after interpolation-only and post-upscale interpolation pipelines.
 
 ## Caching And Reproducibility
 
@@ -305,6 +327,9 @@ The UI should expose memory-safe presets such as:
 - crop and pad calculations
 - metrics math on known fixtures
 - audio remux validation helpers
+- interpolation request validation
+- output-fps derivation and target-frame planning
+- interpolation progress telemetry and stage timing helpers
 
 ### Integration Tests
 
@@ -315,6 +340,9 @@ The UI should expose memory-safe presets such as:
 - Compute and persist metrics
 - Export final video with original audio
 - Reopen saved project and restore state
+- Validate AV-sync after interpolation-only export
+- Validate AV-sync after post-upscale interpolation export
+- Validate progress telemetry fields during interpolation jobs
 
 ### Automated GUI Tests
 
@@ -324,6 +352,9 @@ The UI should expose memory-safe presets such as:
 - Inspect metrics panel for populated values
 - Export and verify output artifact exists
 - Reload project and verify session restore
+- Enable interpolation controls and verify request wiring
+- Verify interpolation progress, throughput, memory, and GPU telemetry are rendered
+- Verify per-job fps warning behavior when the interpolation target is not higher than the source
 
 ### Golden Tests
 
@@ -371,6 +402,13 @@ The UI should expose memory-safe presets such as:
 - Add BasicVSR++ adapter.
 - Add temporal metrics and clip-window execution.
 - Compare frame-wise models versus temporal model on synthetic motion clips.
+
+### Phase 5A: Frame Interpolation
+
+- Add the RIFE runtime adapter and artifact download flow.
+- Add interpolation-only and post-upscale execution modes.
+- Add AV-sync validation fixtures and regression gates for interpolation pipelines.
+- Add GUI telemetry coverage for interpolation progress and resource usage.
 
 ### Phase 6: Synthetic Benchmark Lab
 

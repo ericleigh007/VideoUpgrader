@@ -113,6 +113,28 @@ struct SourceVideoSummary {
     frame_rate: f64,
     has_audio: bool,
     container: String,
+    video_codec: String,
+    source_bitrate_kbps: Option<u32>,
+    video_profile: Option<String>,
+    pixel_format: Option<String>,
+    audio_codec: Option<String>,
+    audio_profile: Option<String>,
+    audio_sample_rate: Option<u32>,
+    audio_channels: Option<String>,
+    audio_bitrate_kbps: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InterpolationDiagnostics {
+    mode: String,
+    source_fps: f64,
+    output_fps: f64,
+    source_frame_count: usize,
+    output_frame_count: usize,
+    segment_count: usize,
+    segment_frame_limit: usize,
+    segment_overlap_frames: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +146,8 @@ struct PipelineResult {
     had_audio: bool,
     codec: String,
     container: String,
+    #[serde(default)]
+    interpolation_diagnostics: Option<InterpolationDiagnostics>,
     runtime: RuntimeStatus,
     log: Vec<String>,
 }

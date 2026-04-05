@@ -1,13 +1,15 @@
-# Upscaler
+# VideoUpgrader
 
-Upscaler is a Windows-first desktop app for evaluating video upscalers the way enthusiasts, researchers, and developers actually use them: by comparing outputs side by side, zooming into problem areas, checking framing behavior, and then exporting a full processed video when a model and setting combination earns it.
+VideoUpgrader is a Windows-first desktop app for evaluating video upscalers the way enthusiasts, researchers, and developers actually use them: by comparing outputs side by side, zooming into problem areas, checking framing behavior, boosting frame rate when needed, and then exporting a full processed video when a model and setting combination earns it.
 
-The project combines a Tauri desktop shell, a React comparison-first UI, and a Python worker that handles probing, synthetic benchmark generation, model execution, encode, remux, and diagnostic benchmarking.
+The project combines a Tauri desktop shell, a React comparison-first UI, and a Python worker that handles probing, synthetic benchmark generation, model execution, interpolation, encode, remux, and diagnostic benchmarking.
 
-## What Upscaler Does
+## What VideoUpgrader Does
 
 - Load a local video and inspect source metadata.
 - Run multiple upscale jobs against the same source material.
+- Run interpolation-only jobs on an existing source video.
+- Run a combined pipeline that upscales first and then interpolates to a target frame rate.
 - Compare outputs with a zoomed inspection workflow.
 - Run blind sample comparisons before committing to a final export.
 - Generate reproducible synthetic benchmark fixtures.
@@ -18,20 +20,25 @@ The current UI already includes a comparison inspector with zoom, focus presets,
 
 ## Current Focus
 
-Upscaler is currently centered on:
+VideoUpgrader is currently centered on:
 
 - Real-ESRGAN-family and PyTorch image super-resolution model evaluation.
+- RIFE-based frame interpolation to 30 fps or 60 fps.
 - 4K framing workflows.
 - Comparison-centric desktop usage instead of a one-click demo flow.
 - Repeatable benchmarking so quality and speed decisions are evidence-based.
 
 The current product direction is quality first, performance second.
 
-## What's Coming
+## Current Processing Modes
 
-- Video frame interpolation as a planned follow-on capability.
-- Support for interpolation-only runs on existing videos, alongside post-upscale interpolation in the main export pipeline.
-- Explicit 30 fps and 60 fps target workflows once the runtime stage is implemented.
+The app now supports three distinct video processing modes:
+
+- Upscale only.
+- Interpolate only.
+- Upscale first, then interpolate in the same pipeline.
+
+Interpolation targets currently support 30 fps and 60 fps outputs through the Windows RIFE NCNN runtime.
 
 ## Available Models
 
@@ -67,6 +74,82 @@ The intended workflow is:
 6. Export the winning result.
 
 The app is designed to support model-vs-model and settings-vs-settings evaluation on the same source material, not just single-pass transcoding.
+
+## Upscale And Interpolation Instructions
+
+### Desktop App
+
+Launch the desktop app:
+
+```powershell
+./scripts/run.ps1
+```
+
+Then use one of these workflows:
+
+1. Upscale only
+
+- Select a source video.
+- In the Upscaler section, choose the upscale model you want.
+- Set Frame Rate Booster to Off.
+- Choose output sizing, codec, container, GPU, and quality settings.
+- Click Run Upscale.
+
+2. Interpolate an existing video without upscaling
+
+- Select a source video.
+- In Frame Rate Booster, choose Interpolate Existing Video.
+- Choose the target frame rate: 30 fps or 60 fps.
+- Set output codec, container, and GPU.
+- Click Run Interpolation.
+
+3. Run the combined VideoUpgrader pipeline
+
+- Select a source video.
+- Choose the upscale model and output sizing settings.
+- In Frame Rate Booster, choose Interpolate After Upscale.
+- Choose the target frame rate: 30 fps or 60 fps.
+- Click Run Upscale + Interpolation.
+
+Notes:
+
+- If the source is already at or above the selected target frame rate, the app warns before continuing.
+- Interpolation keeps the original audio track attached to the final export.
+- The result panel includes interpolation diagnostics in a collapsed details box for segment count, overlap, source fps, and output fps.
+
+### Python Worker CLI
+
+Set the worker path first:
+
+```powershell
+$env:PYTHONPATH='python'
+```
+
+1. Run upscale only
+
+```powershell
+& 'C:/Users/ericl/AppData/Local/Programs/Python/Python310/python.exe' python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrgan-x4plus --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode off --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/upscaled-only.mp4 --codec h264 --container mp4
+```
+
+2. Run interpolation only
+
+```powershell
+& 'C:/Users/ericl/AppData/Local/Programs/Python/Python310/python.exe' python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrgan-x4plus --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode interpolateOnly --interpolation-target-fps 60 --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/interpolated-only.mp4 --codec h264 --container mp4
+```
+
+3. Run upscale and interpolation together
+
+```powershell
+& 'C:/Users/ericl/AppData/Local/Programs/Python/Python310/python.exe' python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrgan-x4plus --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode afterUpscale --interpolation-target-fps 60 --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/upscaled-and-interpolated.mp4 --codec h264 --container mp4
+```
+
+CLI notes:
+
+- `--interpolation-mode off` means upscale only.
+- `--interpolation-mode interpolateOnly` skips the upscale stage and runs interpolation on the source video.
+- `--interpolation-mode afterUpscale` runs interpolation after the upscale stage completes.
+- The worker lazily downloads the RIFE runtime the first time an interpolation job runs.
+- Add `--gpu-id`, `--tile-size`, `--precision`, or `--pytorch-runner` if you need to pin a device or tune runtime behavior.
 
 ## Prerequisites
 
@@ -292,4 +375,4 @@ Still expanding:
 
 ## Why This Project Exists
 
-Upscaler is for people who do not want to judge an upscaler from marketing shots, one cherry-picked crop, or a single render preset. It is for repeatable evaluation, careful comparison, and evidence-backed choices.
+VideoUpgrader is for people who do not want to judge an upscaler from marketing shots, one cherry-picked crop, or a single render preset. It is for repeatable evaluation, careful comparison, evidence-backed choices, and now frame-rate upgrades that can be validated the same way.

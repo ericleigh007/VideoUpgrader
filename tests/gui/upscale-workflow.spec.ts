@@ -1,5 +1,19 @@
 import { expect, test } from "@playwright/test";
 
+async function openUpscaleControls(page) {
+  const workspace = page.getByTestId("upscaler-workspace-section");
+  if (!(await workspace.isVisible().catch(() => false))) {
+    await page.getByTestId("pipeline-toggle-upscale").click();
+  }
+}
+
+async function openInterpolationControls(page) {
+  const workspace = page.getByTestId("frame-rate-workspace-section");
+  if (!(await workspace.isVisible().catch(() => false))) {
+    await page.getByTestId("pipeline-toggle-interpolation").click();
+  }
+}
+
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
     let activeJob = null;
@@ -35,6 +49,8 @@ test.beforeEach(async ({ page }) => {
           ffmpegPath: "C:/tools/ffmpeg.exe",
           realesrganPath: "C:/tools/realesrgan-ncnn-vulkan.exe",
           modelDir: "C:/tools/models",
+          rifePath: "C:/tools/rife-ncnn-vulkan.exe",
+          rifeModelRoot: "C:/tools/rife-models",
           availableGpus: [
             { id: 0, name: "Intel(R) Graphics", kind: "integrated" },
             { id: 1, name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", kind: "discrete" }
@@ -51,7 +67,8 @@ test.beforeEach(async ({ page }) => {
           durationSeconds: 12.5,
           frameRate: 24,
           hasAudio: true,
-          container: "mp4"
+          container: "mp4",
+          videoCodec: "h264"
         };
       },
       async startSourceConversionToMp4(sourcePath) {
@@ -89,7 +106,8 @@ test.beforeEach(async ({ page }) => {
             durationSeconds: 12.5,
             frameRate: 24,
             hasAudio: true,
-            container: "mp4"
+            container: "mp4",
+            videoCodec: "h264"
           },
           error: null
         };
@@ -270,38 +288,39 @@ test.beforeEach(async ({ page }) => {
           throw new Error(`Expected selected model realesrgan-x4plus, received ${request.modelId}`);
         }
         const modelSuffix = request.modelId.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+        const interpolationEnabled = request.interpolationMode !== "off";
         activeJob = {
           jobId: `mock-job-${modelSuffix}`,
           state: "running",
           progress: {
-            phase: "upscaling",
+            phase: interpolationEnabled ? "interpolating" : "upscaling",
             percent: 62,
-            message: "Upscaling extracted frames",
-            processedFrames: 180,
-            totalFrames: 300,
+            message: interpolationEnabled ? "Interpolating additional frames" : "Upscaling extracted frames",
+            processedFrames: interpolationEnabled ? 430 : 180,
+            totalFrames: interpolationEnabled ? 750 : 300,
             extractedFrames: 300,
-            upscaledFrames: 180,
-            interpolatedFrames: 0,
+            upscaledFrames: interpolationEnabled ? 300 : 180,
+            interpolatedFrames: interpolationEnabled ? 430 : 0,
             encodedFrames: 0,
             remuxedFrames: 0,
             segmentIndex: 1,
             segmentCount: 1,
-            segmentProcessedFrames: 180,
-            segmentTotalFrames: 300,
-            batchIndex: 15,
-            batchCount: 25,
+            segmentProcessedFrames: interpolationEnabled ? 430 : 180,
+            segmentTotalFrames: interpolationEnabled ? 750 : 300,
+            batchIndex: interpolationEnabled ? null : 15,
+            batchCount: interpolationEnabled ? null : 25,
             elapsedSeconds: 30,
-            averageFramesPerSecond: 6,
-            rollingFramesPerSecond: 7.5,
-            estimatedRemainingSeconds: 20,
+            averageFramesPerSecond: interpolationEnabled ? 14.5 : 6,
+            rollingFramesPerSecond: interpolationEnabled ? 16.2 : 7.5,
+            estimatedRemainingSeconds: interpolationEnabled ? 22 : 20,
             processRssBytes: 1024 * 1024 * 512,
             gpuMemoryUsedBytes: 1024 * 1024 * 6144,
             gpuMemoryTotalBytes: 1024 * 1024 * 24576,
             scratchSizeBytes: 1024 * 1024 * 12,
             outputSizeBytes: 1024 * 1024 * 3,
             extractStageSeconds: 4,
-            upscaleStageSeconds: 18,
-            interpolateStageSeconds: 0,
+            upscaleStageSeconds: interpolationEnabled ? 18 : 18,
+            interpolateStageSeconds: interpolationEnabled ? 11 : 0,
             encodeStageSeconds: 5,
             remuxStageSeconds: 3
           },
@@ -316,16 +335,28 @@ test.beforeEach(async ({ page }) => {
               ffmpegPath: "C:/tools/ffmpeg.exe",
               realesrganPath: "C:/tools/realesrgan-ncnn-vulkan.exe",
               modelDir: "C:/tools/models",
+              rifePath: "C:/tools/rife-ncnn-vulkan.exe",
+              rifeModelRoot: "C:/tools/rife-models",
               availableGpus: [
                 { id: 0, name: "Intel(R) Graphics", kind: "integrated" },
                 { id: 1, name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", kind: "discrete" }
               ],
               defaultGpuId: 1
             },
+            interpolationDiagnostics: interpolationEnabled ? {
+              mode: request.interpolationMode,
+              sourceFps: 24,
+              outputFps: 60,
+              sourceFrameCount: 300,
+              outputFrameCount: 750,
+              segmentCount: 2,
+              segmentFrameLimit: 48,
+              segmentOverlapFrames: 1,
+            } : null,
             log: [
               `Completed mock pipeline for ${request.modelId}`,
-              "Average throughput: 6.00 fps",
-              "Stage timings: extract 4s, upscale 18s, encode 5s, remux 3s",
+              `Average throughput: ${interpolationEnabled ? "14.50" : "6.00"} fps`,
+              `Stage timings: extract 4s, upscale 18s, interpolate ${interpolationEnabled ? "11s" : "0s"}, encode 5s, remux 3s`,
               "Remuxed original audio"
             ]
           },
@@ -346,13 +377,13 @@ test.beforeEach(async ({ page }) => {
             phase: "completed",
             percent: 100,
             message: "Pipeline completed",
-            processedFrames: 300,
-            totalFrames: 300,
+            processedFrames: activeJob.progress.totalFrames,
+            totalFrames: activeJob.progress.totalFrames,
             extractedFrames: 300,
-            upscaledFrames: 300,
-            interpolatedFrames: 0,
-            encodedFrames: 300,
-            remuxedFrames: 300
+            upscaledFrames: activeJob.progress.upscaledFrames === 0 ? 300 : activeJob.progress.upscaledFrames,
+            interpolatedFrames: activeJob.progress.interpolatedFrames === 0 ? 0 : activeJob.progress.totalFrames,
+            encodedFrames: activeJob.progress.totalFrames,
+            remuxedFrames: activeJob.progress.totalFrames
           }
         };
       },
@@ -401,7 +432,8 @@ test("plays a real preview fixture through the GUI controls", async ({ page }) =
       durationSeconds: 12.5,
       frameRate: 24,
       hasAudio: true,
-      container: "mp4"
+      container: "mp4",
+      videoCodec: "h264"
     });
   });
 
@@ -442,9 +474,10 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "VideoUpgrader" })).toBeVisible();
-  await expect(page.getByTestId("upscaler-section-card")).toContainText("Spatial detail pipeline");
-  await expect(page.getByTestId("interpolator-section-card")).toContainText("Motion interpolation workspace");
-  await expect(page.getByTestId("frame-rate-workspace-section")).toContainText("Interpolation Workspace");
+  await expect(page.getByTestId("upscaler-section-card")).toContainText("Spatial detail restore");
+  await expect(page.getByTestId("interpolator-section-card")).toContainText("Upsampling / interpolation");
+  await page.getByTestId("pipeline-toggle-interpolation").click();
+  await expect(page.getByTestId("frame-rate-workspace-section")).toContainText("Target Frame Rate");
 
   await page.evaluate(() => {
     Object.defineProperty(HTMLMediaElement.prototype, "paused", {
@@ -484,6 +517,7 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
 
   await page.getByTestId("select-video-button").click();
   await expect(page.getByTestId("source-preview")).toBeVisible();
+  await expect(page.getByTestId("top-status-eta")).toContainText("Not running");
   await expect(page.getByText("C:/fixtures/sample-input.mp4")).toBeVisible();
   await expect(page.getByTestId("source-preview")).toHaveJSProperty("controls", true);
   await expect(page.getByTestId("source-preview-toolbar")).toBeVisible();
@@ -514,11 +548,12 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
   await expect(page.getByTestId("source-preview-seek")).toHaveValue("0");
   await page.getByTestId("source-preview-play-toggle").click();
   await expect(page.getByTestId("source-preview")).toHaveJSProperty("paused", true);
+  await openUpscaleControls(page);
   await expect(page.locator('[data-testid="model-select"] optgroup[label="Available Now"] option')).toHaveCount(4);
-  await expect(page.locator('[data-testid="model-select"] optgroup[label="Planned"] option')).toHaveCount(3);
-  await expect(page.locator('[data-testid="model-select"] option[disabled]')).toHaveCount(3);
+  await expect(page.locator('[data-testid="model-select"] optgroup[label="Planned"] option')).toHaveCount(2);
+  await expect(page.locator('[data-testid="model-select"] option[disabled]')).toHaveCount(2);
   await expect(page.locator('[data-testid="model-select"] option[value="hat-realhat-gan-x4"]')).toContainText("not implemented");
-  await expect(page.locator('[data-testid="model-select"] option[value="rife-v4.6"]')).toContainText("not implemented");
+  await expect(page.locator('[data-testid="model-select"] option[value="rife-v4.6"]')).toHaveCount(0);
   await expect(page.getByTestId("target-model-set-card")).toHaveCount(0);
   await expect(page.getByTestId("selected-model-label")).toContainText("Real-ESRGAN x4 Plus");
   await expect(page.getByTestId("selected-model-summary")).toContainText("photographic");
@@ -613,7 +648,7 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
 
   await page.getByTestId("container-select").selectOption("mkv");
   await page.getByTestId("codec-select").selectOption("h265");
-  await page.getByTestId("frame-rate-mode-select").selectOption("afterUpscale");
+  await openInterpolationControls(page);
   await page.getByTestId("frame-rate-target-select").selectOption("60");
   await expect(page.getByTestId("interpolation-workspace-summary")).toContainText("Post-upscale interpolation");
   await page.getByTestId("preview-mode-checkbox").check();
@@ -637,25 +672,33 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
   await expect(page.getByText("Selected winner")).toBeVisible();
 
   await page.getByTestId("run-upscale-button").click();
+  await page.getByTestId("job-cleanup-panel-toggle").click();
   await expect(page.getByTestId("job-progress-panel")).toBeVisible();
   await expect(page.getByTestId("progress-upscaled-frames")).toContainText("300");
-  await expect(page.getByTestId("progress-remuxed-frames")).toContainText("300");
+  await expect(page.getByTestId("progress-interpolated-frames")).toContainText("750");
+  await expect(page.getByTestId("progress-remuxed-frames")).toContainText("750");
   await expect(page.getByTestId("progress-segment-counter")).toContainText("1/1");
-  await expect(page.getByTestId("progress-segment-frames")).toContainText("180/300");
-  await expect(page.getByTestId("progress-batch-counter")).toContainText("15/25");
-  await expect(page.getByTestId("progress-average-fps")).toContainText("6.00 fps");
-  await expect(page.getByTestId("progress-rolling-fps")).toContainText("7.50 fps");
-  await expect(page.getByTestId("progress-eta")).toContainText("20s");
+  await expect(page.getByTestId("progress-segment-frames")).toContainText("430/750");
+  await expect(page.getByTestId("progress-average-fps")).toContainText("14.5 fps");
+  await expect(page.getByTestId("progress-rolling-fps")).toContainText("16.2 fps");
+  await expect(page.getByTestId("progress-eta")).toContainText("22s");
   await expect(page.getByTestId("progress-process-rss")).toContainText("512 MB");
   await expect(page.getByTestId("progress-gpu-memory")).toContainText("6.0 GB / 24 GB");
   await expect(page.getByTestId("progress-stage-timings")).toContainText("extract 4s");
+  await expect(page.getByTestId("progress-stage-timings")).toContainText("interpolate 11s");
   await expect(page.getByTestId("progress-current-activity")).toContainText("Pipeline completed");
   await expect(page.getByTestId("progress-current-detail")).toContainText("segment 1/1");
   await expect(page.getByTestId("progress-last-update")).toContainText("Last update");
   await expect(page.getByTestId("progress-event-log")).toContainText("Pipeline completed");
+  await expect(page.getByTestId("phase-progress-interpolate")).toContainText("750/750");
   await expect(page.getByTestId("result-output-path")).toContainText("C:/exports/upscaled-result.mkv");
+  await expect(page.getByTestId("interpolation-diagnostics-details")).not.toHaveAttribute("open", "");
+  await page.getByTestId("interpolation-diagnostics-summary").click();
+  await expect(page.getByTestId("interpolation-diagnostics-segment-count")).toContainText("2");
+  await expect(page.getByTestId("interpolation-diagnostics-segment-limit")).toContainText("48");
+  await expect(page.getByTestId("interpolation-diagnostics-overlap")).toContainText("1 frame");
   await expect(page.getByTestId("pipeline-log")).toContainText("Completed mock pipeline for realesrgan-x4plus");
-  await expect(page.getByTestId("pipeline-log")).toContainText("Stage timings: extract 4s, upscale 18s, encode 5s, remux 3s");
+  await expect(page.getByTestId("pipeline-log")).toContainText("Stage timings: extract 4s, upscale 18s, interpolate 11s, encode 5s, remux 3s");
   await expect(page.getByText("Original audio remuxed")).toBeVisible();
   await expect(page.getByTestId("result-preview")).toBeVisible();
   await expect(page.getByText("Blind Picks Logged")).toBeVisible();
@@ -669,6 +712,7 @@ test("shows the PyTorch runner selector only for PyTorch image SR models and pas
   await page.goto("/");
 
   await page.getByTestId("select-video-button").click();
+  await openUpscaleControls(page);
   await expect(page.getByTestId("pytorch-runner-select")).toBeHidden();
 
   await page.getByTestId("model-select").selectOption("swinir-realworld-x4");
@@ -710,12 +754,14 @@ test("warns per job when the interpolation target is not higher than the source 
       durationSeconds: 12.5,
       frameRate: 30,
       hasAudio: true,
-      container: "mp4"
+      container: "mp4",
+      videoCodec: "h264"
     });
   });
 
   await page.getByTestId("select-video-button").click();
-  await page.getByTestId("frame-rate-mode-select").selectOption("interpolateOnly");
+  await openInterpolationControls(page);
+  await page.getByTestId("pipeline-toggle-upscale").click();
   await page.getByTestId("frame-rate-target-select").selectOption("30");
   await page.getByTestId("run-upscale-button").click();
 
@@ -726,10 +772,134 @@ test("warns per job when the interpolation target is not higher than the source 
   expect(lastRequest?.interpolationTargetFps).toBe(30);
 });
 
+test("keeps export format controls available for interpolation-only jobs and matches supported input settings", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    if (!window.__UPSCALER_MOCK__) {
+      return;
+    }
+
+    window.__UPSCALER_MOCK__.probeSourceVideo = async (sourcePath) => ({
+      path: sourcePath,
+      previewPath: "C:/fixtures/sample-input-preview.mp4",
+      width: 1920,
+      height: 1080,
+      durationSeconds: 18,
+      frameRate: 24,
+      hasAudio: true,
+      container: "mkv",
+      videoCodec: "hevc"
+    });
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await openInterpolationControls(page);
+  await page.getByTestId("pipeline-toggle-upscale").click();
+
+  await expect(page.getByTestId("pipeline-export-settings")).toBeVisible();
+  await expect(page.getByTestId("match-input-format-summary")).toContainText("HEVC in MKV");
+
+  await page.getByTestId("codec-select").selectOption("h264");
+  await page.getByTestId("container-select").selectOption("mp4");
+  await page.getByTestId("match-input-format-button").click();
+
+  await expect(page.getByTestId("codec-select")).toHaveValue("h265");
+  await expect(page.getByTestId("container-select")).toHaveValue("mkv");
+
+  await page.getByTestId("run-upscale-button").click();
+
+  const { lastRequest } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+  expect(lastRequest?.interpolationMode).toBe("interpolateOnly");
+  expect(lastRequest?.codec).toBe("h265");
+  expect(lastRequest?.container).toBe("mkv");
+});
+
+test("shows overlapped interpolation and encoding progress in the job panel", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    if (!window.__UPSCALER_MOCK__) {
+      return;
+    }
+
+    window.__UPSCALER_MOCK__.startPipeline = async (request) => {
+      window.__UPSCALER_TEST_STATE__.lastRequest = request;
+      return "mock-overlap-job";
+    };
+
+    window.__UPSCALER_MOCK__.getPipelineJob = async () => ({
+      jobId: "mock-overlap-job",
+      state: "running",
+      progress: {
+        phase: "encoding",
+        percent: 76,
+        message: "Encoding segment 1 while the next segment is already interpolated",
+        processedFrames: 180,
+        totalFrames: 750,
+        extractedFrames: 300,
+        upscaledFrames: 300,
+        interpolatedFrames: 540,
+        encodedFrames: 180,
+        remuxedFrames: 0,
+        segmentIndex: 1,
+        segmentCount: 2,
+        segmentProcessedFrames: 180,
+        segmentTotalFrames: 600,
+        batchIndex: null,
+        batchCount: null,
+        elapsedSeconds: 34,
+        averageFramesPerSecond: 13.8,
+        rollingFramesPerSecond: 15.4,
+        estimatedRemainingSeconds: 12,
+        processRssBytes: 1024 * 1024 * 640,
+        gpuMemoryUsedBytes: 1024 * 1024 * 7168,
+        gpuMemoryTotalBytes: 1024 * 1024 * 24576,
+        scratchSizeBytes: 1024 * 1024 * 16,
+        outputSizeBytes: 1024 * 1024 * 5,
+        extractStageSeconds: 4,
+        upscaleStageSeconds: 18,
+        interpolateStageSeconds: 12,
+        encodeStageSeconds: 6,
+        remuxStageSeconds: 0,
+      },
+      result: null,
+      error: null,
+    });
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await openInterpolationControls(page);
+  await page.getByTestId("frame-rate-target-select").selectOption("60");
+  await page.getByTestId("run-upscale-button").click();
+  await page.getByTestId("job-cleanup-panel-toggle").click();
+
+  await expect(page.getByTestId("job-progress-panel")).toBeVisible();
+  await expect(page.getByTestId("progress-message")).toContainText("next segment is already interpolated");
+  await expect(page.getByTestId("progress-current-activity")).toContainText("Encoding");
+  await expect(page.getByTestId("progress-current-detail")).toContainText("segment 1/2");
+  await expect(page.getByTestId("progress-segment-counter")).toContainText("1/2");
+  await expect(page.getByTestId("progress-segment-frames")).toContainText("180/600");
+  await expect(page.getByTestId("progress-interpolated-frames")).toContainText("540");
+  await expect(page.getByTestId("progress-encoded-frames")).toContainText("180");
+  await expect(page.getByTestId("phase-progress-interpolate")).toContainText("540/750");
+  await expect(page.getByTestId("phase-progress-encode")).toContainText("180/750");
+  await expect(page.getByTestId("progress-average-fps")).toContainText("13.8 fps");
+  await expect(page.getByTestId("progress-rolling-fps")).toContainText("15.4 fps");
+  await expect(page.getByTestId("progress-eta")).toContainText("12s");
+  await expect(page.getByTestId("top-status-panel")).toContainText("Pipeline Running");
+  await expect(page.getByTestId("top-status-panel")).toContainText("ETA 12s");
+
+  const { lastRequest } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+  expect(lastRequest?.interpolationMode).toBe("afterUpscale");
+  expect(lastRequest?.interpolationTargetFps).toBe(60);
+});
+
 test("shows not-implemented models in the selector and blocks export when one becomes current", async ({ page }) => {
   await page.goto("/");
 
   await page.getByTestId("select-video-button").click();
+  await openUpscaleControls(page);
   await expect(page.locator('[data-testid="model-select"] option[value="rvrt-x4"]')).toHaveJSProperty("disabled", true);
 
   await page.evaluate(() => {
@@ -765,7 +935,8 @@ test("upgrades an avi preview in the background and still supports manual conver
       durationSeconds: 55,
       frameRate: 29.97,
       hasAudio: true,
-      container: "avi"
+      container: "avi",
+      videoCodec: "mpeg4"
     });
   });
 
@@ -777,6 +948,7 @@ test("upgrades an avi preview in the background and still supports manual conver
   await expect(page.getByTestId("convert-source-to-mp4-button")).toBeVisible();
 
   await page.getByTestId("convert-source-to-mp4-button").click();
+  await page.getByTestId("job-cleanup-panel-toggle").click();
   await expect(page.getByTestId("conversion-progress-panel")).toBeVisible();
   await expect(page.getByText("C:/fixtures/sample-input_fastprep.mp4")).toBeVisible();
   await expect(page.getByText("Source converted to MP4.")).toBeVisible();
@@ -799,7 +971,8 @@ test("routes webm sources through the converted preview path", async ({ page }) 
       durationSeconds: 61,
       frameRate: 23.976,
       hasAudio: true,
-      container: "webm"
+      container: "webm",
+      videoCodec: "vp9"
     });
   });
 

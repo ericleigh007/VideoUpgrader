@@ -24,7 +24,8 @@ describe("interpolation helpers", () => {
       durationSeconds: 5,
       frameRate: 60,
       hasAudio: true,
-      container: "mp4"
+      container: "mp4",
+      videoCodec: "h264"
     };
 
     expect(buildInterpolationWarning(source, "afterUpscale", 60)).toContain("not higher");

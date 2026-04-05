@@ -35,12 +35,23 @@ export interface SourceVideoSummary {
   frameRate: number;
   hasAudio: boolean;
   container: string;
+  videoCodec: string;
+  sourceBitrateKbps?: number | null;
+  videoProfile?: string | null;
+  pixelFormat?: string | null;
+  audioCodec?: string | null;
+  audioProfile?: string | null;
+  audioSampleRate?: number | null;
+  audioChannels?: string | null;
+  audioBitrateKbps?: number | null;
 }
 
 export interface RuntimeStatus {
   ffmpegPath: string;
   realesrganPath: string;
   modelDir: string;
+  rifePath?: string;
+  rifeModelRoot?: string;
   availableGpus: GpuDevice[];
   defaultGpuId: number | null;
 }
@@ -138,6 +149,17 @@ export interface PipelineProgress {
   remuxStageSeconds?: number | null;
 }
 
+export interface InterpolationDiagnostics {
+  mode: string;
+  sourceFps: number;
+  outputFps: number;
+  sourceFrameCount: number;
+  outputFrameCount: number;
+  segmentCount: number;
+  segmentFrameLimit: number;
+  segmentOverlapFrames: number;
+}
+
 export interface RealesrganJobPlan {
   model: string;
   command: string[];
@@ -152,6 +174,7 @@ export interface PipelineResult {
   hadAudio: boolean;
   codec: VideoCodec;
   container: OutputContainer;
+  interpolationDiagnostics?: InterpolationDiagnostics | null;
   runtime: RuntimeStatus;
   log: string[];
 }

@@ -15,6 +15,7 @@ PREVIEW_COMPATIBLE_CONTAINERS = {"mp4"}
 PREVIEW_CLIP_SECONDS = 30
 PREVIEW_MAX_WIDTH = 960
 FAST_MP4_VERSION = "fast-mp4-v1"
+STREAM_LINE_PATTERN = r"^\s*Stream\s+#\d+:\d+(?:\[[^\]]+\])?(?:\([^)]+\))?:\s*{kind}:\s+.+$"
 
 
 def _preview_root() -> Path:
@@ -53,6 +54,56 @@ def _prefers_nvidia_encoder(runtime: dict[str, object]) -> bool:
 
 def _run_ffmpeg(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, text=True, check=False)
+
+
+def _find_stream_line(stderr: str, kind: str) -> str | None:
+    match = re.search(STREAM_LINE_PATTERN.format(kind=re.escape(kind)), stderr, flags=re.MULTILINE)
+    return match.group(0) if match else None
+
+
+def _split_stream_descriptor(line: str, marker: str) -> list[str]:
+    if f"{marker}:" not in line:
+        return []
+    descriptor = line.split(f"{marker}:", maxsplit=1)[1].strip()
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    for char in descriptor:
+        if char == "," and depth == 0:
+            value = "".join(current).strip()
+            if value:
+                parts.append(value)
+            current = []
+            continue
+        current.append(char)
+        if char in "([":
+            depth += 1
+        elif char in ")]" and depth > 0:
+            depth -= 1
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _extract_profile(descriptor: str | None) -> str | None:
+    if not descriptor:
+        return None
+    matches = re.findall(r"\(([^)]+)\)", descriptor)
+    for match in matches:
+        candidate = match.strip()
+        if candidate and "/" not in candidate:
+            return candidate
+    return None
+
+
+def _parse_int_kbps(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = re.search(r"(\d+)\s*kb/s", value)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def _write_progress(
@@ -337,8 +388,11 @@ def probe_video(source_path: str) -> dict[str, object]:
     )
     stderr = process.stderr
     duration_match = re.search(r"Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
-    video_match = re.search(r"Video:.*?(\d{2,5})x(\d{2,5}).*?(\d+(?:\.\d+)?)\s+fps", stderr)
-    audio_present = "Audio:" in stderr
+    duration_bitrate_match = re.search(r"bitrate:\s*(\d+)\s*kb/s", stderr)
+    video_line = _find_stream_line(stderr, "Video")
+    audio_line = _find_stream_line(stderr, "Audio")
+    video_match = re.search(r"Video:\s*([^,]+),.*?(\d{2,5})x(\d{2,5}).*?(\d+(?:\.\d+)?)\s+fps", video_line or "")
+    audio_present = audio_line is not None
 
     if duration_match is None or video_match is None:
         raise RuntimeError(f"Could not parse video metadata for {source_path}\n{stderr}")
@@ -349,14 +403,35 @@ def probe_video(source_path: str) -> dict[str, object]:
     duration_seconds = hours * 3600 + minutes * 60 + seconds
 
     container = source_path.rsplit(".", maxsplit=1)[-1].lower() if "." in source_path else "unknown"
+    video_parts = _split_stream_descriptor(video_line or "", "Video")
+    audio_parts = _split_stream_descriptor(audio_line or "", "Audio")
+    video_codec = video_match.group(1).split()[0].lower()
+    video_profile = _extract_profile(video_parts[0] if video_parts else video_match.group(1))
+    pixel_format = video_parts[1] if len(video_parts) > 1 else None
+    audio_codec = audio_parts[0].split()[0].lower() if audio_parts else None
+    audio_profile = _extract_profile(audio_parts[0] if audio_parts else None)
+    audio_sample_rate_match = re.search(r"(\d+)\s+Hz", audio_line or "")
+    audio_sample_rate = int(audio_sample_rate_match.group(1)) if audio_sample_rate_match else None
+    audio_channels = audio_parts[2] if len(audio_parts) > 2 else None
+    source_bitrate_kbps = int(duration_bitrate_match.group(1)) if duration_bitrate_match else None
+    audio_bitrate_kbps = _parse_int_kbps(audio_line)
     preview_path = ensure_browser_preview(source_path, str(runtime["ffmpegPath"]), container)
     return {
         "path": source_path,
         "previewPath": preview_path,
-        "width": int(video_match.group(1)),
-        "height": int(video_match.group(2)),
+        "width": int(video_match.group(2)),
+        "height": int(video_match.group(3)),
         "durationSeconds": duration_seconds,
-        "frameRate": float(video_match.group(3)),
+        "frameRate": float(video_match.group(4)),
         "hasAudio": audio_present,
         "container": container,
+        "videoCodec": video_codec,
+        "sourceBitrateKbps": source_bitrate_kbps,
+        "videoProfile": video_profile,
+        "pixelFormat": pixel_format,
+        "audioCodec": audio_codec,
+        "audioProfile": audio_profile,
+        "audioSampleRate": audio_sample_rate,
+        "audioChannels": audio_channels,
+        "audioBitrateKbps": audio_bitrate_kbps,
     }

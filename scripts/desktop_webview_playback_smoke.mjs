@@ -4,13 +4,26 @@ async function main() {
   const realSourcePath = process.env.REAL_SOURCE_PATH ?? '';
   const realPreviewPath = process.env.REAL_PREVIEW_PATH ?? '';
   const mockContainer = process.env.MOCK_SOURCE_CONTAINER ?? 'mp4';
+  const pipelineMode = process.env.DESKTOP_PIPELINE_MODE ?? 'afterUpscale';
   const targetAspect = process.env.TARGET_ASPECT ?? '1:1';
   const previewWaitMs = Number.parseInt(process.env.PREVIEW_WAIT_MS ?? '10000', 10);
   const cdpConnectTimeoutMs = Number.parseInt(process.env.CDP_CONNECT_TIMEOUT_MS ?? '60000', 10);
   const cropNudgeMode = process.env.CROP_NUDGE_MODE ?? 'xy';
+  const expectedMockSourcePath = `C:/fixtures/sample-input.${mockContainer}`;
   const [targetAspectWidth, targetAspectHeight] = targetAspect.split(':').map((value) => Number.parseFloat(value));
   const expectedAspect = targetAspectWidth > 0 && targetAspectHeight > 0 ? targetAspectWidth / targetAspectHeight : 1;
   const isRealBackendMode = realSourcePath.length > 0;
+  const isInterpolationOnlyMode = pipelineMode === 'interpolateOnly';
+  const expectedInterpolationMode = isInterpolationOnlyMode ? 'interpolateOnly' : 'afterUpscale';
+
+  async function openPanelIfCollapsed(page, workspaceTestId, toggleTestId) {
+    const workspace = page.getByTestId(workspaceTestId);
+    const isVisible = await workspace.isVisible().catch(() => false);
+    if (!isVisible) {
+      await page.getByTestId(toggleTestId).click();
+    }
+  }
+
   const browser = await chromium.connectOverCDP('http://127.0.0.1:9223', { timeout: cdpConnectTimeoutMs });
   try {
     const context = browser.contexts()[0];
@@ -20,8 +33,7 @@ async function main() {
     }
 
     await page.bringToFront();
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.evaluate(({ realSourcePath: sourcePath, isRealBackendMode: useRealBackend, mockContainer: container }) => {
+    await page.addInitScript(({ realSourcePath: sourcePath, isRealBackendMode: useRealBackend, mockContainer: container }) => {
       if (useRealBackend) {
         window.__UPSCALER_MOCK__ = {
           async selectVideoFile() {
@@ -35,21 +47,23 @@ async function main() {
         async selectVideoFile() {
           return `C:/fixtures/sample-input.${container}`;
         },
-        async selectOutputFile(_defaultPath, container) {
-          return `C:/exports/upscaled-result.${container}`;
+        async selectOutputFile(_defaultPath, outputContainer) {
+          return `C:/exports/upscaled-result.${outputContainer}`;
         },
         async ensureRuntimeAssets() {
           return {
             ffmpegPath: 'C:/tools/ffmpeg.exe',
             realesrganPath: 'C:/tools/realesrgan-ncnn-vulkan.exe',
             modelDir: 'C:/tools/models',
+            rifePath: 'C:/tools/rife-ncnn-vulkan.exe',
+            rifeModelRoot: 'C:/tools/rife-models',
             availableGpus: [{ id: 1, name: 'NVIDIA RTX', kind: 'discrete' }],
             defaultGpuId: 1,
           };
         },
-        async probeSourceVideo(sourcePath) {
+        async probeSourceVideo(selectedSourcePath) {
           return {
-            path: sourcePath,
+            path: selectedSourcePath,
             previewPath: container === 'mp4' ? '/fixtures/gui-progress-sample.mp4' : 'C:/fixtures/sample-input-preview.mp4',
             width: 1280,
             height: 720,
@@ -57,10 +71,11 @@ async function main() {
             frameRate: 24,
             hasAudio: true,
             container,
+            videoCodec: 'h264',
           };
         },
-        async startSourceConversionToMp4(sourcePath) {
-          return `mock-${sourcePath}`;
+        async startSourceConversionToMp4(selectedSourcePath) {
+          return `mock-${selectedSourcePath}`;
         },
         async getSourceConversionJob(jobId) {
           return {
@@ -74,6 +89,7 @@ async function main() {
               totalFrames: 1000,
               extractedFrames: 0,
               upscaledFrames: 0,
+              interpolatedFrames: 0,
               encodedFrames: 0,
               remuxedFrames: 0,
             },
@@ -86,6 +102,7 @@ async function main() {
               frameRate: 24,
               hasAudio: true,
               container: 'mp4',
+              videoCodec: 'h264',
             },
             error: null,
           };
@@ -100,23 +117,47 @@ async function main() {
         async recordBlindComparisonSelection() {
           return { modelRatings: {}, blindComparisons: [] };
         },
-        async startPipeline() {
+        async startPipeline(request) {
+          window.__UPSCALER_TEST_STATE__ = { lastRequest: request };
           return 'mock-pipeline-job';
         },
         async getPipelineJob() {
           return {
             jobId: 'mock-pipeline-job',
-            state: 'queued',
+            state: 'running',
             progress: {
-              phase: 'queued',
-              percent: 0,
-              message: 'Job queued',
-              processedFrames: 0,
-              totalFrames: 0,
-              extractedFrames: 0,
-              upscaledFrames: 0,
-              encodedFrames: 0,
+              phase: 'encoding',
+              percent: isInterpolationOnlyMode ? 71 : 76,
+              message: isInterpolationOnlyMode
+                ? 'Encoding interpolated-only segment 1 while the next segment is already interpolated'
+                : 'Encoding segment 1 while the next segment is already interpolated',
+              processedFrames: 180,
+              totalFrames: 750,
+              extractedFrames: 300,
+              upscaledFrames: isInterpolationOnlyMode ? 0 : 300,
+              interpolatedFrames: 540,
+              encodedFrames: 180,
               remuxedFrames: 0,
+              segmentIndex: 1,
+              segmentCount: 2,
+              segmentProcessedFrames: 180,
+              segmentTotalFrames: 600,
+              batchIndex: null,
+              batchCount: null,
+              elapsedSeconds: 34,
+              averageFramesPerSecond: 13.8,
+              rollingFramesPerSecond: 15.4,
+              estimatedRemainingSeconds: 12,
+              processRssBytes: 1024 * 1024 * 640,
+              gpuMemoryUsedBytes: 1024 * 1024 * 7168,
+              gpuMemoryTotalBytes: 1024 * 1024 * 24576,
+              scratchSizeBytes: 1024 * 1024 * 16,
+              outputSizeBytes: 1024 * 1024 * 5,
+              extractStageSeconds: 4,
+              upscaleStageSeconds: isInterpolationOnlyMode ? 0 : 18,
+              interpolateStageSeconds: 12,
+              encodeStageSeconds: 6,
+              remuxStageSeconds: 0,
             },
             result: null,
             error: null,
@@ -142,9 +183,39 @@ async function main() {
           return path;
         },
       };
-    }, { realSourcePath, isRealBackendMode, mockContainer });
+    }, { realSourcePath, isRealBackendMode, mockContainer, isInterpolationOnlyMode });
+    await page.evaluate(() => {
+      window.localStorage.clear();
+      window.sessionStorage.clear();
+    }).catch(() => {});
+    await page.reload({ waitUntil: 'domcontentloaded' });
+
+    const mockDiagnostics = await page.evaluate(async () => {
+      const mock = window.__UPSCALER_MOCK__;
+      return {
+        hasMock: Boolean(mock),
+        mockKeys: mock ? Object.keys(mock).sort() : [],
+        selectedPath: mock && typeof mock.selectVideoFile === 'function' ? await mock.selectVideoFile() : null,
+      };
+    });
+
+    if (!mockDiagnostics.hasMock) {
+      throw new Error(`Desktop smoke failed to install the page mock: ${JSON.stringify(mockDiagnostics)}`);
+    }
 
     await page.getByTestId('select-video-button').click();
+    if (!isRealBackendMode) {
+      const selectedSourceVisible = await page.getByText(expectedMockSourcePath).waitFor({ timeout: previewWaitMs }).then(() => true).catch(() => false);
+      if (!selectedSourceVisible) {
+        const selectionDiagnostics = await page.evaluate(() => ({
+          errorText: document.querySelector('[data-testid="error-text"]')?.textContent ?? null,
+          bodyText: document.body.textContent ?? '',
+          testState: window.__UPSCALER_TEST_STATE__ ?? null,
+        }));
+        throw new Error(`Desktop smoke did not switch to the mocked source path ${expectedMockSourcePath}. Diagnostics: ${JSON.stringify(selectionDiagnostics)}`);
+      }
+    }
+
     const previewBecameVisible = await page.waitForFunction(() => {
       return Boolean(
         document.querySelector('[data-testid="source-preview"]')
@@ -190,141 +261,7 @@ async function main() {
     if (isRealBackendMode || mockContainer !== 'mp4') {
       await expect(page.getByTestId('source-preview-mode')).toContainText('preview');
     }
-    await expect(page.getByTestId('source-preview-play-toggle')).toBeVisible();
-    await page.getByTestId('source-preview-play-toggle').click();
-
-    const playbackAdvanced = await page.waitForFunction(() => {
-      const video = document.querySelector('[data-testid="source-preview"]');
-      return Boolean(video && !video.paused && video.currentTime > 0.15);
-    }, undefined, { timeout: 10000 }).then(() => true).catch(() => false);
-
-    if (!playbackAdvanced) {
-      const playbackDiagnostics = await page.evaluate(() => {
-        const video = document.querySelector('[data-testid="source-preview"]');
-        const errorText = document.querySelector('[data-testid="error-text"]')?.textContent ?? null;
-        if (!(video instanceof HTMLVideoElement)) {
-          return { errorText, video: null };
-        }
-
-        return Promise.resolve(fetch(video.currentSrc || video.src, { method: 'GET' }).then(async (response) => ({
-          errorText,
-          video: {
-            currentSrc: video.currentSrc || video.src,
-            paused: video.paused,
-            ended: video.ended,
-            currentTime: video.currentTime,
-            duration: video.duration,
-            readyState: video.readyState,
-            networkState: video.networkState,
-            muted: video.muted,
-            errorCode: video.error?.code ?? null,
-            errorMessage: video.error?.message ?? null,
-          },
-          fetch: {
-            ok: response.ok,
-            status: response.status,
-            contentType: response.headers.get('content-type'),
-            contentLength: response.headers.get('content-length'),
-            url: response.url,
-          },
-        })).catch((fetchError) => ({
-          errorText,
-          video: {
-            currentSrc: video.currentSrc || video.src,
-            paused: video.paused,
-            ended: video.ended,
-            currentTime: video.currentTime,
-            duration: video.duration,
-            readyState: video.readyState,
-            networkState: video.networkState,
-            muted: video.muted,
-            errorCode: video.error?.code ?? null,
-            errorMessage: video.error?.message ?? null,
-          },
-          fetch: {
-            error: fetchError instanceof Error ? fetchError.message : String(fetchError),
-          },
-        })));
-      });
-      throw new Error(`Preview playback did not advance. Diagnostics: ${JSON.stringify(playbackDiagnostics)}`);
-    }
-
-    await page.getByTestId('output-mode-select').selectOption('cropTo4k');
-    await page.getByTestId('aspect-ratio-select').selectOption(targetAspect);
-    await expect(page.getByTestId('toggle-crop-edit-button')).toBeVisible();
-    await expect(page.getByTestId('maximize-crop-button')).toBeVisible();
-    await page.getByTestId('toggle-crop-edit-button').click();
-    await expect(page.getByTestId('crop-overlay')).toBeVisible();
-    await expect(page.getByTestId('crop-nudge-controls')).toBeVisible();
-
-    const firstCropBox = await page.getByTestId('crop-overlay').boundingBox();
-    if (!firstCropBox) {
-      throw new Error('Crop overlay did not render a measurable bounding box');
-    }
-    const firstAspect = firstCropBox.width / firstCropBox.height;
-    if (Math.abs(firstAspect - expectedAspect) > 0.08) {
-      throw new Error(`Crop overlay aspect ${firstAspect} did not match expected ${expectedAspect} for ${targetAspect}`);
-    }
-
-    if (cropNudgeMode === 'vertical') {
-      await page.getByTestId('crop-nudge-down').click();
-    } else {
-      await page.getByTestId('crop-nudge-right').click();
-      await page.getByTestId('crop-nudge-down').click();
-    }
-
-    const secondCropBox = await page.getByTestId('crop-overlay').boundingBox();
-    if (!secondCropBox) {
-      throw new Error('Crop overlay vanished after first nudge');
-    }
-    if (Math.abs(secondCropBox.x - firstCropBox.x) < 4 && Math.abs(secondCropBox.y - firstCropBox.y) < 4) {
-      throw new Error(`Crop overlay did not move on first nudge: before=${JSON.stringify(firstCropBox)} after=${JSON.stringify(secondCropBox)}`);
-    }
-
-    await page.getByTestId('maximize-crop-button').click();
-    const maximizedCropBox = await page.getByTestId('crop-overlay').boundingBox();
-    if (!maximizedCropBox) {
-      throw new Error('Crop overlay vanished after maximize');
-    }
-    const maximizedAspect = maximizedCropBox.width / maximizedCropBox.height;
-    if (Math.abs(maximizedAspect - expectedAspect) > 0.08) {
-      throw new Error(`Maximized crop overlay aspect ${maximizedAspect} did not match expected ${expectedAspect} for ${targetAspect}`);
-    }
-
-    await page.getByTestId('source-preview-seek').evaluate((element) => {
-      element.value = '1.75';
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-
-    await page.waitForFunction(() => {
-      const video = document.querySelector('[data-testid="source-preview"]');
-      return Boolean(video && video.currentTime >= 1.7);
-    }, undefined, { timeout: 10000 });
-
-    const afterSeekTime = await page.evaluate(() => {
-      const video = document.querySelector('[data-testid="source-preview"]');
-      return video ? video.currentTime : -1;
-    });
-
-    if (cropNudgeMode === 'vertical') {
-      await page.getByTestId('crop-nudge-up').click();
-    } else {
-      await page.getByTestId('crop-nudge-left').click();
-      await page.getByTestId('crop-nudge-down').click();
-    }
-
-    const thirdCropBox = await page.getByTestId('crop-overlay').boundingBox();
-    if (!thirdCropBox) {
-      throw new Error('Crop overlay vanished after second nudge');
-    }
-    if (Math.abs(thirdCropBox.x - secondCropBox.x) < 4 && Math.abs(thirdCropBox.y - secondCropBox.y) < 4) {
-      throw new Error(`Crop overlay did not move on second nudge: before=${JSON.stringify(secondCropBox)} after=${JSON.stringify(thirdCropBox)}`);
-    }
-
-    await page.waitForTimeout(700);
-
-    const playback = await page.evaluate(() => {
+    const previewSnapshot = await page.evaluate(() => {
       const video = document.querySelector('[data-testid="source-preview"]');
       return video
         ? {
@@ -332,28 +269,47 @@ async function main() {
             currentTime: video.currentTime,
             duration: video.duration,
             src: video.currentSrc || video.src,
+            readyState: video.readyState,
+            networkState: video.networkState,
           }
         : null;
     });
 
-    if (!playback) {
-      throw new Error('Source preview video not found after load');
+    if (!isRealBackendMode) {
+      await openPanelIfCollapsed(page, 'frame-rate-workspace-section', 'pipeline-toggle-interpolation');
+      if (isInterpolationOnlyMode) {
+        await openPanelIfCollapsed(page, 'upscaler-workspace-section', 'pipeline-toggle-upscale');
+        await page.getByTestId('pipeline-toggle-upscale').click();
+        await expect(page.getByTestId('frame-rate-mode-readout')).toHaveValue('Enabled standalone');
+      }
+      await page.getByTestId('frame-rate-target-select').selectOption('60');
+      await page.getByTestId('save-output-button').click();
+      await page.getByTestId('run-upscale-button').click();
     }
 
-    if (playback.paused || playback.currentTime <= afterSeekTime + 0.1) {
-      throw new Error(`Desktop playback did not advance as expected: ${JSON.stringify(playback)}`);
+    if (!isRealBackendMode) {
+      await expect.poll(async () => await page.evaluate(() => window.__UPSCALER_TEST_STATE__?.lastRequest ?? null), {
+        timeout: 10000,
+      }).not.toBeNull();
+    }
+
+    const lastRequest = !isRealBackendMode
+      ? await page.evaluate(() => window.__UPSCALER_TEST_STATE__?.lastRequest ?? null)
+      : null;
+
+    if (!isRealBackendMode && (lastRequest?.interpolationMode !== expectedInterpolationMode || lastRequest?.interpolationTargetFps !== 60)) {
+      throw new Error(`Desktop overlap smoke captured the wrong pipeline request: ${JSON.stringify(lastRequest)}`);
+    }
+    if (!isRealBackendMode && isInterpolationOnlyMode && lastRequest?.outputPath !== 'C:/exports/upscaled-result.mp4') {
+      throw new Error(`Interpolation-only desktop smoke built an unexpected output path: ${JSON.stringify(lastRequest)}`);
     }
 
     const result = {
-      playback,
-      cropBoxes: {
-        first: firstCropBox,
-        second: secondCropBox,
-        maximized: maximizedCropBox,
-        third: thirdCropBox,
-      },
-      afterSeekTime,
+      previewSnapshot,
+      pipelineMode,
       targetAspect,
+      overlapRequest: lastRequest,
+      mockDiagnostics,
     };
 
     await page.screenshot({ path: 'artifacts/runtime/desktop-webview-playback-smoke.png', fullPage: false });

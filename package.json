@@ -7,7 +7,9 @@
     "dev": "vite",
     "build:web": "tsc --noEmit && vite build",
     "test:web": "vitest run",
-    "test:gui": "playwright test",
+    "test:gui:web": "playwright test",
+    "test:desktop": "pwsh -File ./scripts/desktop-test.ps1",
+    "test:gui": "npm run test:gui:web && npm run test:desktop",
     "stop": "pwsh -File ./scripts/stop.ps1 -IncludeRepoWorkers",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"

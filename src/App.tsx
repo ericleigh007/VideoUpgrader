@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState, type MouseEvent as ReactMouseEve
 import { desktopApi } from "./lib/desktopApi";
 import { getBackendDefinition, getBlindComparisonModels, getModelDefinition, getUiModels } from "./lib/catalog";
 import { defaultCropRect, planOutputFraming, resolveAspectRatio, resolveCropRect, type NormalizedCropRect } from "./lib/framing";
-import { buildInterpolationRunLabel, buildInterpolationWarning, interpolationModes, interpolationTargetFpsOptions, isInterpolationEnabled } from "./lib/interpolation";
+import { buildInterpolationWarning, interpolationTargetFpsOptions, isInterpolationEnabled } from "./lib/interpolation";
 import type {
   AppConfig,
   AspectRatioPreset,
@@ -127,11 +127,11 @@ interface ExpandablePanelProps {
   subtitle?: string;
   isOpen: boolean;
   onToggle: () => void;
-  testId: string;
+  testId?: string;
   children: ReactNode;
 }
 
-interface TrackedJobEntry {
+type TrackedJobEntry = {
   id: string;
   jobKind: string;
   label: string;
@@ -152,7 +152,16 @@ interface TrackedJobEntry {
   onStop: null | (() => void);
   onClearScratch: null | (() => void);
   onDeleteOutput: null | (() => void);
-}
+};
+
+type CleanupJobFilter = "all" | "running" | "succeeded" | "cancelled" | "failed";
+type CleanupSortColumn = "state" | "id" | "size" | "updatedAt" | "input" | "output";
+type CleanupSortDirection = "asc" | "desc";
+
+type CleanupJobSort = {
+  column: CleanupSortColumn;
+  direction: CleanupSortDirection;
+};
 
 interface ProgressEventEntry {
   key: string;
@@ -162,15 +171,12 @@ interface ProgressEventEntry {
   timestamp: number;
 }
 
-type CleanupJobFilter = "all" | "running" | "succeeded" | "cancelled" | "failed";
-type CleanupJobSort = "largest" | "newest" | "oldest";
-
 const CLEANUP_FILTER_STORAGE_KEY = "videoupgrader.cleanup.filter";
 const CLEANUP_SEARCH_STORAGE_KEY = "videoupgrader.cleanup.search";
 const CLEANUP_SORT_STORAGE_KEY = "videoupgrader.cleanup.sort";
-const EMBEDDED_PREVIEW_COMPATIBLE_CONTAINERS = new Set(["mp4"]);
+const RUN_SETTINGS_STORAGE_KEY = "videoupgrader.run.settings.v1";
+const EMBEDDED_FULL_PREVIEW_CONTAINERS = new Set(["mp4"]);
 const AUTO_PREVIEW_UPGRADE_MAX_DURATION_SECONDS = 300;
-
 const comparisonFocusPresets: ComparisonFocusPreset[] = [
   {
     id: "dithering",
@@ -205,7 +211,13 @@ const comparisonFocusPresets: ComparisonFocusPreset[] = [
 function ExpandablePanel({ title, subtitle, isOpen, onToggle, testId, children }: ExpandablePanelProps) {
   return (
     <article className={`panel expandable-panel${isOpen ? " expandable-panel-open" : ""}`} data-testid={testId}>
-      <button type="button" className="expandable-panel-header" onClick={onToggle} aria-expanded={isOpen} data-testid={testId ? `${testId}-toggle` : undefined}>
+      <button
+        type="button"
+        className="expandable-panel-header"
+        onClick={onToggle}
+        aria-expanded={isOpen}
+        data-testid={testId ? `${testId}-toggle` : undefined}
+      >
         <div className="expandable-panel-title-block">
           <h2>{title}</h2>
           {subtitle ? <span className="expandable-panel-subtitle">{subtitle}</span> : null}
@@ -218,43 +230,44 @@ function ExpandablePanel({ title, subtitle, isOpen, onToggle, testId, children }
 }
 
 function normalizeOutputPath(path: string, container: OutputContainer): string {
-  const suffix = `.${container}`;
-  return path.toLowerCase().endsWith(suffix) ? path : `${path}${suffix}`;
+  const extension = `.${container}`;
+  return path.toLowerCase().endsWith(extension) ? path : `${path}${extension}`;
 }
 
-function defaultOutputPath(source: SourceVideoSummary | null, container: OutputContainer, modelId: ModelId): string {
-  const stem = source?.path.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") ?? "video_upgrader_output";
-  const modelStem = modelId.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
-  return `${OUTPUT_ROOT}/${stem}_${modelStem}.${container}`;
+function defaultOutputPath(source: SourceVideoSummary | null, container: OutputContainer, modelId: string): string {
+  const fileStem = source?.path.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") ?? "video_upgrader_output";
+  const sanitizedModelId = modelId.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
+  return `${OUTPUT_ROOT}/${fileStem}_${sanitizedModelId}.${container}`;
 }
 
 function pathLeaf(path: string | null | undefined): string {
   if (!path) {
-    return "n/a";
+    return "";
   }
+
   const normalized = path.replace(/\\/g, "/");
-  const candidate = normalized.split("/").pop();
-  return candidate && candidate.length > 0 ? candidate : normalized;
+  const leaf = normalized.split("/").pop();
+  return leaf && leaf.length > 0 ? leaf : normalized;
 }
 
-function jobDirectoryLabel(path: string | null | undefined): string {
-  if (!path) {
-    return "n/a";
+function pathLabel(path: string | null | undefined, emptyLabel: string): string {
+  const leaf = pathLeaf(path);
+  return leaf || emptyLabel;
+}
+
+function normalizeTimestampMillis(timestamp: number | string | null | undefined): number {
+  const parsed = typeof timestamp === "number" ? timestamp : Number(timestamp);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
   }
-  return pathLeaf(path);
+  return parsed < 1_000_000_000_000 ? parsed * 1000 : parsed;
 }
 
-function blindComparisonOutputPath(
-  source: SourceVideoSummary,
-  container: OutputContainer,
-  modelId: ModelId,
-  anonymousLabel: string,
-  runToken: string,
-): string {
-  const stem = source.path.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") ?? "comparison_source";
-  const modelStem = modelId.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
-  const labelStem = anonymousLabel.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
-  return `${OUTPUT_ROOT}/blind/${stem}_${runToken}_${labelStem}_${modelStem}.${container}`;
+function blindComparisonOutputPath(source: SourceVideoSummary, container: OutputContainer, modelId: string, anonymousLabel: string, runToken: string): string {
+  const fileStem = source.path.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") ?? "comparison_source";
+  const sanitizedModelId = modelId.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
+  const sanitizedLabel = anonymousLabel.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
+  return `${OUTPUT_ROOT}/blind/${fileStem}_${runToken}_${sanitizedLabel}_${sanitizedModelId}.${container}`;
 }
 
 function parsePositiveIntegerInput(value: string): number | null {
@@ -263,38 +276,38 @@ function parsePositiveIntegerInput(value: string): number | null {
 }
 
 function supportsEmbeddedFullLengthPreview(container: string | null | undefined): boolean {
-  return EMBEDDED_PREVIEW_COMPATIBLE_CONTAINERS.has(String(container ?? "").toLowerCase());
+  return EMBEDDED_FULL_PREVIEW_CONTAINERS.has(String(container ?? "").toLowerCase());
 }
 
 function previewMimeType(path: string | null | undefined): string | undefined {
-  const normalized = String(path ?? '').toLowerCase();
-  if (normalized.endsWith('.mp4')) {
-    return 'video/mp4';
+  const normalized = String(path ?? "").toLowerCase();
+  if (normalized.endsWith(".mp4")) {
+    return "video/mp4";
   }
-  if (normalized.endsWith('.webm')) {
-    return 'video/webm';
+  if (normalized.endsWith(".webm")) {
+    return "video/webm";
   }
-  if (normalized.endsWith('.mov')) {
-    return 'video/quicktime';
+  if (normalized.endsWith(".mov")) {
+    return "video/quicktime";
   }
-  if (normalized.endsWith('.mkv')) {
-    return 'video/x-matroska';
+  if (normalized.endsWith(".mkv")) {
+    return "video/x-matroska";
   }
   return undefined;
 }
 
-function clampNormalized(value: number): number {
+function clampUnit(value: number): number {
   return Math.min(1, Math.max(0, value));
 }
 
 function clampCropRect(rect: NormalizedCropRect): NormalizedCropRect {
-  const width = clampNormalized(rect.width);
-  const height = clampNormalized(rect.height);
+  const width = clampUnit(rect.width);
+  const height = clampUnit(rect.height);
   return {
     width,
     height,
     left: Math.min(Math.max(0, rect.left), Math.max(0, 1 - width)),
-    top: Math.min(Math.max(0, rect.top), Math.max(0, 1 - height))
+    top: Math.min(Math.max(0, rect.top), Math.max(0, 1 - height)),
   };
 }
 
@@ -306,25 +319,18 @@ function offsetCropRect(rect: NormalizedCropRect, deltaLeft: number, deltaTop: n
   });
 }
 
-function resizeCropRect(
-  startRect: NormalizedCropRect,
-  handle: Exclude<CropHandle, "move">,
-  deltaX: number,
-  deltaY: number,
-  aspectRatio: number,
-  sourceAspectRatio: number,
-): NormalizedCropRect {
-  const normalizedAspectRatio = sourceAspectRatio > 0 ? aspectRatio / sourceAspectRatio : aspectRatio;
-  const leftAnchor = handle === "ne" || handle === "se" ? startRect.left : startRect.left + startRect.width;
-  const topAnchor = handle === "sw" || handle === "se" ? startRect.top : startRect.top + startRect.height;
-  const signedWidth = (handle === "ne" || handle === "se" ? 1 : -1) * deltaX;
-  const signedHeight = (handle === "sw" || handle === "se" ? 1 : -1) * deltaY;
-  const nextWidth = Math.max(0.08, startRect.width + signedWidth + (signedHeight * normalizedAspectRatio));
-  const constrainedWidth = Math.min(nextWidth, 1);
-  const constrainedHeight = normalizedAspectRatio > 0 ? constrainedWidth / normalizedAspectRatio : constrainedWidth;
-  const nextLeft = handle === "ne" || handle === "se" ? leftAnchor : leftAnchor - constrainedWidth;
-  const nextTop = handle === "sw" || handle === "se" ? topAnchor : topAnchor - constrainedHeight;
-  return clampCropRect({ left: nextLeft, top: nextTop, width: constrainedWidth, height: constrainedHeight });
+function resizeCropRect(rect: NormalizedCropRect, handle: Exclude<CropHandle, "move">, deltaX: number, deltaY: number, aspectRatio: number, sourceAspectRatio: number): NormalizedCropRect {
+  const previewAspectRatio = sourceAspectRatio > 0 ? aspectRatio / sourceAspectRatio : aspectRatio;
+  const anchorX = handle === "ne" || handle === "se" ? rect.left : rect.left + rect.width;
+  const anchorY = handle === "sw" || handle === "se" ? rect.top : rect.top + rect.height;
+  const signedDeltaX = (handle === "ne" || handle === "se" ? 1 : -1) * deltaX;
+  const signedDeltaY = (handle === "sw" || handle === "se" ? 1 : -1) * deltaY;
+  const width = Math.max(0.08, rect.width + signedDeltaX + signedDeltaY * previewAspectRatio);
+  const nextWidth = Math.min(width, 1);
+  const nextHeight = previewAspectRatio > 0 ? nextWidth / previewAspectRatio : nextWidth;
+  const left = handle === "ne" || handle === "se" ? anchorX : anchorX - nextWidth;
+  const top = handle === "sw" || handle === "se" ? anchorY : anchorY - nextHeight;
+  return clampCropRect({ left, top, width: nextWidth, height: nextHeight });
 }
 
 function createQueuedJob(jobId: string): PipelineJobStatus {
@@ -369,9 +375,9 @@ function createPendingComparisonJob(): PipelineJobStatus {
   };
 }
 
-function delay(ms: number): Promise<void> {
+function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => {
-    window.setTimeout(resolve, ms);
+    window.setTimeout(resolve, milliseconds);
   });
 }
 
@@ -396,26 +402,25 @@ function createQueuedConversionJob(jobId: string): SourceConversionJobStatus {
   };
 }
 
-function ratioFromCounts(processed: number, total: number, completed: boolean): number {
-  if (completed) {
+function ratioFromCounts(value: number, total: number, forceComplete: boolean): number {
+  if (forceComplete) {
     return 1;
   }
   if (total <= 0) {
     return 0;
   }
-  return Math.max(0, Math.min(1, processed / total));
+  return Math.max(0, Math.min(1, value / total));
 }
 
-function formatDurationProgress(units: number): string {
-  return `${(units / 1000).toFixed(1)}s`;
+function formatDurationProgress(value: number): string {
+  return `${(value / 1000).toFixed(1)}s`;
 }
 
-function formatElapsedSeconds(seconds: number | null | undefined): string {
-  if (!Number.isFinite(seconds ?? NaN) || (seconds ?? 0) < 0) {
+function formatElapsedSeconds(value: number | null | undefined): string {
+  if (!Number.isFinite(value ?? NaN) || (value ?? 0) < 0) {
     return "calculating";
   }
-
-  const rounded = Math.round(seconds ?? 0);
+  const rounded = Math.round(value ?? 0);
   const hours = Math.floor(rounded / 3600);
   const minutes = Math.floor((rounded % 3600) / 60);
   const remainingSeconds = rounded % 60;
@@ -428,19 +433,37 @@ function formatElapsedSeconds(seconds: number | null | undefined): string {
   return `${remainingSeconds}s`;
 }
 
-function formatClockTime(seconds: number | null | undefined): string {
-  if (!Number.isFinite(seconds ?? NaN) || (seconds ?? 0) < 0) {
+function formatClockTime(value: number | null | undefined): string {
+  if (!Number.isFinite(value ?? NaN) || (value ?? 0) < 0) {
     return "0:00";
   }
-
-  const rounded = Math.floor(seconds ?? 0);
+  const rounded = Math.floor(value ?? 0);
   const hours = Math.floor(rounded / 3600);
   const minutes = Math.floor((rounded % 3600) / 60);
-  const remainingSeconds = rounded % 60;
+  const seconds = rounded % 60;
   if (hours > 0) {
-    return `${hours}:${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
-  return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function normalizeSourceCodec(value: string | null | undefined): VideoCodec | null {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (normalized.includes("hevc") || normalized.includes("h265") || normalized.includes("x265")) {
+    return "h265";
+  }
+  if (normalized.includes("h264") || normalized.includes("avc") || normalized.includes("x264")) {
+    return "h264";
+  }
+  return null;
+}
+
+function normalizeSourceContainer(value: string | null | undefined): OutputContainer | null {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return normalized === "mp4" || normalized === "mkv" ? normalized : null;
 }
 
 function formatFramesPerSecond(value: number | null | undefined): string {
@@ -488,6 +511,124 @@ function formatBytes(bytes: number): string {
   }
 
   return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function formatBitrateKbps(value: number | null | undefined): string {
+  if (!Number.isFinite(value ?? NaN) || (value ?? 0) <= 0) {
+    return "Unknown";
+  }
+  const resolved = value ?? 0;
+  if (resolved >= 1000) {
+    return `${(resolved / 1000).toFixed(resolved >= 10000 ? 1 : 2)} Mb/s`;
+  }
+  return `${resolved.toFixed(0)} kb/s`;
+}
+
+function formatSampleRate(value: number | null | undefined): string {
+  if (!Number.isFinite(value ?? NaN) || (value ?? 0) <= 0) {
+    return "Unknown";
+  }
+  return `${Math.round(value ?? 0).toLocaleString()} Hz`;
+}
+
+function greatestCommonDivisor(left: number, right: number): number {
+  let a = Math.abs(Math.round(left));
+  let b = Math.abs(Math.round(right));
+  while (b !== 0) {
+    const remainder = a % b;
+    a = b;
+    b = remainder;
+  }
+  return a || 1;
+}
+
+function formatAspectRatio(width: number, height: number): string {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return "Unknown";
+  }
+  const divisor = greatestCommonDivisor(width, height);
+  return `${Math.round(width / divisor)}:${Math.round(height / divisor)}`;
+}
+
+function formatMediaLabel(value: string | null | undefined): string {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return "Unknown";
+  }
+
+  const labels: Record<string, string> = {
+    aac: "AAC",
+    ac3: "AC-3",
+    av1: "AV1",
+    dts: "DTS",
+    eac3: "E-AC-3",
+    flac: "FLAC",
+    h264: "H.264",
+    h265: "H.265",
+    hevc: "HEVC",
+    mp3: "MP3",
+    opus: "Opus",
+    pcm_s16le: "PCM S16LE",
+    pcm_s24le: "PCM S24LE",
+    truehd: "TrueHD",
+    vorbis: "Vorbis",
+  };
+
+  return labels[normalized] ?? normalized.replace(/[_-]+/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function formatTitleCase(value: string | null | undefined): string {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) {
+    return "Unknown";
+  }
+  return normalized.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function buildSourceVideoSummary(source: SourceVideoSummary): string {
+  return [
+    formatMediaLabel(source.videoCodec),
+    source.videoProfile?.trim() || null,
+    `${source.width} x ${source.height}`,
+    `${source.frameRate.toFixed(3)} fps`,
+  ].filter(Boolean).join(" • ");
+}
+
+function buildSourceAudioSummary(source: SourceVideoSummary): string {
+  if (!source.hasAudio) {
+    return "No audio stream detected";
+  }
+  return [
+    formatMediaLabel(source.audioCodec),
+    source.audioProfile?.trim() || null,
+    Number.isFinite(source.audioSampleRate ?? NaN) && (source.audioSampleRate ?? 0) > 0 ? formatSampleRate(source.audioSampleRate) : null,
+    source.audioChannels ? formatTitleCase(source.audioChannels) : null,
+  ].filter(Boolean).join(" • ");
+}
+
+function buildResultOutputSummary(result: PipelineResult, outputSizeBytes: number | null | undefined, workDirSizeBytes: number | null | undefined): string {
+  return [
+    `${result.frameCount.toLocaleString()} frames`,
+    `${formatMediaLabel(result.codec)} / ${String(result.container ?? "").toUpperCase()}`,
+    `Output ${formatBytes(outputSizeBytes ?? 0)}`,
+    `Scratch ${formatBytes(workDirSizeBytes ?? 0)}`,
+  ].join(" • ");
+}
+
+function buildInterpolationDiagnosticsSummary(result: PipelineResult): string {
+  if (!result.interpolationDiagnostics) {
+    return "Interpolation details unavailable";
+  }
+  return [
+    formatTitleCase(result.interpolationDiagnostics.mode),
+    `${result.interpolationDiagnostics.sourceFps.toFixed(3)} -> ${result.interpolationDiagnostics.outputFps.toFixed(3)} fps`,
+    `${result.interpolationDiagnostics.segmentCount} segments`,
+    `${result.interpolationDiagnostics.segmentOverlapFrames} frame${result.interpolationDiagnostics.segmentOverlapFrames === 1 ? "" : "s"} overlap`,
+  ].join(" • ");
+}
+
+function buildWorkerLogSummary(result: PipelineResult): string {
+  return `${result.log.length.toLocaleString()} log line${result.log.length === 1 ? "" : "s"}`;
 }
 
 function formatRelativeTime(timestamp: number): string {
@@ -551,6 +692,31 @@ function buildPipelineActivityTitle(progress: PipelineProgress): string {
   return "Preparing pipeline";
 }
 
+function formatPipelinePhaseLabel(phase: string): string {
+  if (phase === "extracting") {
+    return "Extracting";
+  }
+  if (phase === "upscaling") {
+    return "Upscaling";
+  }
+  if (phase === "interpolating") {
+    return "Interpolating";
+  }
+  if (phase === "encoding") {
+    return "Encoding";
+  }
+  if (phase === "remuxing") {
+    return "Finalizing";
+  }
+  if (phase === "completed") {
+    return "Completed";
+  }
+  if (phase === "failed") {
+    return "Failed";
+  }
+  return "Preparing";
+}
+
 function buildPipelineActivityDetail(progress: PipelineProgress): string {
   const parts: string[] = [];
   const totalFrames = progress.totalFrames || 0;
@@ -586,6 +752,7 @@ function buildProgressEventKey(progress: PipelineProgress): string {
     progress.processedFrames,
     progress.extractedFrames,
     progress.upscaledFrames,
+    progress.interpolatedFrames,
     progress.encodedFrames,
     progress.remuxedFrames,
     progress.segmentIndex ?? "",
@@ -606,8 +773,19 @@ function buildProgressEvent(progress: PipelineProgress, timestamp: number): Prog
   };
 }
 
-function cleanupKindLabel(jobKind: string): string {
-  return jobKind === "sourceConversion" ? "Conversion" : "Upscale";
+function cleanupKindLabel(job: TrackedJobEntry): string {
+  if (job.jobKind === "sourceConversion") {
+    return "Conversion";
+  }
+  const hasInterpolation = (job.progress.interpolatedFrames ?? 0) > 0;
+  const hasUpscale = (job.progress.upscaledFrames ?? 0) > 0 || Boolean(job.modelId);
+  if (hasInterpolation && hasUpscale) {
+    return "Upscale + Motion";
+  }
+  if (hasInterpolation) {
+    return "Motion";
+  }
+  return "Upscale";
 }
 
 function formatExactTimestamp(timestamp: number): string {
@@ -640,16 +818,167 @@ function safeLocalStorageSet(key: string, value: string): void {
   }
 }
 
+type PersistedRunSettings = {
+  modelId: ModelId;
+  outputMode: OutputMode;
+  qualityPreset: QualityPreset;
+  selectedGpuId: number | null;
+  aspectRatioPreset: AspectRatioPreset;
+  customAspectWidthInput: string;
+  customAspectHeightInput: string;
+  resolutionBasis: ResolutionBasis;
+  targetWidthInput: string;
+  targetHeightInput: string;
+  codec: VideoCodec;
+  container: OutputContainer;
+  tileSize: number;
+  crf: number;
+  isUpscaleStepEnabled: boolean;
+  isInterpolationStepEnabled: boolean;
+  interpolationTargetFps: InterpolationTargetFps;
+  pytorchRunner: PytorchRunner;
+  previewMode: boolean;
+  previewDurationInput: string;
+  segmentDurationInput: string;
+  isInputPanelOpen: boolean;
+  isOutputPanelOpen: boolean;
+  isBlindPanelOpen: boolean;
+  isCleanupPanelOpen: boolean;
+};
+
+function parsePersistedRunSettings(raw: string | null): Partial<PersistedRunSettings> {
+  if (!raw) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const settings: Partial<PersistedRunSettings> = {};
+
+    if (typeof parsed.modelId === "string" && models.some((model) => model.value === parsed.modelId)) {
+      settings.modelId = parsed.modelId;
+    }
+    if (parsed.outputMode === "preserveAspect4k" || parsed.outputMode === "cropTo4k" || parsed.outputMode === "native4x") {
+      settings.outputMode = parsed.outputMode;
+    }
+    if (parsed.qualityPreset === "qualityMax" || parsed.qualityPreset === "qualityBalanced" || parsed.qualityPreset === "vramSafe") {
+      settings.qualityPreset = parsed.qualityPreset;
+    }
+    if (typeof parsed.selectedGpuId === "number" || parsed.selectedGpuId === null) {
+      settings.selectedGpuId = parsed.selectedGpuId;
+    }
+    if (parsed.aspectRatioPreset === "source" || parsed.aspectRatioPreset === "16:9" || parsed.aspectRatioPreset === "9:16" || parsed.aspectRatioPreset === "4:3" || parsed.aspectRatioPreset === "1:1" || parsed.aspectRatioPreset === "21:9" || parsed.aspectRatioPreset === "custom") {
+      settings.aspectRatioPreset = parsed.aspectRatioPreset;
+    }
+    if (typeof parsed.customAspectWidthInput === "string") {
+      settings.customAspectWidthInput = parsed.customAspectWidthInput;
+    }
+    if (typeof parsed.customAspectHeightInput === "string") {
+      settings.customAspectHeightInput = parsed.customAspectHeightInput;
+    }
+    if (parsed.resolutionBasis === "exact" || parsed.resolutionBasis === "width" || parsed.resolutionBasis === "height") {
+      settings.resolutionBasis = parsed.resolutionBasis;
+    }
+    if (typeof parsed.targetWidthInput === "string") {
+      settings.targetWidthInput = parsed.targetWidthInput;
+    }
+    if (typeof parsed.targetHeightInput === "string") {
+      settings.targetHeightInput = parsed.targetHeightInput;
+    }
+    if (parsed.codec === "h264" || parsed.codec === "h265") {
+      settings.codec = parsed.codec;
+    }
+    if (parsed.container === "mp4" || parsed.container === "mkv") {
+      settings.container = parsed.container;
+    }
+    if (typeof parsed.tileSize === "number" && Number.isFinite(parsed.tileSize) && parsed.tileSize >= 0) {
+      settings.tileSize = parsed.tileSize;
+    }
+    if (typeof parsed.crf === "number" && Number.isFinite(parsed.crf)) {
+      settings.crf = parsed.crf;
+    }
+    if (typeof parsed.isUpscaleStepEnabled === "boolean") {
+      settings.isUpscaleStepEnabled = parsed.isUpscaleStepEnabled;
+    }
+    if (typeof parsed.isInterpolationStepEnabled === "boolean") {
+      settings.isInterpolationStepEnabled = parsed.isInterpolationStepEnabled;
+    }
+    if (parsed.interpolationTargetFps === 30 || parsed.interpolationTargetFps === 60) {
+      settings.interpolationTargetFps = parsed.interpolationTargetFps;
+    }
+    if (parsed.pytorchRunner === "torch" || parsed.pytorchRunner === "tensorrt") {
+      settings.pytorchRunner = parsed.pytorchRunner;
+    }
+    if (typeof parsed.previewMode === "boolean") {
+      settings.previewMode = parsed.previewMode;
+    }
+    if (typeof parsed.previewDurationInput === "string") {
+      settings.previewDurationInput = parsed.previewDurationInput;
+    }
+    if (typeof parsed.segmentDurationInput === "string") {
+      settings.segmentDurationInput = parsed.segmentDurationInput;
+    }
+    if (typeof parsed.isInputPanelOpen === "boolean") {
+      settings.isInputPanelOpen = parsed.isInputPanelOpen;
+    }
+    if (typeof parsed.isOutputPanelOpen === "boolean") {
+      settings.isOutputPanelOpen = parsed.isOutputPanelOpen;
+    }
+    if (typeof parsed.isBlindPanelOpen === "boolean") {
+      settings.isBlindPanelOpen = parsed.isBlindPanelOpen;
+    }
+    if (typeof parsed.isCleanupPanelOpen === "boolean") {
+      settings.isCleanupPanelOpen = parsed.isCleanupPanelOpen;
+    }
+
+    return settings;
+  } catch {
+    return {};
+  }
+}
+
 function parseCleanupFilter(value: string | null): CleanupJobFilter {
   return value === "running" || value === "succeeded" || value === "cancelled" || value === "failed" ? value : "all";
 }
 
 function parseCleanupSort(value: string | null): CleanupJobSort {
-  return value === "newest" || value === "oldest" ? value : "largest";
+  if (!value) {
+    return { column: "size", direction: "desc" };
+  }
+
+  const [column, direction] = value.split(":", 2);
+  if (
+    (column === "state" || column === "id" || column === "size" || column === "updatedAt" || column === "input" || column === "output")
+    && (direction === "asc" || direction === "desc")
+  ) {
+    return { column, direction };
+  }
+
+  return { column: "size", direction: "desc" };
 }
 
 function cleanupJobTotalBytes(job: TrackedJobEntry): number {
   return job.scratchSizeBytes + job.outputSizeBytes;
+}
+
+function toggleCleanupSort(currentSort: CleanupJobSort, column: CleanupSortColumn): CleanupJobSort {
+  if (currentSort.column === column) {
+    return {
+      column,
+      direction: currentSort.direction === "asc" ? "desc" : "asc",
+    };
+  }
+  return {
+    column,
+    direction: "asc",
+  };
+}
+
+function cleanupSortIndicator(currentSort: CleanupJobSort, column: CleanupSortColumn): string {
+  if (currentSort.column !== column) {
+    return "";
+  }
+  return currentSort.direction === "asc" ? "↑" : "↓";
 }
 
 function matchesCleanupSearch(job: TrackedJobEntry, query: string): boolean {
@@ -671,15 +1000,38 @@ function matchesCleanupSearch(job: TrackedJobEntry, query: string): boolean {
 }
 
 function sortCleanupJobs(left: TrackedJobEntry, right: TrackedJobEntry, sortMode: CleanupJobSort): number {
-  if (sortMode === "newest") {
-    return right.updatedAt - left.updatedAt;
-  }
-  if (sortMode === "oldest") {
-    return left.updatedAt - right.updatedAt;
+  const directionFactor = sortMode.direction === "asc" ? 1 : -1;
+  const compareText = (leftValue: string, rightValue: string): number => leftValue.localeCompare(rightValue, undefined, { sensitivity: "base" });
+
+  let comparison = 0;
+  switch (sortMode.column) {
+    case "state":
+      comparison = compareText(left.state, right.state) || compareText(left.label, right.label);
+      break;
+    case "id":
+      comparison = compareText(left.id, right.id);
+      break;
+    case "size":
+      comparison = cleanupJobTotalBytes(left) - cleanupJobTotalBytes(right);
+      break;
+    case "updatedAt":
+      comparison = left.updatedAt - right.updatedAt;
+      break;
+    case "input":
+      comparison = compareText(pathLabel(left.sourcePath, ""), pathLabel(right.sourcePath, ""));
+      break;
+    case "output":
+      comparison = compareText(pathLabel(left.outputPath, ""), pathLabel(right.outputPath, ""));
+      break;
   }
 
-  const byteDelta = cleanupJobTotalBytes(right) - cleanupJobTotalBytes(left);
-  return byteDelta !== 0 ? byteDelta : right.updatedAt - left.updatedAt;
+  if (comparison === 0) {
+    comparison = right.updatedAt - left.updatedAt;
+  }
+  if (comparison === 0) {
+    comparison = compareText(left.id, right.id);
+  }
+  return comparison * directionFactor;
 }
 
 function isManagedArtifactPath(path: string | null | undefined): boolean {
@@ -702,27 +1054,29 @@ function shuffleModels(modelIds: ModelId[]): ModelId[] {
 }
 
 export default function App() {
-  const [modelId, setModelId] = useState<ModelId>("realesrgan-x4plus");
-  const [outputMode, setOutputMode] = useState<OutputMode>("preserveAspect4k");
-  const [qualityPreset, setQualityPreset] = useState<QualityPreset>("qualityBalanced");
-  const [selectedGpuId, setSelectedGpuId] = useState<number | null>(null);
-  const [aspectRatioPreset, setAspectRatioPreset] = useState<AspectRatioPreset>("16:9");
-  const [customAspectWidthInput, setCustomAspectWidthInput] = useState<string>("16");
-  const [customAspectHeightInput, setCustomAspectHeightInput] = useState<string>("9");
-  const [resolutionBasis, setResolutionBasis] = useState<ResolutionBasis>("exact");
-  const [targetWidthInput, setTargetWidthInput] = useState<string>("3840");
-  const [targetHeightInput, setTargetHeightInput] = useState<string>("2160");
+  const persistedRunSettings = parsePersistedRunSettings(safeLocalStorageGet(RUN_SETTINGS_STORAGE_KEY));
+  const [modelId, setModelId] = useState<ModelId>(persistedRunSettings.modelId ?? "realesrgan-x4plus");
+  const [outputMode, setOutputMode] = useState<OutputMode>(persistedRunSettings.outputMode ?? "preserveAspect4k");
+  const [qualityPreset, setQualityPreset] = useState<QualityPreset>(persistedRunSettings.qualityPreset ?? "qualityBalanced");
+  const [selectedGpuId, setSelectedGpuId] = useState<number | null>(persistedRunSettings.selectedGpuId ?? null);
+  const [aspectRatioPreset, setAspectRatioPreset] = useState<AspectRatioPreset>(persistedRunSettings.aspectRatioPreset ?? "16:9");
+  const [customAspectWidthInput, setCustomAspectWidthInput] = useState<string>(persistedRunSettings.customAspectWidthInput ?? "16");
+  const [customAspectHeightInput, setCustomAspectHeightInput] = useState<string>(persistedRunSettings.customAspectHeightInput ?? "9");
+  const [resolutionBasis, setResolutionBasis] = useState<ResolutionBasis>(persistedRunSettings.resolutionBasis ?? "exact");
+  const [targetWidthInput, setTargetWidthInput] = useState<string>(persistedRunSettings.targetWidthInput ?? "3840");
+  const [targetHeightInput, setTargetHeightInput] = useState<string>(persistedRunSettings.targetHeightInput ?? "2160");
   const [cropRect, setCropRect] = useState<NormalizedCropRect | null>(null);
-  const [codec, setCodec] = useState<VideoCodec>("h264");
-  const [container, setContainer] = useState<OutputContainer>("mp4");
-  const [tileSize, setTileSize] = useState<number>(0);
-  const [crf, setCrf] = useState<number>(18);
-  const [interpolationMode, setInterpolationMode] = useState<InterpolationMode>("off");
-  const [interpolationTargetFps, setInterpolationTargetFps] = useState<InterpolationTargetFps>(60);
-  const [pytorchRunner, setPytorchRunner] = useState<PytorchRunner>(() => recommendedPytorchRunner(modelId));
-  const [previewMode, setPreviewMode] = useState<boolean>(true);
-  const [previewDurationInput, setPreviewDurationInput] = useState<string>("8");
-  const [segmentDurationInput, setSegmentDurationInput] = useState<string>("10");
+  const [codec, setCodec] = useState<VideoCodec>(persistedRunSettings.codec ?? "h264");
+  const [container, setContainer] = useState<OutputContainer>(persistedRunSettings.container ?? "mp4");
+  const [tileSize, setTileSize] = useState<number>(persistedRunSettings.tileSize ?? 0);
+  const [crf, setCrf] = useState<number>(persistedRunSettings.crf ?? 18);
+  const [isUpscaleStepEnabled, setIsUpscaleStepEnabled] = useState<boolean>(persistedRunSettings.isUpscaleStepEnabled ?? true);
+  const [isInterpolationStepEnabled, setIsInterpolationStepEnabled] = useState<boolean>(persistedRunSettings.isInterpolationStepEnabled ?? false);
+  const [interpolationTargetFps, setInterpolationTargetFps] = useState<InterpolationTargetFps>(persistedRunSettings.interpolationTargetFps ?? 60);
+  const [pytorchRunner, setPytorchRunner] = useState<PytorchRunner>(persistedRunSettings.pytorchRunner ?? recommendedPytorchRunner(persistedRunSettings.modelId ?? "realesrgan-x4plus"));
+  const [previewMode, setPreviewMode] = useState<boolean>(persistedRunSettings.previewMode ?? true);
+  const [previewDurationInput, setPreviewDurationInput] = useState<string>(persistedRunSettings.previewDurationInput ?? "8");
+  const [segmentDurationInput, setSegmentDurationInput] = useState<string>(persistedRunSettings.segmentDurationInput ?? "10");
   const [source, setSource] = useState<SourceVideoSummary | null>(null);
   const [outputPath, setOutputPath] = useState<string | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
@@ -747,10 +1101,10 @@ export default function App() {
   const [cleanupSearch, setCleanupSearch] = useState<string>(() => safeLocalStorageGet(CLEANUP_SEARCH_STORAGE_KEY) ?? "");
   const [cleanupSort, setCleanupSort] = useState<CleanupJobSort>(() => parseCleanupSort(safeLocalStorageGet(CLEANUP_SORT_STORAGE_KEY)));
   const [expandedCleanupJobIds, setExpandedCleanupJobIds] = useState<string[]>([]);
-  const [isInputPanelOpen, setIsInputPanelOpen] = useState(true);
-  const [isOutputPanelOpen, setIsOutputPanelOpen] = useState(true);
-  const [isBlindPanelOpen, setIsBlindPanelOpen] = useState(false);
-  const [isCleanupPanelOpen, setIsCleanupPanelOpen] = useState(false);
+  const [isInputPanelOpen, setIsInputPanelOpen] = useState(persistedRunSettings.isInputPanelOpen ?? true);
+  const [isOutputPanelOpen, setIsOutputPanelOpen] = useState(persistedRunSettings.isOutputPanelOpen ?? true);
+  const [isBlindPanelOpen, setIsBlindPanelOpen] = useState(persistedRunSettings.isBlindPanelOpen ?? false);
+  const [isCleanupPanelOpen, setIsCleanupPanelOpen] = useState(persistedRunSettings.isCleanupPanelOpen ?? false);
   const [blindComparison, setBlindComparison] = useState<BlindComparisonState | null>(null);
   const [status, setStatus] = useState<string>("Idle");
   const [error, setError] = useState<string | null>(null);
@@ -777,6 +1131,7 @@ export default function App() {
   const pipelineProgressSignatureRef = useRef<string | null>(null);
   const sourcePreviewAutoResumeRef = useRef(false);
   const resolvedSourcePreviewUrlRef = useRef<string | null>(null);
+  const jobsPanelRef = useRef<HTMLDivElement | null>(null);
 
   const sizingOptions: OutputSizingOptions = {
     aspectRatioPreset,
@@ -848,9 +1203,37 @@ export default function App() {
     && sourceConversionMode === "preview"
     && isSourceConversionRunning
   );
-  const isRunDisabled = isBusy || !source || isBlindComparisonRunning || isPipelineRunning || isBlockingSourceConversionRunning || !isSelectedModelImplemented;
+  const interpolationMode: InterpolationMode = !isUpscaleStepEnabled && isInterpolationStepEnabled
+    ? "interpolateOnly"
+    : isUpscaleStepEnabled && isInterpolationStepEnabled
+      ? "afterUpscale"
+      : "off";
+  const hasEnabledPipelineStep = isUpscaleStepEnabled || isInterpolationStepEnabled;
   const interpolationEnabled = isInterpolationEnabled(interpolationMode);
-  const runButtonLabel = buildInterpolationRunLabel(interpolationMode, isPipelineRunning);
+  const selectedQualityPresetLabel = qualityPresets.find((entry) => entry.value === qualityPreset)?.label ?? qualityPreset;
+  const selectedCodecLabel = codecs.find((entry) => entry.value === codec)?.label ?? codec.toUpperCase();
+  const selectedContainerLabel = containers.find((entry) => entry.value === container)?.label ?? container.toUpperCase();
+  const encodingDetailsSummary = `${selectedCodecLabel} / ${selectedContainerLabel} • CRF ${crf} • ${selectedQualityPresetLabel} • Tile ${tileSize > 0 ? tileSize : "Auto"}`;
+  const compactPipelineLabel = [
+    isUpscaleStepEnabled ? selectedModel.label : null,
+    interpolationEnabled ? `Interpolation ${interpolationTargetFps} fps` : null,
+    hasEnabledPipelineStep ? selectedCodecLabel : null,
+  ].filter((entry): entry is string => Boolean(entry)).join(" -> ");
+  const matchedInputCodec = normalizeSourceCodec(source?.videoCodec);
+  const matchedInputContainer = normalizeSourceContainer(source?.container);
+  const canMatchInputFormat = Boolean(matchedInputCodec || matchedInputContainer);
+  const matchInputFormatSummary = source
+    ? canMatchInputFormat
+      ? `Input video detected as ${source.videoCodec.toUpperCase()} in ${source.container.toUpperCase()}. Match Input will apply supported export settings.`
+      : `Input video detected as ${source.videoCodec.toUpperCase()} in ${source.container.toUpperCase()}. Match Input is unavailable because that format is not supported for export.`
+    : "Load a source file to match its codec and container where supported.";
+  const isRunDisabled = isBusy
+    || !source
+    || isBlindComparisonRunning
+    || isPipelineRunning
+    || isBlockingSourceConversionRunning
+    || !hasEnabledPipelineStep
+    || (isUpscaleStepEnabled && !isSelectedModelImplemented);
   const isBlindComparisonDisabled = isBusy || !source || isBlindComparisonRunning || isPipelineRunning || isBlockingSourceConversionRunning || blindComparisonCandidates.length < 2;
   const nowTimestamp = uiNow;
   const trackedJobCandidates: Array<TrackedJobEntry | null> = [
@@ -922,7 +1305,7 @@ export default function App() {
     container: job.container,
     recordedCount: job.recordedCount,
     message: job.progress.message,
-    updatedAt: Number(job.updatedAt) || 0,
+    updatedAt: normalizeTimestampMillis(job.updatedAt),
     sourcePath: job.sourcePath,
     scratchPath: job.scratchPath,
     scratchSizeBytes: job.progress.scratchSizeBytes ?? job.scratchStats?.sizeBytes ?? 0,
@@ -990,6 +1373,12 @@ export default function App() {
       summary: `${pipelineJob.progress.upscaledFrames}/${pipelineJob.progress.totalFrames || "?"}`,
     },
     {
+      id: "interpolate",
+      label: "Interpolate",
+      value: ratioFromCounts(pipelineJob.progress.interpolatedFrames, pipelineJob.progress.totalFrames, pipelineJob.state === "succeeded"),
+      summary: `${pipelineJob.progress.interpolatedFrames}/${pipelineJob.progress.totalFrames || "?"}`,
+    },
+    {
       id: "encode",
       label: "Encode",
       value: ratioFromCounts(pipelineJob.progress.encodedFrames, pipelineJob.progress.totalFrames, pipelineJob.state === "succeeded"),
@@ -1006,7 +1395,60 @@ export default function App() {
   const progressOutputSizeBytes = pipelineJob?.progress.outputSizeBytes ?? outputPathStats?.sizeBytes ?? 0;
   const pipelineActivityTitle = pipelineJob ? buildPipelineActivityTitle(pipelineJob.progress) : null;
   const pipelineActivityDetail = pipelineJob ? buildPipelineActivityDetail(pipelineJob.progress) : null;
+  const pipelinePhaseLabel = pipelineJob ? formatPipelinePhaseLabel(pipelineJob.progress.phase) : null;
   const pipelineLastUpdateLabel = lastPipelineProgressAt ? formatRelativeTime(lastPipelineProgressAt) : "waiting for first update";
+  const compactStatusTitle = isPipelineRunning
+    ? "Pipeline Running"
+    : isSourceConversionRunning
+      ? "Source Conversion Running"
+      : result
+        ? "Last Output Ready"
+        : "Ready To Configure";
+  const compactPhaseBars = pipelinePhaseBars.filter((entry) => entry.id === "upscale" || entry.id === "interpolate");
+  const activePipelineVisualStep = (() => {
+    if (!pipelineJob) {
+      return null;
+    }
+
+    switch (pipelineJob.progress.phase) {
+      case "interpolating":
+        return "interpolate";
+      case "encoding":
+      case "remuxing":
+      case "completed":
+        return pipelineJob.progress.interpolatedFrames > 0 ? "interpolate" : "upscale";
+      default:
+        return "upscale";
+    }
+  })();
+  const compactStatusDetail = pipelineJob
+    ? `${pipelinePhaseLabel ?? "Preparing"} • ${pipelineJob.progress.percent}% • ${activePrimaryJob && (activePrimaryJob.progress.estimatedRemainingSeconds ?? 0) > 0 ? `ETA ${formatElapsedSeconds(activePrimaryJob.progress.estimatedRemainingSeconds)}` : "ETA pending"}`
+    : isSourceConversionRunning
+      ? "Preparing source preview"
+      : result
+        ? `Ready • ${pathLeaf(result.outputPath)}`
+        : "Ready to configure";
+  const runtimeFactsSummary = runtime
+    ? `${runtime.availableGpus.length > 0 ? `${runtime.availableGpus.length} GPU${runtime.availableGpus.length === 1 ? "" : "s"}` : "No GPUs detected"} • ${selectedGpu ? `GPU ${selectedGpu.id}` : "Auto GPU"}`
+    : "Runtime assets download on first use";
+
+  function toggleCleanupPanel(): void {
+    setIsCleanupPanelOpen((current) => !current);
+
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const panel = jobsPanelRef.current;
+        if (!panel) {
+          return;
+        }
+
+        const bounds = panel.getBoundingClientRect();
+        if (bounds.top < 0 || bounds.bottom > window.innerHeight) {
+          panel.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      });
+    });
+  }
 
   useEffect(() => {
     if (!isPipelineRunning && !isSourceConversionRunning) {
@@ -1229,10 +1671,6 @@ export default function App() {
       window.clearInterval(intervalId);
     };
   }, [activeJobId]);
-
-  useEffect(() => {
-    setPytorchRunner(recommendedPytorchRunner(modelId));
-  }, [modelId]);
 
   useEffect(() => {
     sourcePreviewAutoResumeRef.current = sourcePreviewAutoResumeRef.current || sourcePreviewPlaying;
@@ -1459,8 +1897,65 @@ export default function App() {
   }, [cleanupSearch]);
 
   useEffect(() => {
-    safeLocalStorageSet(CLEANUP_SORT_STORAGE_KEY, cleanupSort);
+    safeLocalStorageSet(CLEANUP_SORT_STORAGE_KEY, `${cleanupSort.column}:${cleanupSort.direction}`);
   }, [cleanupSort]);
+
+  useEffect(() => {
+    const nextSettings: PersistedRunSettings = {
+      modelId,
+      outputMode,
+      qualityPreset,
+      selectedGpuId,
+      aspectRatioPreset,
+      customAspectWidthInput,
+      customAspectHeightInput,
+      resolutionBasis,
+      targetWidthInput,
+      targetHeightInput,
+      codec,
+      container,
+      tileSize,
+      crf,
+      isUpscaleStepEnabled,
+      isInterpolationStepEnabled,
+      interpolationTargetFps,
+      pytorchRunner,
+      previewMode,
+      previewDurationInput,
+      segmentDurationInput,
+      isInputPanelOpen,
+      isOutputPanelOpen,
+      isBlindPanelOpen,
+      isCleanupPanelOpen,
+    };
+    safeLocalStorageSet(RUN_SETTINGS_STORAGE_KEY, JSON.stringify(nextSettings));
+  }, [
+    aspectRatioPreset,
+    codec,
+    container,
+    crf,
+    customAspectHeightInput,
+    customAspectWidthInput,
+    interpolationTargetFps,
+    isBlindPanelOpen,
+    isCleanupPanelOpen,
+    isInputPanelOpen,
+    isInterpolationStepEnabled,
+    isOutputPanelOpen,
+    isUpscaleStepEnabled,
+    modelId,
+    outputMode,
+    previewDurationInput,
+    previewMode,
+    pytorchRunner,
+    qualityPreset,
+    resolutionBasis,
+    segmentDurationInput,
+    selectedGpuId,
+    targetHeightInput,
+    targetWidthInput,
+    tileSize,
+  ]);
 
   useEffect(() => {
     setExpandedCleanupJobIds((current) => current.filter((jobId) => cleanupJobs.some((job) => job.id === jobId)));
@@ -2166,6 +2661,20 @@ export default function App() {
     });
   }
 
+  function matchInputFormat(): void {
+    if (!source) {
+      return;
+    }
+
+    if (matchedInputContainer) {
+      updateContainer(matchedInputContainer);
+    }
+
+    if (matchedInputCodec) {
+      setCodec(matchedInputCodec);
+    }
+  }
+
   function getLargestCropRect(): NormalizedCropRect | null {
     if (!source || outputMode !== "cropTo4k") {
       return null;
@@ -2222,7 +2731,7 @@ export default function App() {
   return (
     <main className="app-shell">
       <section className="hero-panel">
-        <div>
+        <div className="hero-copy">
           <p className="eyebrow">Windows-first video upgrade workbench</p>
           <h1>{APP_NAME}</h1>
           <p className="summary">
@@ -2230,18 +2739,46 @@ export default function App() {
             frame-rate upgrades from the same desktop workflow before committing to a full export.
           </p>
         </div>
-        <div className="status-card">
-          <span className="status-label">MVP Track</span>
-          <strong>{selectedModel.label}</strong>
-          <span>{progressMessage}</span>
+        <div className="status-card status-card-compact" data-testid="top-status-panel">
+          <div className="status-card-header">
+            <span className="status-label">{compactStatusTitle}</span>
+            <strong>{isSourceConversionRunning ? "Preparing source preview" : compactPipelineLabel}</strong>
+          </div>
+          <span className="status-primary-text">{progressMessage}</span>
           <div className="progress-shell" aria-label="Pipeline progress">
             <div className="progress-bar" style={{ width: `${progressPercent}%` }} />
           </div>
-          <span>{progressPercent}%</span>
+          <div className="status-metric-row">
+            <span data-testid="top-status-percent">{progressPercent}% complete</span>
+            <span data-testid="top-status-eta">
+              {activePrimaryJob && (activePrimaryJob.progress.estimatedRemainingSeconds ?? 0) > 0
+                ? `ETA ${formatElapsedSeconds(activePrimaryJob.progress.estimatedRemainingSeconds)}`
+                : isPipelineRunning || isSourceConversionRunning
+                  ? "ETA pending"
+                  : "Not running"}
+            </span>
+          </div>
+          {pipelineJob ? (
+            <div className="status-phase-stack">
+              {compactPhaseBars
+                .filter((entry) => entry.id === "upscale" || interpolationEnabled)
+                .map((entry) => (
+                  <div key={entry.id} className="status-phase-row">
+                    <span>{entry.label}</span>
+                    <div className="progress-shell status-mini-progress" aria-hidden="true">
+                      <div className="progress-bar" style={{ width: `${entry.value * 100}%` }} />
+                    </div>
+                    <span>{entry.summary}</span>
+                  </div>
+                ))}
+            </div>
+          ) : null}
+          <span className="status-secondary-text">{compactStatusDetail}</span>
         </div>
       </section>
 
       <section className="workspace-grid primary-panel-grid">
+        <div className="workspace-column">
         <ExpandablePanel
           title="Input"
           subtitle={source ? `${source.width} x ${source.height} • ${source.container.toUpperCase()}` : "Load a source video"}
@@ -2412,16 +2949,50 @@ export default function App() {
               </div>
             ) : null}
             {source ? (
-              <dl className="facts">
-                <div><dt>Path</dt><dd>{source.path}</dd></div>
-                <div><dt>Preview</dt><dd data-testid="source-preview-mode">{previewUpgradeAvailable ? "Full-length converted preview" : usingFallbackPreviewClip ? "Short fallback preview clip" : "Direct source playback"}</dd></div>
-                <div><dt>Input Size</dt><dd>{formatBytes(sourcePathStats?.sizeBytes ?? 0)}</dd></div>
-                <div><dt>Resolution</dt><dd>{source.width} x {source.height}</dd></div>
-                <div><dt>Duration</dt><dd>{source.durationSeconds.toFixed(2)}s</dd></div>
-                <div><dt>Frame Rate</dt><dd>{source.frameRate.toFixed(3)} fps</dd></div>
-                <div><dt>Audio</dt><dd>{source.hasAudio ? "Present" : "Missing"}</dd></div>
-                <div><dt>Container</dt><dd>{source.container}</dd></div>
-              </dl>
+              <div className="source-metadata-stack">
+                <dl className="facts">
+                  <div><dt>Path</dt><dd>{source.path}</dd></div>
+                  <div><dt>Preview</dt><dd data-testid="source-preview-mode">{previewUpgradeAvailable ? "Full-length converted preview" : usingFallbackPreviewClip ? "Short fallback preview clip" : "Direct source playback"}</dd></div>
+                  <div><dt>Input Size</dt><dd>{formatBytes(sourcePathStats?.sizeBytes ?? 0)}</dd></div>
+                  <div><dt>Container</dt><dd>{source.container.toUpperCase()}</dd></div>
+                  <div><dt>Duration</dt><dd>{formatClockTime(source.durationSeconds)} ({source.durationSeconds.toFixed(2)}s)</dd></div>
+                  <div><dt>Source Bitrate</dt><dd>{formatBitrateKbps(source.sourceBitrateKbps)}</dd></div>
+                </dl>
+                <div className="source-metadata-grid">
+                  <details className="source-detail-disclosure source-metadata-card" data-testid="source-video-details">
+                    <summary className="source-detail-summary" title={buildSourceVideoSummary(source)}>
+                      <span className="source-detail-summary-label">Video Details</span>
+                      <span className="source-detail-summary-value">{buildSourceVideoSummary(source)}</span>
+                    </summary>
+                    <dl className="facts compact-facts source-detail-facts">
+                      <div><dt>Resolution</dt><dd>{source.width} x {source.height}</dd></div>
+                      <div><dt>Aspect Ratio</dt><dd>{formatAspectRatio(source.width, source.height)}</dd></div>
+                      <div><dt>Frame Rate</dt><dd>{source.frameRate.toFixed(3)} fps</dd></div>
+                      <div><dt>Codec</dt><dd>{formatMediaLabel(source.videoCodec)}</dd></div>
+                      <div><dt>Profile</dt><dd>{source.videoProfile?.trim() || "Unknown"}</dd></div>
+                      <div><dt>Pixel Format</dt><dd>{source.pixelFormat?.trim() || "Unknown"}</dd></div>
+                    </dl>
+                  </details>
+                  <details className="source-detail-disclosure source-metadata-card" data-testid="source-audio-details">
+                    <summary className="source-detail-summary" title={buildSourceAudioSummary(source)}>
+                      <span className="source-detail-summary-label">Audio Details</span>
+                      <span className="source-detail-summary-value">{buildSourceAudioSummary(source)}</span>
+                    </summary>
+                    {source.hasAudio ? (
+                      <dl className="facts compact-facts source-detail-facts">
+                        <div><dt>Track</dt><dd>Present</dd></div>
+                        <div><dt>Codec</dt><dd>{formatMediaLabel(source.audioCodec)}</dd></div>
+                        <div><dt>Profile</dt><dd>{source.audioProfile?.trim() || "Unknown"}</dd></div>
+                        <div><dt>Sample Rate</dt><dd>{formatSampleRate(source.audioSampleRate)}</dd></div>
+                        <div><dt>Channels</dt><dd>{formatTitleCase(source.audioChannels)}</dd></div>
+                        <div><dt>Bitrate</dt><dd>{formatBitrateKbps(source.audioBitrateKbps)}</dd></div>
+                      </dl>
+                    ) : (
+                      <p className="summary source-detail-empty">No audio stream detected in the selected source.</p>
+                    )}
+                  </details>
+                </div>
+              </div>
             ) : null}
             {source && !supportsEmbeddedFullLengthPreview(source.container) ? (
               <p className="summary" data-testid="source-preview-guidance">
@@ -2438,471 +3009,16 @@ export default function App() {
             )}
           </div>
         </ExpandablePanel>
-
-        <ExpandablePanel
-          title="Output"
-          subtitle={result ? "Output ready" : isPipelineRunning ? "Encoding in progress" : "Configure and run"}
-          isOpen={isOutputPanelOpen}
-          onToggle={() => setIsOutputPanelOpen((current) => !current)}
-          testId="output-panel"
-        >
-          <section className="workflow-track-grid" data-testid="processing-track-grid">
-            <article className="workflow-track-card workflow-track-card-active" data-testid="upscaler-section-card">
-              <div className="workflow-track-header">
-                <span className="catalog-chip">Upscaler</span>
-                <strong>Spatial detail pipeline</strong>
-              </div>
-              <p className="summary">
-                This is the active export path today: model selection, framing, quality tuning, blind comparison, and full render output.
-              </p>
-            </article>
-            <article className="workflow-track-card" data-testid="interpolator-section-card">
-              <div className="workflow-track-header">
-                <span className="catalog-chip execution-planned">{MOTION_SECTION_NAME}</span>
-                <strong>Motion interpolation workspace</strong>
-              </div>
-              <p className="summary" data-testid="interpolator-roadmap-summary">
-                This section will handle 30 fps and 60 fps frame generation, both as a standalone video upgrade path and as a follow-on stage after upscaling.
-              </p>
-            </article>
-          </section>
-          <section className="workflow-section" data-testid="upscaler-workspace-section">
-            <div className="workflow-section-heading">
-              <p className="eyebrow">Upscaler</p>
-              <h3>Upscale Workspace</h3>
-              <p className="summary">
-                Configure the current model-driven pipeline here. This section remains the runnable export path until motion interpolation is implemented.
-              </p>
-            </div>
-          <label>
-            Model
-            <select data-testid="model-select" value={modelId} onChange={(event) => setModelId(event.target.value as ModelId)}>
-              <optgroup label="Available Now">
-                {runnableModels.map((model) => (
-                  <option key={model.value} value={model.value}>
-                    {model.label}
-                  </option>
-                ))}
-              </optgroup>
-              <optgroup label="Planned">
-                {plannedModels.map((model) => (
-                  <option key={model.value} value={model.value} disabled>
-                    {model.label} (not implemented)
-                  </option>
-                ))}
-              </optgroup>
-            </select>
-          </label>
-          <section className="catalog-card" data-testid="model-details-card">
-            <div className="catalog-card-header">
-              <strong data-testid="selected-model-label">{selectedModel.label}</strong>
-              <span className={`catalog-chip execution-${selectedModel.executionStatus}`} data-testid="selected-model-status">
-                {isSelectedModelImplemented ? selectedModel.executionStatus : "not implemented"}
-              </span>
-            </div>
-            <p className="summary" data-testid="selected-model-summary">{selectedModel.summary}</p>
-            {!isSelectedModelImplemented ? (
-              <p className="summary" data-testid="selected-model-availability">
-                This model is visible in the catalog but is not implemented yet, so it cannot be selected for export.
-              </p>
-            ) : null}
-            <dl className="facts compact-facts">
-              <div><dt>Backend</dt><dd>{selectedBackend.label}</dd></div>
-              <div><dt>Loader</dt><dd>{selectedModel.loader}</dd></div>
-              <div><dt>Runtime Model</dt><dd>{selectedModel.runtimeModelName}</dd></div>
-              <div><dt>Support Tier</dt><dd>{selectedModel.supportTier}</dd></div>
-              <div><dt>Quality Rank</dt><dd>#{selectedModel.qualityRank}</dd></div>
-              <div><dt>Native Scale</dt><dd>{selectedModel.nativeScale}x</dd></div>
-              <div><dt>Video Path</dt><dd>{selectedModel.videoNative ? "Native video pipeline" : "Frame-by-frame pipeline"}</dd></div>
-              <div><dt>Suitability</dt><dd>{selectedModel.mediaSuitability.join(", ")}</dd></div>
-              <div><dt>GPU Routing</dt><dd>{selectedModel.specialHandling.supportsGpuId ? "Explicit GPU id supported" : "Automatic device selection only"}</dd></div>
-            </dl>
-          </section>
-          <label>
-            Rating
-            <select
-              data-testid="model-rating-select"
-              value={selectedModelRating !== null ? String(selectedModelRating) : ""}
-              onChange={(event) => void saveRating(event.target.value === "" ? null : Number(event.target.value))}
-              disabled={isSavingRating}
-            >
-              <option value="">No saved rating</option>
-              <option value="1">1 / 5</option>
-              <option value="2">2 / 5</option>
-              <option value="3">3 / 5</option>
-              <option value="4">4 / 5</option>
-              <option value="5">5 / 5</option>
-            </select>
-          </label>
-          <p className="summary" data-testid="rating-summary">
-            {selectedModelRating !== null
-              ? `Saved rating: ${selectedModelRating}/5. Persisted in config/model_preferences.json.`
-              : "No saved rating yet. Ratings persist in config/model_preferences.json."}
+        <article className="panel roadmap-note" data-testid="dynamic-crop-panel">
+          <div className="roadmap-note-header">
+            <p className="eyebrow">Roadmap</p>
+            <strong>Dynamic crop is still experimental</strong>
+          </div>
+          <p className="summary" data-testid="dynamic-crop-summary">
+            It stays out of the main workflow for now. The next version will explore object-aware crop tracking without competing with the core input and export controls.
           </p>
-          <label>
-            GPU Device
-            <select
-              data-testid="gpu-select"
-              value={selectedGpuId !== null ? String(selectedGpuId) : ""}
-              onChange={(event) => setSelectedGpuId(event.target.value === "" ? null : Number(event.target.value))}
-              disabled={!runtime || runtime.availableGpus.length === 0}
-            >
-              {!runtime ? <option value="">Prepare runtime first</option> : null}
-              {runtime && runtime.availableGpus.length === 0 ? <option value="">No Vulkan GPUs detected</option> : null}
-              {runtime?.availableGpus.map((gpu) => (
-                <option key={gpu.id} value={gpu.id}>{gpu.id}: {gpu.name} ({gpu.kind})</option>
-              ))}
-            </select>
-          </label>
-          {runtime ? (
-            <p className="summary">
-              {selectedGpu
-                ? `Using NCNN/Vulkan GPU ${selectedGpu.id}: ${selectedGpu.name}.`
-                : "Runtime detected no explicit Vulkan GPU selection."}
-            </p>
-          ) : null}
-          <label>
-            Output Mode
-            <select data-testid="output-mode-select" value={outputMode} onChange={(event) => setOutputMode(event.target.value as OutputMode)}>
-              {outputModes.map((mode) => (
-                <option key={mode.value} value={mode.value}>{mode.label}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Resolution Basis
-            <select data-testid="resolution-basis-select" value={resolutionBasis} onChange={(event) => setResolutionBasis(event.target.value as ResolutionBasis)}>
-              {resolutionBases.map((basis) => (
-                <option key={basis.value} value={basis.value}>{basis.label}</option>
-              ))}
-            </select>
-          </label>
-          <div className="dual-field-grid">
-            <label>
-              Target Width
-              <input
-                data-testid="target-width-input"
-                type="number"
-                min={2}
-                step={2}
-                value={displayedWidth}
-                onChange={(event) => setTargetWidthInput(event.target.value)}
-                readOnly={resolutionBasis === "height"}
-              />
-            </label>
-            <label>
-              Target Height
-              <input
-                data-testid="target-height-input"
-                type="number"
-                min={2}
-                step={2}
-                value={displayedHeight}
-                onChange={(event) => setTargetHeightInput(event.target.value)}
-                readOnly={resolutionBasis === "width"}
-              />
-            </label>
-          </div>
-          {outputMode === "cropTo4k" ? <p className="summary">Use Edit Crop to move the framing box without blocking the source player controls. The derived dimension is computed from the selected resolution basis and stays editable through the driving axis.</p> : null}
-          <label>
-            Quality Preset
-            <select
-              data-testid="quality-preset-select"
-              value={qualityPreset}
-              onChange={(event) => setQualityPreset(event.target.value as QualityPreset)}
-            >
-              {qualityPresets.map((preset) => (
-                <option key={preset.value} value={preset.value}>{preset.label}</option>
-              ))}
-            </select>
-          </label>
-          {supportsPytorchRunner ? (
-            <label>
-              PyTorch Runner
-              <select data-testid="pytorch-runner-select" value={pytorchRunner} onChange={(event) => setPytorchRunner(event.target.value as PytorchRunner)}>
-                {pytorchRunners.map((runner) => (
-                  <option key={runner.value} value={runner.value}>{runner.label}</option>
-                ))}
-              </select>
-              <span className="summary">
-                TensorRT builds a cached engine on the first run for supported PyTorch image SR models, then reuses it on later runs.
-              </span>
-            </label>
-          ) : null}
-          <label className="checkbox-row">
-            <input data-testid="preview-mode-checkbox" type="checkbox" checked={previewMode} onChange={(event) => setPreviewMode(event.target.checked)} />
-            <span>Quick Test Mode</span>
-          </label>
-          <label>
-            Preview Duration Seconds
-            <input
-              data-testid="preview-duration-input"
-              type="number"
-              min={1}
-              max={30}
-              step={1}
-              value={previewDurationInput}
-              onChange={(event) => setPreviewDurationInput(event.target.value)}
-              disabled={!previewMode}
-            />
-          </label>
-          <label>
-            Export Chunk Seconds
-            <input
-              data-testid="segment-duration-input"
-              type="number"
-              min={1}
-              max={120}
-              step={1}
-              value={segmentDurationInput}
-              onChange={(event) => setSegmentDurationInput(event.target.value)}
-              disabled={previewMode}
-            />
-            <span className="summary">Full exports buffer this many seconds per restartable chunk. Larger chunks reduce intermediate MKV overhead but reduce restart granularity. Quick Test always runs as one segment.</span>
-          </label>
-          <div className="dual-field-grid">
-            <label>
-              Codec
-              <select data-testid="codec-select" value={codec} onChange={(event) => setCodec(event.target.value as VideoCodec)}>
-                {codecs.map((entry) => (
-                  <option key={entry.value} value={entry.value}>{entry.label}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Container
-              <select data-testid="container-select" value={container} onChange={(event) => updateContainer(event.target.value as OutputContainer)}>
-                {containers.map((entry) => (
-                  <option key={entry.value} value={entry.value}>{entry.label}</option>
-                ))}
-              </select>
-            </label>
-          </div>
-          <label>
-            Tile Size
-            <input data-testid="tile-size-input" type="number" min={0} step={32} value={tileSize} onChange={(event) => setTileSize(Number(event.target.value))} />
-            <span className="summary">Use 0 for auto: PyTorch defaults to 384 on balanced quality, NCNN defaults to 256.</span>
-          </label>
-          <label>
-            CRF
-            <input data-testid="crf-input" type="number" min={0} max={51} value={crf} onChange={(event) => setCrf(Number(event.target.value))} />
-          </label>
-          <label>
-            Output File
-            <div className="path-picker-row">
-              <input data-testid="output-path-input" className="path-readonly-input" type="text" value={outputPath ?? defaultOutputPath(source, container, modelId)} readOnly />
-              <button data-testid="save-output-button" className="action-button secondary-button" onClick={() => void chooseOutputFile()} disabled={isRunDisabled}>
-                Save As
-              </button>
-            </div>
-          </label>
-          {framing ? (
-            <div className="framing-preview">
-              <span>Target Canvas</span>
-              <strong>{framing.canvas.width} x {framing.canvas.height}</strong>
-              <span>Aspect Ratio</span>
-              <strong>{framing.aspectRatio.toFixed(3)} : 1</strong>
-              <span>Scaled Source</span>
-              <strong>{framing.scaled.width} x {framing.scaled.height}</strong>
-              <span>Selected Input Window</span>
-              <strong>{framing.cropWindow.width} x {framing.cropWindow.height} at {framing.cropWindow.offsetX}, {framing.cropWindow.offsetY}</strong>
-            </div>
-          ) : null}
-          <button data-testid="run-upscale-button" className="action-button" onClick={() => void runPipeline()} disabled={isRunDisabled}>
-            {runButtonLabel}
-          </button>
-          {!isSelectedModelImplemented ? (
-            <p className="summary" data-testid="run-disabled-reason">
-              {selectedModel.label} is not implemented yet, so export is disabled.
-            </p>
-          ) : null}
-          {runtime ? (
-            <dl className="facts compact-facts">
-              <div><dt>FFmpeg</dt><dd>{runtime.ffmpegPath}</dd></div>
-              <div><dt>Real-ESRGAN</dt><dd>{runtime.realesrganPath}</dd></div>
-              <div><dt>Selected Model</dt><dd>{selectedModel.label}</dd></div>
-              <div><dt>Detected GPUs</dt><dd>{runtime.availableGpus.length > 0 ? runtime.availableGpus.map((gpu) => `${gpu.id}: ${gpu.name}`).join(" | ") : "None detected"}</dd></div>
-              <div><dt>Selected GPU</dt><dd>{selectedGpu ? `${selectedGpu.id}: ${selectedGpu.name}` : "Automatic / none"}</dd></div>
-              <div><dt>Saved Ratings</dt><dd>{Object.keys(appConfig?.modelRatings ?? {}).length}</dd></div>
-              <div><dt>Blind Picks Logged</dt><dd>{appConfig?.blindComparisons.length ?? 0}</dd></div>
-            </dl>
-          ) : (
-            <p className="summary">Runtime assets download on first use.</p>
-          )}
-          </section>
-          <section className="workflow-section workflow-section-planned" data-testid="frame-rate-workspace-section">
-            <div className="workflow-section-heading">
-              <p className="eyebrow">{MOTION_SECTION_NAME}</p>
-              <h3>Interpolation Workspace</h3>
-              <p className="summary">
-                Use this workspace to define how frame synthesis should run. The runtime stage is still being implemented, but the app contract and job planning can already be configured here.
-              </p>
-            </div>
-            <div className="dual-field-grid">
-              <label>
-                Target Frame Rate
-                <select data-testid="frame-rate-target-select" value={String(interpolationTargetFps)} onChange={(event) => setInterpolationTargetFps(Number(event.target.value) as InterpolationTargetFps)} disabled={!interpolationEnabled}>
-                  {interpolationTargetFpsOptions.map((fps) => (
-                    <option key={fps} value={String(fps)}>{fps} fps</option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                Motion Workflow
-                <select data-testid="frame-rate-mode-select" value={interpolationMode} onChange={(event) => setInterpolationMode(event.target.value as InterpolationMode)}>
-                  {interpolationModes.map((mode) => (
-                    <option key={mode.value} value={mode.value}>{mode.label}</option>
-                  ))}
-                </select>
-              </label>
-            </div>
-            <p className="summary" data-testid="interpolation-workspace-summary">
-              {interpolationMode === "interpolateOnly"
-                ? "Interpolate-only mode is wired first so existing videos can move to a higher frame rate without requiring spatial upscaling."
-                : interpolationMode === "afterUpscale"
-                  ? "Post-upscale interpolation will synthesize frames after the spatial upscale stage so the generated motion runs at final output resolution."
-                  : "Turn motion interpolation on here when you want to test frame-rate upgrades alongside the upscaler workflow."}
-            </p>
-          </section>
-          {sourceConversionJob && !pipelineJob ? (
-            <div className="job-progress-panel" data-testid="conversion-progress-panel">
-              <div className="catalog-card-header">
-                <strong>Source Conversion</strong>
-                <span>{sourceConversionJob.progress.percent}%</span>
-              </div>
-              <div className="progress-shell large-progress">
-                <div className="progress-bar" style={{ width: `${sourceConversionJob.progress.percent}%` }} />
-              </div>
-              <strong data-testid="conversion-progress-message">{sourceConversionJob.progress.message}</strong>
-              <span>{sourceConversionJob.progress.phase}</span>
-              <div className="progress-stat-grid">
-                <span data-testid="conversion-progress-current">Processed: {formatDurationProgress(sourceConversionJob.progress.processedFrames)}</span>
-                <span data-testid="conversion-progress-total">Total: {formatDurationProgress(sourceConversionJob.progress.totalFrames || 0)}</span>
-              </div>
-            </div>
-          ) : null}
-          {pipelineJob ? (
-            <div className="job-progress-panel" data-testid="job-progress-panel">
-              <div className="catalog-card-header">
-                <strong>Upscale Progress</strong>
-                <span>{pipelineJob.progress.percent}%</span>
-              </div>
-              <div className="progress-shell large-progress">
-                <div className="progress-bar" style={{ width: `${pipelineJob.progress.percent}%` }} />
-              </div>
-              <strong data-testid="progress-message">{pipelineJob.progress.message}</strong>
-              <span>{pipelineJob.progress.phase}</span>
-              <div className="progress-live-summary" data-testid="progress-live-summary">
-                <strong data-testid="progress-current-activity">{pipelineActivityTitle}</strong>
-                <span data-testid="progress-current-detail">{pipelineActivityDetail}</span>
-                <span data-testid="progress-last-update">Last update {pipelineLastUpdateLabel}</span>
-              </div>
-              {pipelineJob.progress.segmentIndex && pipelineJob.progress.segmentCount ? (
-                <div className="progress-stat-grid">
-                  <span data-testid="progress-segment-counter">Chunk: {pipelineJob.progress.segmentIndex}/{pipelineJob.progress.segmentCount}</span>
-                  <span data-testid="progress-segment-frames">Chunk Frames: {pipelineJob.progress.segmentProcessedFrames ?? 0}/{pipelineJob.progress.segmentTotalFrames ?? 0}</span>
-                  {pipelineJob.progress.batchCount ? <span data-testid="progress-batch-counter">Batch: {pipelineJob.progress.batchIndex ?? 0}/{pipelineJob.progress.batchCount}</span> : null}
-                </div>
-              ) : null}
-              <div className="phase-progress-grid">
-                {pipelinePhaseBars.map((phaseBar) => (
-                  <div key={phaseBar.id} className="phase-progress-card" data-testid={`phase-progress-${phaseBar.id}`}>
-                    <div className="phase-progress-header">
-                      <strong>{phaseBar.label}</strong>
-                      <span>{phaseBar.summary}</span>
-                    </div>
-                    <div className="progress-shell phase-progress-shell">
-                      <div className="progress-bar" style={{ width: `${phaseBar.value * 100}%` }} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <div className="progress-stat-grid">
-                <span data-testid="progress-total-frames">Total Frames: {pipelineJob.progress.totalFrames || "?"}</span>
-                <span data-testid="progress-extracted-frames">Extracted PNGs: {pipelineJob.progress.extractedFrames}</span>
-                <span data-testid="progress-upscaled-frames">Upscaled PNGs: {pipelineJob.progress.upscaledFrames}</span>
-                <span data-testid="progress-encoded-frames">Encoded Frames: {pipelineJob.progress.encodedFrames}</span>
-                <span data-testid="progress-remuxed-frames">Audio Remux Frames: {pipelineJob.progress.remuxedFrames}</span>
-              </div>
-              <div className="progress-stat-grid">
-                <span data-testid="progress-average-fps">Average Throughput: {formatFramesPerSecond(pipelineJob.progress.averageFramesPerSecond)}</span>
-                <span data-testid="progress-rolling-fps">Current Throughput: {formatFramesPerSecond(pipelineJob.progress.rollingFramesPerSecond)}</span>
-                <span data-testid="progress-eta">ETA: {formatElapsedSeconds(pipelineJob.progress.estimatedRemainingSeconds)}</span>
-                <span data-testid="progress-elapsed">Elapsed: {formatElapsedSeconds(pipelineJob.progress.elapsedSeconds)}</span>
-                <span data-testid="progress-process-rss">Worker RAM: {formatBytes(pipelineJob.progress.processRssBytes ?? 0)}</span>
-              </div>
-              <div className="progress-stat-grid">
-                <span data-testid="progress-gpu-memory">GPU Memory: {formatGpuMemory(pipelineJob.progress.gpuMemoryUsedBytes, pipelineJob.progress.gpuMemoryTotalBytes)}</span>
-                <span data-testid="workdir-size">Job Scratch Size: {formatBytes(progressScratchSizeBytes)}</span>
-                <span data-testid="output-file-size">Output Size: {formatBytes(progressOutputSizeBytes)}</span>
-                <span data-testid="progress-stage-timings">Stage Times: {formatStageTimings(pipelineJob.progress)}</span>
-              </div>
-              <div className="progress-event-log" data-testid="progress-event-log">
-                {pipelineProgressEvents.length > 0 ? [...pipelineProgressEvents].reverse().map((entry) => (
-                  <div key={`${entry.key}-${entry.timestamp}`} className="progress-event-row">
-                    <div className="progress-event-header">
-                      <strong>{entry.title}</strong>
-                      <span>{entry.percent}%</span>
-                    </div>
-                    <span>{entry.detail}</span>
-                    <span className="progress-event-timestamp">{formatExactTimestamp(entry.timestamp)}</span>
-                  </div>
-                )) : (
-                  <div className="progress-event-row">
-                    <strong>Waiting for live worker updates</strong>
-                    <span>The panel will add milestone entries as the pipeline advances.</span>
-                  </div>
-                )}
-              </div>
-            </div>
-          ) : null}
-          {result ? (
-            <>
-              {source && resultPreviewSrc ? (
-                <div className="comparison-grid">
-                  <div className="comparison-card">
-                    <span>Source Preview</span>
-                    <button type="button" className="preview-launcher" data-testid="source-result-open-button" onClick={() => void openMediaInDefaultApp(source.path)}>
-                      <video data-testid="source-result-preview" className="result-preview clickable-preview" preload="metadata" src={previewSrc ?? undefined} muted />
-                      <span className="preview-launch-hint">Click to open in the default video app</span>
-                    </button>
-                  </div>
-                  <div className="comparison-card">
-                    <span>Output Preview</span>
-                    <button type="button" className="preview-launcher" data-testid="result-open-button" onClick={() => void openMediaInDefaultApp(result.outputPath)}>
-                      <video data-testid="result-preview" className="result-preview clickable-preview" preload="metadata" src={resultPreviewSrc} muted />
-                      <span className="preview-launch-hint">Click to open in the default video app</span>
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-              <dl className="facts compact-facts">
-                <div><dt>Output</dt><dd data-testid="result-output-path">{result.outputPath}</dd></div>
-                <div><dt>Output Size</dt><dd>{formatBytes(outputPathStats?.sizeBytes ?? 0)}</dd></div>
-                <div><dt>Work Dir</dt><dd>{result.workDir}</dd></div>
-                <div><dt>Scratch Size</dt><dd>{formatBytes(workDirStats?.sizeBytes ?? 0)}</dd></div>
-                <div><dt>Frames</dt><dd>{result.frameCount}</dd></div>
-                <div><dt>Codec</dt><dd>{result.codec}</dd></div>
-                <div><dt>Container</dt><dd>{result.container}</dd></div>
-                <div><dt>Audio Sync</dt><dd>{result.hadAudio ? "Original audio remuxed" : "No source audio"}</dd></div>
-              </dl>
-              <div data-testid="pipeline-log" className="log-box">
-                {result.log.map((line, index) => (
-                  <div key={`${index}-${line.slice(0, 12)}`}>{line}</div>
-                ))}
-              </div>
-            </>
-          ) : (
-            <ul className="simple-list">
-              <li>Select a source file and verify its preview.</li>
-              <li>Pick the model, codec, container, and output file.</li>
-              <li>Use Quick Test Mode or blind comparison before a full export.</li>
-            </ul>
-          )}
-        </ExpandablePanel>
-      </section>
+        </article>
 
-      <section className="advanced-panel-stack">
         <ExpandablePanel
           title="Blind Test"
           subtitle={`${blindComparisonCandidates.length} runnable models`}
@@ -3120,14 +3236,536 @@ export default function App() {
             {blindComparison?.error ? <p className="error-text">{blindComparison.error}</p> : null}
           </section>
         </ExpandablePanel>
+        </div>
+
+        <div className="workspace-column">
 
         <ExpandablePanel
-          title="Job Cleanup"
+          title="Pipeline"
+          subtitle={result ? "Output ready" : isPipelineRunning ? "Running now" : "Configure and run"}
+          isOpen={isOutputPanelOpen}
+          onToggle={() => setIsOutputPanelOpen((current) => !current)}
+          testId="output-panel"
+        >
+          <section className="pipeline-shell" data-testid="processing-track-grid">
+            <div className="pipeline-section-heading">
+              <p className="eyebrow">Pipeline</p>
+              <h3>Processing Path</h3>
+              <p className="summary">
+                Load the video, switch pipeline steps on or off, then run the selected pipeline.
+              </p>
+            </div>
+
+            <section className={`pipeline-stage-panel${isUpscaleStepEnabled ? " pipeline-stage-panel-enabled" : ""}${activePipelineVisualStep === "upscale" ? " pipeline-stage-panel-current" : ""}`} data-testid="pipeline-upscale-details">
+              <div className="pipeline-stage-panel-header" data-testid="pipeline-upscale-summary">
+                <div className="pipeline-stage-heading-block" data-testid="upscaler-section-card">
+                  <span className="catalog-chip">Upscale</span>
+                  <strong>Spatial detail restore</strong>
+                  <span>{selectedModel.label}</span>
+                </div>
+                <button type="button" role="switch" aria-checked={isUpscaleStepEnabled} className={`pipeline-switch${isUpscaleStepEnabled ? " pipeline-switch-enabled" : ""}`} data-testid="pipeline-toggle-upscale" onClick={() => setIsUpscaleStepEnabled((current) => !current)}>
+                  <span className="pipeline-switch-track"><span className="pipeline-switch-thumb" /></span>
+                  <span className="pipeline-switch-label">{isUpscaleStepEnabled ? "On" : "Off"}</span>
+                </button>
+              </div>
+              {isUpscaleStepEnabled ? (
+                <section className="pipeline-stage-body" data-testid="upscaler-workspace-section">
+                  <label>
+                    Model
+                    <select data-testid="model-select" value={modelId} onChange={(event) => setModelId(event.target.value as ModelId)}>
+                      <optgroup label="Available Now">
+                        {runnableModels.map((model) => (
+                          <option key={model.value} value={model.value}>{model.label}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Planned">
+                        {plannedModels.map((model) => (
+                          <option key={model.value} value={model.value} disabled>{model.label} (not implemented)</option>
+                        ))}
+                      </optgroup>
+                    </select>
+                  </label>
+                  <details className="pipeline-detail-disclosure" data-testid="model-details-card">
+                    <summary className="pipeline-detail-summary">
+                      <span className="source-detail-summary-label">Model notes</span>
+                      <span className="source-detail-summary-value">{selectedModel.label} • {selectedBackend.label} • {selectedModel.nativeScale}x native</span>
+                    </summary>
+                    <div className="pipeline-detail-body">
+                      <div className="catalog-card-header">
+                        <strong data-testid="selected-model-label">{selectedModel.label}</strong>
+                        <span className={`catalog-chip execution-${selectedModel.executionStatus}`} data-testid="selected-model-status">
+                          {isSelectedModelImplemented ? selectedModel.executionStatus : "not implemented"}
+                        </span>
+                      </div>
+                      <p className="summary" data-testid="selected-model-summary">{selectedModel.summary}</p>
+                      {!isSelectedModelImplemented ? (
+                        <p className="summary" data-testid="selected-model-availability">This model is visible in the catalog but is not implemented yet, so it cannot be selected for export.</p>
+                      ) : null}
+                      <dl className="facts compact-facts">
+                        <div><dt>Backend</dt><dd>{selectedBackend.label}</dd></div>
+                        <div><dt>Loader</dt><dd>{selectedModel.loader}</dd></div>
+                        <div><dt>Runtime Model</dt><dd>{selectedModel.runtimeModelName}</dd></div>
+                        <div><dt>Support Tier</dt><dd>{selectedModel.supportTier}</dd></div>
+                        <div><dt>Quality Rank</dt><dd>#{selectedModel.qualityRank}</dd></div>
+                        <div><dt>Native Scale</dt><dd>{selectedModel.nativeScale}x</dd></div>
+                        <div><dt>Video Path</dt><dd>{selectedModel.videoNative ? "Native video pipeline" : "Frame-by-frame pipeline"}</dd></div>
+                        <div><dt>Suitability</dt><dd>{selectedModel.mediaSuitability.join(", ")}</dd></div>
+                        <div><dt>GPU Routing</dt><dd>{selectedModel.specialHandling.supportsGpuId ? "Explicit GPU id supported" : "Automatic device selection only"}</dd></div>
+                      </dl>
+                      <label>
+                        Rating
+                        <select data-testid="model-rating-select" value={selectedModelRating !== null ? String(selectedModelRating) : ""} onChange={(event) => void saveRating(event.target.value === "" ? null : Number(event.target.value))} disabled={isSavingRating}>
+                          <option value="">No saved rating</option>
+                          <option value="1">1 / 5</option>
+                          <option value="2">2 / 5</option>
+                          <option value="3">3 / 5</option>
+                          <option value="4">4 / 5</option>
+                          <option value="5">5 / 5</option>
+                        </select>
+                      </label>
+                      <p className="summary" data-testid="rating-summary">
+                        {selectedModelRating !== null ? `Saved rating: ${selectedModelRating}/5. Persisted in config/model_preferences.json.` : "No saved rating yet. Ratings persist in config/model_preferences.json."}
+                      </p>
+                    </div>
+                  </details>
+                  <label>
+                    GPU Device
+                    <select data-testid="gpu-select" value={selectedGpuId !== null ? String(selectedGpuId) : ""} onChange={(event) => setSelectedGpuId(event.target.value === "" ? null : Number(event.target.value))} disabled={!runtime || runtime.availableGpus.length === 0}>
+                      {!runtime ? <option value="">Prepare runtime first</option> : null}
+                      {runtime && runtime.availableGpus.length === 0 ? <option value="">No Vulkan GPUs detected</option> : null}
+                      {runtime?.availableGpus.map((gpu) => (
+                        <option key={gpu.id} value={gpu.id}>{gpu.id}: {gpu.name} ({gpu.kind})</option>
+                      ))}
+                    </select>
+                  </label>
+                  {runtime ? <p className="summary">{selectedGpu ? `Using NCNN/Vulkan GPU ${selectedGpu.id}: ${selectedGpu.name}.` : "Runtime detected no explicit Vulkan GPU selection."}</p> : null}
+                  <label>
+                    Output Mode
+                    <select data-testid="output-mode-select" value={outputMode} onChange={(event) => setOutputMode(event.target.value as OutputMode)}>
+                      {outputModes.map((mode) => (
+                        <option key={mode.value} value={mode.value}>{mode.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Resolution Basis
+                    <select data-testid="resolution-basis-select" value={resolutionBasis} onChange={(event) => setResolutionBasis(event.target.value as ResolutionBasis)}>
+                      {resolutionBases.map((basis) => (
+                        <option key={basis.value} value={basis.value}>{basis.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="dual-field-grid">
+                    <label>
+                      Target Width
+                      <input data-testid="target-width-input" type="number" min={2} step={2} value={displayedWidth} onChange={(event) => setTargetWidthInput(event.target.value)} readOnly={resolutionBasis === "height"} />
+                    </label>
+                    <label>
+                      Target Height
+                      <input data-testid="target-height-input" type="number" min={2} step={2} value={displayedHeight} onChange={(event) => setTargetHeightInput(event.target.value)} readOnly={resolutionBasis === "width"} />
+                    </label>
+                  </div>
+                  {outputMode === "cropTo4k" ? <p className="summary">Use Edit Crop to move the framing box without blocking the source player controls. The derived dimension is computed from the selected resolution basis and stays editable through the driving axis.</p> : null}
+                  <label>
+                    Quality Preset
+                    <select data-testid="quality-preset-select" value={qualityPreset} onChange={(event) => setQualityPreset(event.target.value as QualityPreset)}>
+                      {qualityPresets.map((preset) => (
+                        <option key={preset.value} value={preset.value}>{preset.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  {supportsPytorchRunner ? (
+                    <label>
+                      PyTorch Runner
+                      <select data-testid="pytorch-runner-select" value={pytorchRunner} onChange={(event) => setPytorchRunner(event.target.value as PytorchRunner)}>
+                        {pytorchRunners.map((runner) => (
+                          <option key={runner.value} value={runner.value}>{runner.label}</option>
+                        ))}
+                      </select>
+                      <span className="summary">TensorRT builds a cached engine on the first run for supported PyTorch image SR models, then reuses it on later runs.</span>
+                    </label>
+                  ) : null}
+                  <label>
+                    Tile Size
+                    <input data-testid="tile-size-input" type="number" min={0} step={32} value={tileSize} onChange={(event) => setTileSize(Number(event.target.value))} />
+                    <span className="summary">Use 0 for auto: PyTorch defaults to 384 on balanced quality, NCNN defaults to 256.</span>
+                  </label>
+                  <label>
+                    CRF
+                    <input data-testid="crf-input" type="number" min={0} max={51} value={crf} onChange={(event) => setCrf(Number(event.target.value))} />
+                  </label>
+                  {framing ? (
+                    <div className="framing-preview">
+                      <span>Target Canvas</span>
+                      <strong>{framing.canvas.width} x {framing.canvas.height}</strong>
+                      <span>Aspect Ratio</span>
+                      <strong>{framing.aspectRatio.toFixed(3)} : 1</strong>
+                      <span>Scaled Source</span>
+                      <strong>{framing.scaled.width} x {framing.scaled.height}</strong>
+                      <span>Selected Input Window</span>
+                      <strong>{framing.cropWindow.width} x {framing.cropWindow.height} at {framing.cropWindow.offsetX}, {framing.cropWindow.offsetY}</strong>
+                    </div>
+                  ) : null}
+                </section>
+              ) : null}
+            </section>
+
+            <div className="pipeline-arrow pipeline-arrow-large" aria-hidden="true">
+              <span className="pipeline-arrow-shaft" />
+              <span className="pipeline-arrow-head" />
+            </div>
+
+            <section className={`pipeline-stage-panel${isInterpolationStepEnabled ? " pipeline-stage-panel-enabled" : ""}${activePipelineVisualStep === "interpolate" ? " pipeline-stage-panel-current" : ""}`} data-testid="pipeline-interpolation-details">
+              <div className="pipeline-stage-panel-header" data-testid="pipeline-interpolation-summary">
+                <div className="pipeline-stage-heading-block" data-testid="interpolator-section-card">
+                  <span className="catalog-chip">{MOTION_SECTION_NAME}</span>
+                  <strong>Upsampling / interpolation</strong>
+                  <span>{!isInterpolationStepEnabled ? "Off" : interpolationMode === "interpolateOnly" ? `${interpolationTargetFps} fps standalone` : `${interpolationTargetFps} fps after upscale`}</span>
+                </div>
+                <button type="button" role="switch" aria-checked={isInterpolationStepEnabled} className={`pipeline-switch${isInterpolationStepEnabled ? " pipeline-switch-enabled" : ""}`} data-testid="pipeline-toggle-interpolation" onClick={() => setIsInterpolationStepEnabled((current) => !current)}>
+                  <span className="pipeline-switch-track"><span className="pipeline-switch-thumb" /></span>
+                  <span className="pipeline-switch-label">{isInterpolationStepEnabled ? "On" : "Off"}</span>
+                </button>
+              </div>
+              {isInterpolationStepEnabled ? (
+                <section className="pipeline-stage-body pipeline-stage-body-muted" data-testid="frame-rate-workspace-section">
+                  <div className="dual-field-grid">
+                    <label>
+                      Target Frame Rate
+                      <select data-testid="frame-rate-target-select" value={String(interpolationTargetFps)} onChange={(event) => setInterpolationTargetFps(Number(event.target.value) as InterpolationTargetFps)} disabled={!interpolationEnabled}>
+                        {interpolationTargetFpsOptions.map((fps) => (
+                          <option key={fps} value={String(fps)}>{fps} fps</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Pipeline Step
+                      <input data-testid="frame-rate-mode-readout" type="text" value={isUpscaleStepEnabled ? "Enabled after upscale" : "Enabled standalone"} readOnly />
+                    </label>
+                  </div>
+                  <p className="summary" data-testid="interpolation-workspace-summary">
+                    {interpolationMode === "interpolateOnly" ? "Interpolate-only mode is wired first so existing videos can move to a higher frame rate without requiring spatial upscaling." : "Post-upscale interpolation will synthesize frames after the spatial upscale stage so the generated motion runs at final output resolution."}
+                  </p>
+                </section>
+              ) : null}
+            </section>
+
+            <div className="pipeline-arrow pipeline-arrow-large" aria-hidden="true">
+              <span className="pipeline-arrow-shaft" />
+              <span className="pipeline-arrow-head" />
+            </div>
+
+            <section className="run-results-section pipeline-run-box">
+              <div className="pipeline-section-heading">
+                <p className="eyebrow">Pipeline</p>
+                <h3>Run Pipeline</h3>
+                <p className="summary">Choose the destination file and run the enabled steps in order.</p>
+              </div>
+            <section className="pipeline-export-settings" data-testid="pipeline-export-settings">
+              <div className="pipeline-export-settings-header">
+                <strong>Export Format</strong>
+                <button
+                  type="button"
+                  data-testid="match-input-format-button"
+                  className="action-button secondary-button pipeline-inline-action"
+                  onClick={matchInputFormat}
+                  disabled={!source || !canMatchInputFormat}
+                >
+                  Match Input
+                </button>
+              </div>
+              <div className="dual-field-grid">
+                <label>
+                  Codec
+                  <select data-testid="codec-select" value={codec} onChange={(event) => setCodec(event.target.value as VideoCodec)}>
+                    {codecs.map((entry) => (
+                      <option key={entry.value} value={entry.value}>{entry.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Container
+                  <select data-testid="container-select" value={container} onChange={(event) => updateContainer(event.target.value as OutputContainer)}>
+                    {containers.map((entry) => (
+                      <option key={entry.value} value={entry.value}>{entry.label}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <p className="summary" data-testid="match-input-format-summary">{matchInputFormatSummary}</p>
+              <details className="pipeline-detail-disclosure" data-testid="encoding-details-card">
+                <summary className="pipeline-detail-summary">
+                  <span className="source-detail-summary-label">Encoding Details</span>
+                  <span className="source-detail-summary-value">{encodingDetailsSummary}</span>
+                </summary>
+                <div className="pipeline-detail-body">
+                  <div className="dual-field-grid">
+                    <label>
+                      Quality Preset
+                      <select data-testid="encoding-quality-preset-select" value={qualityPreset} onChange={(event) => setQualityPreset(event.target.value as QualityPreset)}>
+                        {qualityPresets.map((preset) => (
+                          <option key={preset.value} value={preset.value}>{preset.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      CRF
+                      <input data-testid="encoding-crf-input" type="number" min={0} max={51} value={crf} onChange={(event) => setCrf(Number(event.target.value))} />
+                    </label>
+                  </div>
+                  <label>
+                    Tile Size
+                    <input data-testid="encoding-tile-size-input" type="number" min={0} step={32} value={tileSize} onChange={(event) => setTileSize(Number(event.target.value))} />
+                    <span className="summary">Use 0 for auto: PyTorch defaults to 384 on balanced quality, NCNN defaults to 256.</span>
+                  </label>
+                </div>
+              </details>
+            </section>
+            <section className="pipeline-export-settings" data-testid="pipeline-preview-settings">
+              <div className="pipeline-export-settings-header">
+                <strong>Quick Test</strong>
+              </div>
+              <label className="checkbox-row">
+                <input data-testid="preview-mode-checkbox" type="checkbox" checked={previewMode} onChange={(event) => setPreviewMode(event.target.checked)} />
+                <span>Quick Test Mode</span>
+              </label>
+              <label>
+                Preview Duration Seconds
+                <input data-testid="preview-duration-input" type="number" min={1} max={30} step={1} value={previewDurationInput} onChange={(event) => setPreviewDurationInput(event.target.value)} disabled={!previewMode} />
+              </label>
+              <label>
+                Export Chunk Seconds
+                <input data-testid="segment-duration-input" type="number" min={1} max={120} step={1} value={segmentDurationInput} onChange={(event) => setSegmentDurationInput(event.target.value)} disabled={previewMode} />
+                <span className="summary">Full exports buffer this many seconds per restartable chunk. Larger chunks reduce intermediate MKV overhead but reduce restart granularity. Quick Test always runs as one segment.</span>
+              </label>
+            </section>
+            <label>
+              Output File
+              <div className="path-picker-row">
+                <input data-testid="output-path-input" className="path-readonly-input" type="text" value={outputPath ?? defaultOutputPath(source, container, modelId)} readOnly />
+                <button data-testid="save-output-button" className="action-button secondary-button" onClick={() => void chooseOutputFile()} disabled={isRunDisabled}>
+                  Save As
+                </button>
+              </div>
+            </label>
+            <button data-testid="run-upscale-button" className="action-button" onClick={() => void runPipeline()} disabled={isRunDisabled}>
+              {isPipelineRunning ? "Running Pipeline..." : "Run Pipeline"}
+            </button>
+            {!hasEnabledPipelineStep ? (
+              <p className="summary" data-testid="run-disabled-reason">
+                Enable at least one pipeline step before running.
+              </p>
+            ) : null}
+            {hasEnabledPipelineStep && isUpscaleStepEnabled && !isSelectedModelImplemented ? (
+              <p className="summary" data-testid="run-disabled-reason">
+                {selectedModel.label} is not implemented yet, so export is disabled.
+              </p>
+            ) : null}
+            <details className="pipeline-detail-disclosure pipeline-runtime-disclosure">
+              <summary className="pipeline-detail-summary">
+                <span className="source-detail-summary-label">Runtime details</span>
+                <span className="source-detail-summary-value">{runtimeFactsSummary}</span>
+              </summary>
+              <div className="pipeline-detail-body">
+                {runtime ? (
+                  <dl className="facts compact-facts">
+                    <div><dt>FFmpeg</dt><dd>{runtime.ffmpegPath}</dd></div>
+                    <div><dt>Real-ESRGAN</dt><dd>{runtime.realesrganPath}</dd></div>
+                    <div><dt>Selected Model</dt><dd>{selectedModel.label}</dd></div>
+                    <div><dt>Detected GPUs</dt><dd>{runtime.availableGpus.length > 0 ? runtime.availableGpus.map((gpu) => `${gpu.id}: ${gpu.name}`).join(" | ") : "None detected"}</dd></div>
+                    <div><dt>Selected GPU</dt><dd>{selectedGpu ? `${selectedGpu.id}: ${selectedGpu.name}` : "Automatic / none"}</dd></div>
+                    <div><dt>Saved Ratings</dt><dd>{Object.keys(appConfig?.modelRatings ?? {}).length}</dd></div>
+                    <div><dt>Blind Picks Logged</dt><dd>{appConfig?.blindComparisons.length ?? 0}</dd></div>
+                  </dl>
+                ) : (
+                  <p className="summary">Runtime assets download on first use.</p>
+                )}
+              </div>
+            </details>
+            </section>
+          </section>
+          {result ? (
+            <>
+              {source && resultPreviewSrc ? (
+                <div className="comparison-grid">
+                  <div className="comparison-card">
+                    <span>Source Preview</span>
+                    <button type="button" className="preview-launcher" data-testid="source-result-open-button" onClick={() => void openMediaInDefaultApp(source.path)}>
+                      <video data-testid="source-result-preview" className="result-preview clickable-preview" preload="metadata" src={previewSrc ?? undefined} muted />
+                      <span className="preview-launch-hint">Click to open in the default video app</span>
+                    </button>
+                  </div>
+                  <div className="comparison-card">
+                    <span>Output Preview</span>
+                    <button type="button" className="preview-launcher" data-testid="result-open-button" onClick={() => void openMediaInDefaultApp(result.outputPath)}>
+                      <video data-testid="result-preview" className="result-preview clickable-preview" preload="metadata" src={resultPreviewSrc} muted />
+                      <span className="preview-launch-hint">Click to open in the default video app</span>
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+              <div className="result-detail-grid">
+                <details className="source-detail-disclosure source-metadata-card" data-testid="result-output-details">
+                  <summary className="source-detail-summary" title={buildResultOutputSummary(result, outputPathStats?.sizeBytes, workDirStats?.sizeBytes)}>
+                    <span className="source-detail-summary-label">Output Details</span>
+                    <span className="source-detail-summary-value">{buildResultOutputSummary(result, outputPathStats?.sizeBytes, workDirStats?.sizeBytes)}</span>
+                  </summary>
+                  <dl className="facts compact-facts source-detail-facts">
+                    <div><dt>Output</dt><dd data-testid="result-output-path">{result.outputPath}</dd></div>
+                    <div><dt>Output Size</dt><dd>{formatBytes(outputPathStats?.sizeBytes ?? 0)}</dd></div>
+                    <div><dt>Work Dir</dt><dd>{result.workDir}</dd></div>
+                    <div><dt>Scratch Size</dt><dd>{formatBytes(workDirStats?.sizeBytes ?? 0)}</dd></div>
+                    <div><dt>Frames</dt><dd>{result.frameCount}</dd></div>
+                    <div><dt>Codec</dt><dd>{formatMediaLabel(result.codec)}</dd></div>
+                    <div><dt>Container</dt><dd>{String(result.container).toUpperCase()}</dd></div>
+                    <div><dt>Audio Sync</dt><dd>{result.hadAudio ? "Original audio remuxed" : "No source audio"}</dd></div>
+                  </dl>
+                </details>
+                {result.interpolationDiagnostics ? (
+                  <details className="diagnostics-details source-detail-disclosure source-metadata-card" data-testid="interpolation-diagnostics-details">
+                    <summary className="source-detail-summary" data-testid="interpolation-diagnostics-summary" title={buildInterpolationDiagnosticsSummary(result)}>
+                      <span className="source-detail-summary-label">Interpolation Details</span>
+                      <span className="source-detail-summary-value">{buildInterpolationDiagnosticsSummary(result)}</span>
+                    </summary>
+                    <dl className="facts compact-facts diagnostics-facts source-detail-facts">
+                      <div><dt>Mode</dt><dd data-testid="interpolation-diagnostics-mode">{result.interpolationDiagnostics.mode}</dd></div>
+                      <div><dt>Source FPS</dt><dd data-testid="interpolation-diagnostics-source-fps">{result.interpolationDiagnostics.sourceFps.toFixed(3)}</dd></div>
+                      <div><dt>Output FPS</dt><dd data-testid="interpolation-diagnostics-output-fps">{result.interpolationDiagnostics.outputFps.toFixed(3)}</dd></div>
+                      <div><dt>Source Frames</dt><dd data-testid="interpolation-diagnostics-source-frames">{result.interpolationDiagnostics.sourceFrameCount}</dd></div>
+                      <div><dt>Output Frames</dt><dd data-testid="interpolation-diagnostics-output-frames">{result.interpolationDiagnostics.outputFrameCount}</dd></div>
+                      <div><dt>Segment Count</dt><dd data-testid="interpolation-diagnostics-segment-count">{result.interpolationDiagnostics.segmentCount}</dd></div>
+                      <div><dt>Source Frame Limit</dt><dd data-testid="interpolation-diagnostics-segment-limit">{result.interpolationDiagnostics.segmentFrameLimit}</dd></div>
+                      <div><dt>Boundary Overlap</dt><dd data-testid="interpolation-diagnostics-overlap">{result.interpolationDiagnostics.segmentOverlapFrames} frame{result.interpolationDiagnostics.segmentOverlapFrames === 1 ? "" : "s"}</dd></div>
+                    </dl>
+                  </details>
+                ) : null}
+                <details className="source-detail-disclosure source-metadata-card" data-testid="pipeline-log-details">
+                  <summary className="source-detail-summary" title={buildWorkerLogSummary(result)}>
+                    <span className="source-detail-summary-label">Worker Log</span>
+                    <span className="source-detail-summary-value">{buildWorkerLogSummary(result)}</span>
+                  </summary>
+                  <div data-testid="pipeline-log" className="log-box source-detail-facts">
+                    {result.log.map((line, index) => (
+                      <div key={`${index}-${line.slice(0, 12)}`}>{line}</div>
+                    ))}
+                  </div>
+                </details>
+              </div>
+            </>
+          ) : (
+            <ul className="simple-list">
+              <li>Select a source file and verify its preview.</li>
+              <li>Pick the model, codec, container, and output file.</li>
+              <li>Use Quick Test Mode or blind comparison before a full export.</li>
+            </ul>
+          )}
+        </ExpandablePanel>
+
+        </div>
+      </section>
+
+      <section className="advanced-panel-stack" ref={jobsPanelRef}>
+        <ExpandablePanel
+          title="Jobs"
           subtitle={`${cleanupJobs.length} tracked and historical jobs`}
           isOpen={isCleanupPanelOpen}
-          onToggle={() => setIsCleanupPanelOpen((current) => !current)}
+          onToggle={toggleCleanupPanel}
           testId="job-cleanup-panel"
         >
+          {sourceConversionJob && !pipelineJob ? (
+            <div className="job-progress-panel" data-testid="conversion-progress-panel">
+              <div className="catalog-card-header">
+                <strong>Source Conversion</strong>
+                <span>{sourceConversionJob.progress.percent}%</span>
+              </div>
+              <div className="progress-shell large-progress">
+                <div className="progress-bar" style={{ width: `${sourceConversionJob.progress.percent}%` }} />
+              </div>
+              <strong data-testid="conversion-progress-message">{sourceConversionJob.progress.message}</strong>
+              <span>{sourceConversionJob.progress.phase}</span>
+              <div className="progress-stat-grid">
+                <span data-testid="conversion-progress-current">Processed: {formatDurationProgress(sourceConversionJob.progress.processedFrames)}</span>
+                <span data-testid="conversion-progress-total">Total: {formatDurationProgress(sourceConversionJob.progress.totalFrames || 0)}</span>
+              </div>
+            </div>
+          ) : null}
+          {pipelineJob ? (
+            <div className="job-progress-panel" data-testid="job-progress-panel">
+              <div className="catalog-card-header">
+                <strong>Pipeline Progress</strong>
+                <span>{pipelineJob.progress.percent}%</span>
+              </div>
+              <div className="progress-shell large-progress">
+                <div className="progress-bar" style={{ width: `${pipelineJob.progress.percent}%` }} />
+              </div>
+              <strong className="truncated-line" data-testid="progress-message" title={pipelineJob.progress.message}>{pipelineJob.progress.message}</strong>
+              <span className="truncated-line progress-phase-label" title={pipelinePhaseLabel ?? ""}>{pipelinePhaseLabel}</span>
+              <div className="progress-live-summary" data-testid="progress-live-summary">
+                <strong className="truncated-line" data-testid="progress-current-activity" title={pipelineActivityTitle ?? ""}>{pipelineActivityTitle}</strong>
+                <span className="truncated-line" data-testid="progress-current-detail" title={pipelineActivityDetail ?? ""}>{pipelineActivityDetail}</span>
+                <span className="truncated-line" data-testid="progress-last-update" title={`Last update ${pipelineLastUpdateLabel}`}>Last update {pipelineLastUpdateLabel}</span>
+              </div>
+              {pipelineJob.progress.segmentIndex && pipelineJob.progress.segmentCount ? (
+                <div className="progress-stat-grid">
+                  <span className="truncated-line" data-testid="progress-segment-counter" title={`Segment: ${pipelineJob.progress.segmentIndex}/${pipelineJob.progress.segmentCount}`}>Segment: {pipelineJob.progress.segmentIndex}/{pipelineJob.progress.segmentCount}</span>
+                  <span className="truncated-line" data-testid="progress-segment-frames" title={`Segment Frames: ${pipelineJob.progress.segmentProcessedFrames ?? 0}/${pipelineJob.progress.segmentTotalFrames ?? 0}`}>Segment Frames: {pipelineJob.progress.segmentProcessedFrames ?? 0}/{pipelineJob.progress.segmentTotalFrames ?? 0}</span>
+                  {pipelineJob.progress.batchCount ? <span className="truncated-line" data-testid="progress-batch-counter" title={`Batch: ${pipelineJob.progress.batchIndex ?? 0}/${pipelineJob.progress.batchCount}`}>Batch: {pipelineJob.progress.batchIndex ?? 0}/{pipelineJob.progress.batchCount}</span> : null}
+                </div>
+              ) : null}
+              <span className="progress-section-label">Job-wide stage progress</span>
+              <div className="phase-progress-grid">
+                {pipelinePhaseBars.map((phaseBar) => (
+                  <div key={phaseBar.id} className="phase-progress-card" data-testid={`phase-progress-${phaseBar.id}`}>
+                    <div className="phase-progress-header">
+                      <strong>{phaseBar.label}</strong>
+                      <span className="truncated-line" title={phaseBar.summary}>{phaseBar.summary}</span>
+                    </div>
+                    <div className="progress-shell phase-progress-shell">
+                      <div className="progress-bar" style={{ width: `${phaseBar.value * 100}%` }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="progress-stat-grid">
+                <span className="truncated-line" data-testid="progress-total-frames" title={`Total Frames: ${pipelineJob.progress.totalFrames || "?"}`}>Total Frames: {pipelineJob.progress.totalFrames || "?"}</span>
+                <span className="truncated-line" data-testid="progress-extracted-frames" title={`Extracted PNGs: ${pipelineJob.progress.extractedFrames}`}>Extracted PNGs: {pipelineJob.progress.extractedFrames}</span>
+                <span className="truncated-line" data-testid="progress-upscaled-frames" title={`Upscaled PNGs: ${pipelineJob.progress.upscaledFrames}`}>Upscaled PNGs: {pipelineJob.progress.upscaledFrames}</span>
+                <span className="truncated-line" data-testid="progress-interpolated-frames" title={`Interpolated PNGs: ${pipelineJob.progress.interpolatedFrames}`}>Interpolated PNGs: {pipelineJob.progress.interpolatedFrames}</span>
+                <span className="truncated-line" data-testid="progress-encoded-frames" title={`Encoded Frames: ${pipelineJob.progress.encodedFrames}`}>Encoded Frames: {pipelineJob.progress.encodedFrames}</span>
+                <span className="truncated-line" data-testid="progress-remuxed-frames" title={`Audio Remux Frames: ${pipelineJob.progress.remuxedFrames}`}>Audio Remux Frames: {pipelineJob.progress.remuxedFrames}</span>
+              </div>
+              <div className="progress-stat-grid">
+                <span className="truncated-line" data-testid="progress-average-fps" title={`Average Throughput: ${formatFramesPerSecond(pipelineJob.progress.averageFramesPerSecond)}`}>Average Throughput: {formatFramesPerSecond(pipelineJob.progress.averageFramesPerSecond)}</span>
+                <span className="truncated-line" data-testid="progress-rolling-fps" title={`Current Throughput: ${formatFramesPerSecond(pipelineJob.progress.rollingFramesPerSecond)}`}>Current Throughput: {formatFramesPerSecond(pipelineJob.progress.rollingFramesPerSecond)}</span>
+                <span className="truncated-line" data-testid="progress-eta" title={`ETA: ${formatElapsedSeconds(pipelineJob.progress.estimatedRemainingSeconds)}`}>ETA: {formatElapsedSeconds(pipelineJob.progress.estimatedRemainingSeconds)}</span>
+                <span className="truncated-line" data-testid="progress-elapsed" title={`Elapsed: ${formatElapsedSeconds(pipelineJob.progress.elapsedSeconds)}`}>Elapsed: {formatElapsedSeconds(pipelineJob.progress.elapsedSeconds)}</span>
+                <span className="truncated-line" data-testid="progress-process-rss" title={`Worker RAM: ${formatBytes(pipelineJob.progress.processRssBytes ?? 0)}`}>Worker RAM: {formatBytes(pipelineJob.progress.processRssBytes ?? 0)}</span>
+              </div>
+              <div className="progress-stat-grid">
+                <span className="truncated-line" data-testid="progress-gpu-memory" title={`GPU Memory: ${formatGpuMemory(pipelineJob.progress.gpuMemoryUsedBytes, pipelineJob.progress.gpuMemoryTotalBytes)}`}>GPU Memory: {formatGpuMemory(pipelineJob.progress.gpuMemoryUsedBytes, pipelineJob.progress.gpuMemoryTotalBytes)}</span>
+                <span className="truncated-line" data-testid="workdir-size" title={`Job Scratch Size: ${formatBytes(progressScratchSizeBytes)}`}>Job Scratch Size: {formatBytes(progressScratchSizeBytes)}</span>
+                <span className="truncated-line" data-testid="output-file-size" title={`Output Size: ${formatBytes(progressOutputSizeBytes)}`}>Output Size: {formatBytes(progressOutputSizeBytes)}</span>
+                <span className="truncated-line" data-testid="progress-stage-timings" title={`Stage Times: ${formatStageTimings(pipelineJob.progress)}`}>Stage Times: {formatStageTimings(pipelineJob.progress)}</span>
+              </div>
+              <div className="progress-event-log" data-testid="progress-event-log">
+                {pipelineProgressEvents.length > 0 ? [...pipelineProgressEvents].reverse().map((entry) => (
+                  <div key={`${entry.key}-${entry.timestamp}`} className="progress-event-row">
+                    <div className="progress-event-header">
+                      <strong>{entry.title}</strong>
+                      <span>{entry.percent}%</span>
+                    </div>
+                    <span className="truncated-line" title={entry.detail}>{entry.detail}</span>
+                    <span className="progress-event-timestamp truncated-line" title={formatExactTimestamp(entry.timestamp)}>{formatExactTimestamp(entry.timestamp)}</span>
+                  </div>
+                )) : (
+                  <div className="progress-event-row">
+                    <strong>Waiting for live worker updates</strong>
+                    <span className="truncated-line" title="The panel will add milestone entries as the pipeline advances.">The panel will add milestone entries as the pipeline advances.</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : null}
           <section className="catalog-card cleanup-card" data-testid="cleanup-jobs-card">
             <div className="catalog-card-header">
               <strong>Tracked And Historical Jobs</strong>
@@ -3163,14 +3801,10 @@ export default function App() {
                       onChange={(event) => setCleanupSearch(event.target.value)}
                     />
                   </label>
-                  <label>
-                    Sort Jobs
-                    <select data-testid="cleanup-sort-select" value={cleanupSort} onChange={(event) => setCleanupSort(event.target.value as CleanupJobSort)}>
-                      <option value="largest">Largest First</option>
-                      <option value="newest">Newest First</option>
-                      <option value="oldest">Oldest First</option>
-                    </select>
-                  </label>
+                  <div className="cleanup-sort-hint" data-testid="cleanup-sort-hint">
+                    <span className="cleanup-sort-hint-label">Sort Jobs</span>
+                    <span className="summary">Click a column header to sort ascending first, then descending on the next click.</span>
+                  </div>
                 </div>
                 <div className="job-progress-actions wrap-actions">
                   <button type="button" className="action-button secondary-button" data-testid="cleanup-bulk-scratch" onClick={() => void runBulkCleanup("scratch")} disabled={isBusy || hasActiveCleanupJobs || filteredCleanupJobs.length === 0}>
@@ -3183,104 +3817,140 @@ export default function App() {
                     Clear Filtered Artifacts
                   </button>
                 </div>
-              <div className="cleanup-table-shell" data-testid="cleanup-jobs-table-shell">
-                <table className="cleanup-jobs-table" data-testid="cleanup-jobs-table">
-                  <thead>
-                    <tr>
-                      <th scope="col">State</th>
-                      <th scope="col">Job Directory</th>
-                      <th scope="col">Size</th>
-                      <th scope="col">Last Update</th>
-                      <th scope="col">Input File</th>
-                      <th scope="col">Output File</th>
-                      <th scope="col">Details</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredCleanupJobs.map((job) => {
-                      const isExpanded = expandedCleanupJobIds.includes(job.id);
-                      const combinedSizeBytes = cleanupJobTotalBytes(job);
-                      return (
-                        <Fragment key={job.id}>
-                          <tr className="cleanup-jobs-row" data-testid={`cleanup-job-${job.id}`}>
-                            <td>
-                              <div className="cleanup-state-cell">
-                                <span className="catalog-chip">{cleanupKindLabel(job.jobKind)}</span>
-                                <strong>{job.state}</strong>
-                                <span className="cleanup-row-message">{job.label}</span>
-                              </div>
-                            </td>
-                            <td data-testid={`cleanup-directory-${job.id}`}>{jobDirectoryLabel(job.scratchPath)}</td>
-                            <td data-testid={`cleanup-size-${job.id}`}>{formatBytes(combinedSizeBytes)}</td>
-                            <td data-testid={`cleanup-updated-${job.id}`}>{formatRelativeTime(job.updatedAt)}</td>
-                            <td data-testid={`cleanup-input-${job.id}`}>{pathLeaf(job.sourcePath)}</td>
-                            <td data-testid={`cleanup-output-${job.id}`}>{pathLeaf(job.outputPath)}</td>
-                            <td>
-                              <button type="button" className="cleanup-expand-button" data-testid={`cleanup-expand-${job.id}`} onClick={() => toggleCleanupJobExpanded(job.id)}>
-                                {isExpanded ? "Hide Details" : "Show Details"}
-                              </button>
-                            </td>
-                          </tr>
-                          {isExpanded ? (
-                            <tr className="cleanup-jobs-detail-row" data-testid={`cleanup-details-row-${job.id}`}>
-                              <td colSpan={7}>
-                                <div className="cleanup-details-panel" data-testid={`cleanup-details-${job.id}`}>
-                                  <div className="cleanup-details-grid">
-                                    <span>Status Message: {job.message}</span>
-                                    <span>Exact Updated: {formatExactTimestamp(job.updatedAt)}</span>
-                                    <span>Phase: {job.phase}</span>
-                                    <span>Recorded Frames: {job.recordedCount}</span>
-                                    <span>Model: {job.modelId ?? "n/a"}</span>
-                                    <span>Codec / Container: {job.codec ?? "n/a"} / {job.container ?? "n/a"}</span>
-                                    <span>Scratch Size / Output Size: {formatBytes(job.scratchSizeBytes)} / {formatBytes(job.outputSizeBytes)}</span>
-                                    <span>Average / Current Throughput: {formatFramesPerSecond(job.progress.averageFramesPerSecond)} / {formatFramesPerSecond(job.progress.rollingFramesPerSecond)}</span>
-                                    <span>Elapsed / ETA: {formatElapsedSeconds(job.progress.elapsedSeconds)} / {formatElapsedSeconds(job.progress.estimatedRemainingSeconds)}</span>
-                                    <span>Worker RAM / GPU Memory: {formatBytes(job.progress.processRssBytes ?? 0)} / {formatGpuMemory(job.progress.gpuMemoryUsedBytes, job.progress.gpuMemoryTotalBytes)}</span>
-                                    <span>Stage Times: {formatStageTimings(job.progress)}</span>
-                                    <span>Input Path: {job.sourcePath ?? "n/a"}</span>
-                                    <span>Scratch Path: {job.scratchPath ?? "n/a"}</span>
-                                    <span>Output Path: {job.outputPath ?? "n/a"}</span>
-                                  </div>
-                                  <div className="job-progress-actions wrap-actions">
-                                    {job.outputPath ? (
-                                      <button type="button" className="action-button secondary-button" data-testid={`cleanup-open-output-${job.id}`} onClick={() => void openMediaInDefaultApp(job.outputPath!)} disabled={isBusy}>
-                                        Open Output
-                                      </button>
-                                    ) : null}
-                                    {job.scratchPath ? (
-                                      <button type="button" className="action-button secondary-button" data-testid={`cleanup-open-scratch-${job.id}`} onClick={() => void openMediaInDefaultApp(job.scratchPath!)} disabled={isBusy}>
-                                        Open Scratch Folder
-                                      </button>
-                                    ) : null}
-                                    {job.onStop ? (
-                                      <button type="button" className="action-button secondary-button" data-testid={`cleanup-stop-${job.id}`} onClick={job.onStop} disabled={isBusy}>
-                                        Stop Job
-                                      </button>
-                                    ) : null}
-                                    {job.onClearScratch ? (
-                                      <button type="button" className="action-button secondary-button" data-testid={`cleanup-clear-scratch-${job.id}`} onClick={job.onClearScratch} disabled={isBusy || isPipelineRunning}>
-                                        Clear Job Scratch
-                                      </button>
-                                    ) : null}
-                                    {job.onDeleteOutput ? (
-                                      <button type="button" className="action-button secondary-button" data-testid={`cleanup-delete-output-${job.id}`} onClick={job.onDeleteOutput} disabled={isBusy || isPipelineRunning || isSourceConversionRunning}>
-                                        Delete Job Output
-                                      </button>
-                                    ) : null}
-                                  </div>
+                <div className="cleanup-table-shell" data-testid="cleanup-jobs-table-shell">
+                  <table className="cleanup-jobs-table" data-testid="cleanup-jobs-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">
+                          <button type="button" className={`cleanup-sort-button${cleanupSort.column === "state" ? " cleanup-sort-button-active" : ""}`} data-testid="cleanup-sort-state" onClick={() => setCleanupSort((current) => toggleCleanupSort(current, "state"))}>
+                            <span>State</span>
+                            <span className="cleanup-sort-arrow">{cleanupSortIndicator(cleanupSort, "state")}</span>
+                          </button>
+                        </th>
+                        <th scope="col">
+                          <button type="button" className={`cleanup-sort-button${cleanupSort.column === "id" ? " cleanup-sort-button-active" : ""}`} data-testid="cleanup-sort-id" onClick={() => setCleanupSort((current) => toggleCleanupSort(current, "id"))}>
+                            <span>Job ID</span>
+                            <span className="cleanup-sort-arrow">{cleanupSortIndicator(cleanupSort, "id")}</span>
+                          </button>
+                        </th>
+                        <th scope="col">
+                          <button type="button" className={`cleanup-sort-button${cleanupSort.column === "size" ? " cleanup-sort-button-active" : ""}`} data-testid="cleanup-sort-size" onClick={() => setCleanupSort((current) => toggleCleanupSort(current, "size"))}>
+                            <span>Size</span>
+                            <span className="cleanup-sort-arrow">{cleanupSortIndicator(cleanupSort, "size")}</span>
+                          </button>
+                        </th>
+                        <th scope="col">
+                          <button type="button" className={`cleanup-sort-button${cleanupSort.column === "updatedAt" ? " cleanup-sort-button-active" : ""}`} data-testid="cleanup-sort-updated" onClick={() => setCleanupSort((current) => toggleCleanupSort(current, "updatedAt"))}>
+                            <span>Last Update</span>
+                            <span className="cleanup-sort-arrow">{cleanupSortIndicator(cleanupSort, "updatedAt")}</span>
+                          </button>
+                        </th>
+                        <th scope="col">
+                          <button type="button" className={`cleanup-sort-button${cleanupSort.column === "input" ? " cleanup-sort-button-active" : ""}`} data-testid="cleanup-sort-input" onClick={() => setCleanupSort((current) => toggleCleanupSort(current, "input"))}>
+                            <span>Input File</span>
+                            <span className="cleanup-sort-arrow">{cleanupSortIndicator(cleanupSort, "input")}</span>
+                          </button>
+                        </th>
+                        <th scope="col">
+                          <button type="button" className={`cleanup-sort-button${cleanupSort.column === "output" ? " cleanup-sort-button-active" : ""}`} data-testid="cleanup-sort-output" onClick={() => setCleanupSort((current) => toggleCleanupSort(current, "output"))}>
+                            <span>Output File</span>
+                            <span className="cleanup-sort-arrow">{cleanupSortIndicator(cleanupSort, "output")}</span>
+                          </button>
+                        </th>
+                        <th scope="col">Details</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredCleanupJobs.map((job) => {
+                        const isExpanded = expandedCleanupJobIds.includes(job.id);
+                        const combinedSizeBytes = cleanupJobTotalBytes(job);
+                        return (
+                          <Fragment key={job.id}>
+                            <tr className="cleanup-jobs-row" data-testid={`cleanup-job-${job.id}`}>
+                              <td>
+                                <div className="cleanup-state-cell">
+                                  <span className="catalog-chip">{cleanupKindLabel(job)}</span>
+                                  <strong>{job.state}</strong>
+                                  <span className="cleanup-row-message">{job.label}</span>
                                 </div>
                               </td>
+                              <td data-testid={`cleanup-directory-${job.id}`}>
+                                <div className="cleanup-id-cell">
+                                  <strong className="cleanup-id-value">{job.id}</strong>
+                                  <span className="cleanup-row-message">{job.scratchPath ? `Scratch: ${pathLabel(job.scratchPath, "No scratch")}` : "No scratch"}</span>
+                                </div>
+                              </td>
+                              <td data-testid={`cleanup-size-${job.id}`}>{formatBytes(combinedSizeBytes)}</td>
+                              <td data-testid={`cleanup-updated-${job.id}`}>{formatRelativeTime(job.updatedAt)}</td>
+                              <td data-testid={`cleanup-input-${job.id}`} title={job.sourcePath ?? "No input path"}>{pathLabel(job.sourcePath, "No input")}</td>
+                              <td data-testid={`cleanup-output-${job.id}`} title={job.outputPath ?? "No output path"}>{pathLabel(job.outputPath, "No output")}</td>
+                              <td>
+                                <button type="button" className="cleanup-expand-button" data-testid={`cleanup-expand-${job.id}`} onClick={() => toggleCleanupJobExpanded(job.id)}>
+                                  {isExpanded ? "Hide Details" : "Show Details"}
+                                </button>
+                              </td>
                             </tr>
-                          ) : null}
-                        </Fragment>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-              {filteredCleanupJobs.length === 0 ? (
-                <p className="summary" data-testid="cleanup-empty-filter">No jobs match the current filter.</p>
-              ) : null}
+                            {isExpanded ? (
+                              <tr className="cleanup-jobs-detail-row" data-testid={`cleanup-details-row-${job.id}`}>
+                                <td colSpan={7}>
+                                  <div className="cleanup-details-panel" data-testid={`cleanup-details-${job.id}`}>
+                                    <div className="cleanup-details-grid">
+                                      <span>Status Message: {job.message}</span>
+                                      <span>Exact Updated: {formatExactTimestamp(job.updatedAt)}</span>
+                                      <span>Job ID: {job.id}</span>
+                                      <span>Phase: {job.phase}</span>
+                                      <span>Recorded Frames: {job.recordedCount}</span>
+                                      <span>Model: {job.modelId ?? "Unknown model"}</span>
+                                      <span>Codec / Container: {job.codec ?? "Unknown codec"} / {job.container ?? "Unknown container"}</span>
+                                      <span>Scratch Size / Output Size: {formatBytes(job.scratchSizeBytes)} / {formatBytes(job.outputSizeBytes)}</span>
+                                      <span>Average / Current Throughput: {formatFramesPerSecond(job.progress.averageFramesPerSecond)} / {formatFramesPerSecond(job.progress.rollingFramesPerSecond)}</span>
+                                      <span>Elapsed / ETA: {formatElapsedSeconds(job.progress.elapsedSeconds)} / {formatElapsedSeconds(job.progress.estimatedRemainingSeconds)}</span>
+                                      <span>Worker RAM / GPU Memory: {formatBytes(job.progress.processRssBytes ?? 0)} / {formatGpuMemory(job.progress.gpuMemoryUsedBytes, job.progress.gpuMemoryTotalBytes)}</span>
+                                      <span>Stage Times: {formatStageTimings(job.progress)}</span>
+                                      <span>Input Path: {job.sourcePath ?? "No input path recorded"}</span>
+                                      <span>Scratch Path: {job.scratchPath ?? "No scratch path recorded"}</span>
+                                      <span>Output Path: {job.outputPath ?? "No output path recorded"}</span>
+                                    </div>
+                                    <div className="job-progress-actions wrap-actions">
+                                      {job.outputPath ? (
+                                        <button type="button" className="action-button secondary-button" data-testid={`cleanup-open-output-${job.id}`} onClick={() => void openMediaInDefaultApp(job.outputPath!)} disabled={isBusy}>
+                                          Open Output
+                                        </button>
+                                      ) : null}
+                                      {job.scratchPath ? (
+                                        <button type="button" className="action-button secondary-button" data-testid={`cleanup-open-scratch-${job.id}`} onClick={() => void openMediaInDefaultApp(job.scratchPath!)} disabled={isBusy}>
+                                          Open Scratch Folder
+                                        </button>
+                                      ) : null}
+                                      {job.onStop ? (
+                                        <button type="button" className="action-button secondary-button" data-testid={`cleanup-stop-${job.id}`} onClick={job.onStop} disabled={isBusy}>
+                                          Stop Job
+                                        </button>
+                                      ) : null}
+                                      {job.onClearScratch ? (
+                                        <button type="button" className="action-button secondary-button" data-testid={`cleanup-clear-scratch-${job.id}`} onClick={job.onClearScratch} disabled={isBusy || isPipelineRunning}>
+                                          Clear Job Scratch
+                                        </button>
+                                      ) : null}
+                                      {job.onDeleteOutput ? (
+                                        <button type="button" className="action-button secondary-button" data-testid={`cleanup-delete-output-${job.id}`} onClick={job.onDeleteOutput} disabled={isBusy || isPipelineRunning || isSourceConversionRunning}>
+                                          Delete Job Output
+                                        </button>
+                                      ) : null}
+                                    </div>
+                                  </div>
+                                </td>
+                              </tr>
+                            ) : null}
+                          </Fragment>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                {filteredCleanupJobs.length === 0 ? (
+                  <p className="summary" data-testid="cleanup-empty-filter">No jobs match the current filter.</p>
+                ) : null}
               </>
             ) : (
               <p className="summary">No tracked or historical managed jobs found yet.</p>

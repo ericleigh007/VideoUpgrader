@@ -182,28 +182,6 @@
       }
     },
     {
-      "id": "rife-v4.6",
-      "backendId": "pytorch-video-interpolation",
-      "loader": "pytorch-checkpoint",
-      "runtimeModelName": "rife-v4.6",
-      "label": "RIFE v4.6",
-      "summary": "Planned frame interpolation model for motion-compensated 30 fps and 60 fps video upgrades.",
-      "visibleInUi": false,
-      "comparisonEligible": false,
-      "executionStatus": "planned",
-      "supportTier": "research",
-      "qualityRank": 7,
-      "videoNative": true,
-      "mediaSuitability": ["video"],
-      "nativeScale": 1,
-      "specialHandling": {
-        "cropMath": "scale-aware",
-        "requiresVulkan": false,
-        "supportsGpuId": true,
-        "prefersFixedScaleModelOutput": false
-      }
-    },
-    {
       "id": "realesrgan-x4plus-anime",
       "backendId": "realesrgan-ncnn",
       "loader": "ncnn-portable-binary",

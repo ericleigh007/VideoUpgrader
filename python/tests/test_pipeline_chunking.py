@@ -1,3 +1,5 @@
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,9 +10,11 @@ from upscaler_worker.pipeline import (
     PIPELINE_SEGMENT_FRAME_LIMIT,
     PIPELINE_SEGMENT_TARGET_SECONDS,
     PipelineProgressState,
+    _emit_pipeline_progress,
     _effective_tile_size,
     _pipeline_percent,
     _plan_pipeline_segments,
+    _resolve_video_encoder_config,
 )
 
 
@@ -51,11 +55,131 @@ class PipelineChunkingTests(unittest.TestCase):
 
         self.assertEqual(_pipeline_percent(48, progress_state), 49)
 
+    def test_pipeline_percent_scales_interpolation_only_progress_to_output_frames(self) -> None:
+        progress_state = PipelineProgressState(
+            extracted_frames=2667,
+            upscaled_frames=0,
+            interpolated_frames=8000,
+            encoded_frames=0,
+            remuxed_frames=0,
+        )
+
+        self.assertEqual(
+            _pipeline_percent(
+                80000,
+                progress_state,
+                source_total_frames=26667,
+                interpolation_mode="interpolateOnly",
+            ),
+            8,
+        )
+
+    def test_pipeline_percent_includes_interpolation_after_upscale(self) -> None:
+        progress_state = PipelineProgressState(
+            extracted_frames=2667,
+            upscaled_frames=2667,
+            interpolated_frames=8000,
+            encoded_frames=0,
+            remuxed_frames=0,
+        )
+
+        self.assertEqual(
+            _pipeline_percent(
+                80000,
+                progress_state,
+                source_total_frames=26667,
+                interpolation_mode="afterUpscale",
+            ),
+            8,
+        )
+
+    def test_emit_pipeline_progress_uses_interpolated_frames_for_processed_frames(self) -> None:
+        progress_state = PipelineProgressState(
+            extracted_frames=2667,
+            upscaled_frames=0,
+            interpolated_frames=8000,
+            encoded_frames=0,
+            remuxed_frames=0,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            progress_path = Path(temp_dir) / "progress.json"
+            _emit_pipeline_progress(
+                str(progress_path),
+                phase="interpolating",
+                message="Interpolating frames",
+                total_frames=80000,
+                progress_state=progress_state,
+                source_total_frames=26667,
+                interpolation_mode="interpolateOnly",
+            )
+
+            payload = json.loads(progress_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["percent"], 8)
+        self.assertEqual(payload["processedFrames"], 8001)
+        self.assertEqual(payload["interpolatedFrames"], 8000)
+
     def test_effective_tile_size_is_backend_aware(self) -> None:
         self.assertEqual(_effective_tile_size("realesrgan-x4plus", "qualityBalanced", 0), 256)
         self.assertEqual(_effective_tile_size("realesrnet-x4plus", "qualityBalanced", 0), 384)
         self.assertEqual(_effective_tile_size("realesrnet-x4plus", "vramSafe", 0), 256)
         self.assertEqual(_effective_tile_size("realesrnet-x4plus", "qualityMax", 0), 512)
+
+    @patch("upscaler_worker.pipeline._probe_video_encoder", return_value=True)
+    def test_resolve_video_encoder_prefers_nvenc_when_available(self, _probe_mock) -> None:
+        log: list[str] = []
+        config = _resolve_video_encoder_config(
+            ffmpeg="ffmpeg",
+            runtime={
+                "availableGpus": [{"id": 0, "name": "NVIDIA GeForce RTX 4080", "kind": "discrete"}],
+            },
+            gpu_id=0,
+            codec="h264",
+            crf=18,
+            log=log,
+        )
+
+        self.assertEqual(config.encoder, "h264_nvenc")
+        self.assertTrue(config.hardware_accelerated)
+        self.assertIn("Video encoder: h264_nvenc", log[0])
+
+    @patch("upscaler_worker.pipeline._probe_video_encoder", return_value=False)
+    def test_resolve_video_encoder_falls_back_to_cpu_when_probe_fails(self, _probe_mock) -> None:
+        log: list[str] = []
+        config = _resolve_video_encoder_config(
+            ffmpeg="ffmpeg",
+            runtime={
+                "availableGpus": [{"id": 0, "name": "NVIDIA GeForce RTX 4080", "kind": "discrete"}],
+            },
+            gpu_id=0,
+            codec="h264",
+            crf=18,
+            log=log,
+        )
+
+        self.assertEqual(config.encoder, "libx264")
+        self.assertFalse(config.hardware_accelerated)
+        self.assertIn("Hardware encoder probe failed", log[0])
+
+    @patch("upscaler_worker.pipeline._probe_video_encoder")
+    def test_resolve_video_encoder_uses_cpu_for_non_nvidia_gpus(self, probe_mock) -> None:
+        log: list[str] = []
+        config = _resolve_video_encoder_config(
+            ffmpeg="ffmpeg",
+            runtime={
+                "availableGpus": [{"id": 3, "name": "Intel Iris Xe Graphics", "kind": "integrated"}],
+            },
+            gpu_id=3,
+            codec="h265",
+            crf=20,
+            log=log,
+        )
+
+        self.assertEqual(config.encoder, "libx265")
+        self.assertFalse(config.hardware_accelerated)
+        probe_mock.assert_not_called()
+        self.assertIn("Video encoder: libx265", log[0])
 
     @patch("upscaler_worker.pipeline._path_size_bytes", side_effect=[4096, 2048, 4096, 2048])
     @patch("upscaler_worker.pipeline._sample_gpu_memory_bytes", return_value=(512 * 1024 * 1024, 1024 * 1024 * 1024))
