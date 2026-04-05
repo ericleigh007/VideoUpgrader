@@ -318,7 +318,16 @@ fn managed_job_summary_path(job_id: &str) -> PathBuf {
 }
 
 fn python_command() -> String {
-    env::var("UPSCALER_PYTHON").unwrap_or_else(|_| "python".to_string())
+    if let Ok(command) = env::var("UPSCALER_PYTHON") {
+        return command;
+    }
+
+    let repo_local_python = repo_root().join(".venv").join("Scripts").join("python.exe");
+    if repo_local_python.exists() {
+        return repo_local_python.display().to_string();
+    }
+
+    "python".to_string()
 }
 
 fn pythonpath() -> String {

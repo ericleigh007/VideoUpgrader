@@ -4,7 +4,7 @@
 
 Build a Windows-first desktop application for comparing video upscaler models and frame interpolation workflows with the primary goal of maximizing output quality and the secondary goal of measuring performance. The app should ingest source video, upscale it up to 4K UHD, optionally preserve aspect ratio or crop to a fixed 4K frame, interpolate to higher frame rates where requested, and produce analytical comparisons of competing models at the pixel level and over time.
 
-This plan is based on the current baseline in [requirements.md](requirements.md) and the existing build/runbook direction in [build_upscalers.md](../build_upscalers.md).
+This plan is based on the current baseline in [requirements.md](requirements.md) and the existing build/runbook direction in [build_VideoUpgrader.md](../build_VideoUpgrader.md).
 
 ## Key Requirements Interpreted
 

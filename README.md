@@ -122,25 +122,26 @@ Notes:
 Set the worker path first:
 
 ```powershell
+$env:UPSCALER_PYTHON = (Resolve-Path .\.venv\Scripts\python.exe).Path
 $env:PYTHONPATH='python'
 ```
 
 1. Run upscale only
 
 ```powershell
-& 'C:/Users/ericl/AppData/Local/Programs/Python/Python310/python.exe' python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrgan-x4plus --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode off --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/upscaled-only.mp4 --codec h264 --container mp4
+& $env:UPSCALER_PYTHON python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrgan-x4plus --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode off --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/upscaled-only.mp4 --codec h264 --container mp4
 ```
 
 2. Run interpolation only
 
 ```powershell
-& 'C:/Users/ericl/AppData/Local/Programs/Python/Python310/python.exe' python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrgan-x4plus --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode interpolateOnly --interpolation-target-fps 60 --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/interpolated-only.mp4 --codec h264 --container mp4
+& $env:UPSCALER_PYTHON python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrgan-x4plus --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode interpolateOnly --interpolation-target-fps 60 --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/interpolated-only.mp4 --codec h264 --container mp4
 ```
 
 3. Run upscale and interpolation together
 
 ```powershell
-& 'C:/Users/ericl/AppData/Local/Programs/Python/Python310/python.exe' python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrgan-x4plus --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode afterUpscale --interpolation-target-fps 60 --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/upscaled-and-interpolated.mp4 --codec h264 --container mp4
+& $env:UPSCALER_PYTHON python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrgan-x4plus --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode afterUpscale --interpolation-target-fps 60 --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/upscaled-and-interpolated.mp4 --codec h264 --container mp4
 ```
 
 CLI notes:
@@ -157,16 +158,16 @@ CLI notes:
 - Node.js 20+
 - npm
 - Rust and Cargo
-- Python 3.10+ for the worker runtime
+- Python 3.10+ in the project-local `.venv` for the worker runtime
 - FFmpeg available on `PATH`
 
 Preferred Python environment variable:
 
 ```powershell
-$env:UPSCALER_PYTHON='C:/path/to/venv/Scripts/python.exe'
+$env:UPSCALER_PYTHON = (Resolve-Path .\.venv\Scripts\python.exe).Path
 ```
 
-If that variable is not set, the scripts fall back to `python`.
+If that variable is not set, the repository scripts prefer the repo-local `.venv` and only fall back to `python` when needed.
 
 ## One-Time Setup
 
@@ -206,6 +207,12 @@ Generate synthetic benchmark fixtures:
 ./scripts/generate-benchmarks.ps1
 ```
 
+Run the automated desktop smoke test:
+
+```powershell
+./scripts/desktop-test.ps1
+```
+
 ## Frontend / Desktop Dev Commands
 
 These are also available directly through `npm`:
@@ -229,34 +236,34 @@ Generate a small synthetic fixture:
 
 ```powershell
 $env:PYTHONPATH='python'
-& 'C:/Users/ericl/AppData/Local/Programs/Python/Python310/python.exe' python/upscaler_worker/cli.py generate-benchmark --output-dir artifacts/benchmarks --name quick_fixture --frames 4 --width 1280 --height 720 --downscale-width 320 --downscale-height 180
+& $env:UPSCALER_PYTHON python/upscaler_worker/cli.py generate-benchmark --output-dir artifacts/benchmarks --name quick_fixture --frames 4 --width 1280 --height 720 --downscale-width 320 --downscale-height 180
 ```
 
 Compare precision quality on a small frame set:
 
 ```powershell
 $env:PYTHONPATH='python'
-& 'C:/Users/ericl/AppData/Local/Programs/Python/Python310/python.exe' python/upscaler_worker/cli.py compare-precision-quality --manifest-path artifacts/benchmarks/quick_fixture/manifest.json --model-id swinir-realworld-x4 --tile-size 128 --reference-precision fp32 --candidate-precision bf16 --max-frames 4
+& $env:UPSCALER_PYTHON python/upscaler_worker/cli.py compare-precision-quality --manifest-path artifacts/benchmarks/quick_fixture/manifest.json --model-id swinir-realworld-x4 --tile-size 128 --reference-precision fp32 --candidate-precision bf16 --max-frames 4
 ```
 
 Install the optional TensorRT runner dependencies:
 
 ```powershell
-& 'C:/Users/ericl/AppData/Local/Programs/Python/Python310/python.exe' -m pip install -r python/requirements-tensorrt.txt
+& $env:UPSCALER_PYTHON -m pip install -r python/requirements-tensorrt.txt
 ```
 
 Benchmark SwinIR with the TensorRT runner:
 
 ```powershell
 $env:PYTHONPATH='python'
-& 'C:/Users/ericl/AppData/Local/Programs/Python/Python310/python.exe' python/upscaler_worker/cli.py benchmark-upscaler --manifest-path artifacts/benchmarks/quick_fixture/manifest.json --model-id swinir-realworld-x4 --tile-sizes 128 --repeats 1 --precision fp32 --pytorch-runner tensorrt
+& $env:UPSCALER_PYTHON python/upscaler_worker/cli.py benchmark-upscaler --manifest-path artifacts/benchmarks/quick_fixture/manifest.json --model-id swinir-realworld-x4 --tile-sizes 128 --repeats 1 --precision fp32 --pytorch-runner tensorrt
 ```
 
 Benchmark the PyTorch streaming path:
 
 ```powershell
 $env:PYTHONPATH='python'
-& 'C:/Users/ericl/AppData/Local/Programs/Python/Python310/python.exe' python/upscaler_worker/benchmark_pytorch_pipeline_paths.py --model-id swinir-realworld-x4 --execution-paths streaming --repeats 1 --duration-seconds 10 --width 1280 --height 720 --fps 24 --tile-size 128 --preset qualityBalanced --precision bf16 --output-mode preserveAspect4k --resolution-basis exact --target-width 3840 --target-height 2160
+& $env:UPSCALER_PYTHON python/upscaler_worker/benchmark_pytorch_pipeline_paths.py --model-id swinir-realworld-x4 --execution-paths streaming --repeats 1 --duration-seconds 10 --width 1280 --height 720 --fps 24 --tile-size 128 --preset qualityBalanced --precision bf16 --output-mode preserveAspect4k --resolution-basis exact --target-width 3840 --target-height 2160
 ```
 
 ## Runtime Notes
