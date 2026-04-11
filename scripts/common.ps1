@@ -12,6 +12,203 @@ function Get-UpscalerPython {
     return "python"
 }
 
+function Get-UpscalerPythonSeedCandidates {
+    $candidates = @()
+
+    if ($env:UPSCALER_PYTHON -and (Test-Path $env:UPSCALER_PYTHON)) {
+        $candidates += ,@($env:UPSCALER_PYTHON)
+    }
+
+    $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    $repoLocalPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
+    if (Test-Path $repoLocalPython) {
+        $candidates += ,@($repoLocalPython)
+    }
+
+    $python310 = Join-Path $env:LOCALAPPDATA "Programs\Python\Python310\python.exe"
+    if (Test-Path $python310) {
+        $candidates += ,@($python310)
+    }
+
+    $pyCommand = Get-Command py -ErrorAction SilentlyContinue
+    if ($pyCommand) {
+        $candidates += ,@($pyCommand.Source, "-3.10")
+        $candidates += ,@($pyCommand.Source, "-3.11")
+        $candidates += ,@($pyCommand.Source, "-3.12")
+    }
+
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonCommand) {
+        $candidates += ,@($pythonCommand.Source)
+    }
+
+    return $candidates
+}
+
+function Invoke-PythonSeedCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$CommandSpec,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    $executable = $CommandSpec[0]
+    $prefixArgs = @()
+    if ($CommandSpec.Count -gt 1) {
+        $prefixArgs = $CommandSpec[1..($CommandSpec.Count - 1)]
+    }
+
+    & $executable @prefixArgs @Arguments
+}
+
+function Test-PythonSeedUsable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$CommandSpec
+    )
+
+    try {
+        Invoke-PythonSeedCommand -CommandSpec $CommandSpec -Arguments @("-c", "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)") | Out-Null
+        return $LASTEXITCODE -eq 0
+    }
+    catch {
+        return $false
+    }
+}
+
+function Resolve-BootstrapPythonSeed {
+    foreach ($candidate in Get-UpscalerPythonSeedCandidates) {
+        if (Test-PythonSeedUsable -CommandSpec $candidate) {
+            return $candidate
+        }
+    }
+
+    throw "Python 3.10+ is required. Run scripts/bootstrap.ps1 so it can install Python, or set UPSCALER_PYTHON to a valid interpreter."
+}
+
+function Refresh-ProcessPath {
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $pathSegments = @($machinePath, $userPath) | Where-Object { $_ -and $_.Trim() }
+    if ($pathSegments.Count -gt 0) {
+        $env:Path = ($pathSegments -join ";")
+    }
+}
+
+function Get-WingetCommand {
+    $wingetCommand = Get-Command winget -ErrorAction SilentlyContinue
+    if ($wingetCommand) {
+        return $wingetCommand.Source
+    }
+
+    $windowsAppsWinget = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\winget.exe"
+    if (Test-Path $windowsAppsWinget) {
+        return $windowsAppsWinget
+    }
+
+    return $null
+}
+
+function Assert-WingetAvailable {
+    $winget = Get-WingetCommand
+    if (-not $winget) {
+        throw "winget is required for one-click workstation bootstrap on Windows. Install App Installer from the Microsoft Store and rerun scripts/bootstrap.ps1."
+    }
+
+    return $winget
+}
+
+function Get-VisualStudioBuildToolsInstallPath {
+    $vswherePath = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswherePath)) {
+        return $null
+    }
+
+    $installationPath = & $vswherePath -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -latest -property installationPath
+    if ($LASTEXITCODE -ne 0) {
+        return $null
+    }
+
+    $resolved = ($installationPath | Select-Object -First 1).Trim()
+    if (-not $resolved) {
+        return $null
+    }
+
+    return $resolved
+}
+
+function Test-WebView2RuntimeInstalled {
+    $clientKey = "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+    $clientKeyWow = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+    foreach ($path in @($clientKey, $clientKeyWow)) {
+        try {
+            $value = (Get-ItemProperty -Path $path -Name "pv" -ErrorAction Stop).pv
+            if ($value) {
+                return $true
+            }
+        }
+        catch {
+        }
+    }
+
+    return $false
+}
+
+function Install-WingetPackage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Id,
+        [Parameter(Mandatory = $true)]
+        [string]$DisplayName,
+        [string[]]$AdditionalArguments = @()
+    )
+
+    $winget = Assert-WingetAvailable
+    Write-Host "Installing $DisplayName via winget..."
+    & $winget install --id $Id --exact --accept-source-agreements --accept-package-agreements --silent --disable-interactivity @AdditionalArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Installing $DisplayName failed. Exit code: $LASTEXITCODE"
+    }
+    Refresh-ProcessPath
+}
+
+function Ensure-UpscalerSystemDependencies {
+    Refresh-ProcessPath
+
+    if (-not (Get-Command node -ErrorAction SilentlyContinue) -or -not (Get-Command npm -ErrorAction SilentlyContinue)) {
+        Install-WingetPackage -Id "OpenJS.NodeJS.LTS" -DisplayName "Node.js LTS"
+    }
+
+    try {
+        $null = Resolve-BootstrapPythonSeed
+    }
+    catch {
+        Install-WingetPackage -Id "Python.Python.3.10" -DisplayName "Python 3.10"
+    }
+
+    if (-not (Test-Path (Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe")) -and -not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        Install-WingetPackage -Id "Rustlang.Rustup" -DisplayName "Rust toolchain"
+    }
+
+    if (-not (Get-VisualStudioBuildToolsInstallPath)) {
+        Install-WingetPackage -Id "Microsoft.VisualStudio.2022.BuildTools" -DisplayName "Microsoft C++ Build Tools" -AdditionalArguments @(
+            "--override",
+            "--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+        )
+    }
+
+    if (-not (Test-WebView2RuntimeInstalled)) {
+        Install-WingetPackage -Id "Microsoft.EdgeWebView2Runtime" -DisplayName "Microsoft Edge WebView2 Runtime"
+    }
+
+    Refresh-ProcessPath
+    $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+    if (Test-Path $cargoBin -and -not (($env:Path -split ";") -contains $cargoBin)) {
+        $env:Path = "$cargoBin;$env:Path"
+    }
+}
+
 function Assert-CommandAvailable {
     param(
         [Parameter(Mandatory = $true)]
@@ -26,9 +223,9 @@ function Assert-CommandAvailable {
 }
 
 function Assert-Prerequisites {
-    Assert-CommandAvailable -Command "npm" -HelpText "Install Node.js and npm before running repository scripts."
-    Assert-CommandAvailable -Command "cargo" -HelpText "Install the Rust toolchain before running repository scripts."
-    Assert-CommandAvailable -Command (Get-UpscalerPython) -HelpText "Provide Python 3.10+, keep the repo .venv available, or set UPSCALER_PYTHON explicitly."
+    Assert-CommandAvailable -Command "npm" -HelpText "Install Node.js and npm before running repository scripts, or run scripts/bootstrap.ps1 to provision them automatically."
+    Assert-CommandAvailable -Command "cargo" -HelpText "Install the Rust toolchain before running repository scripts, or run scripts/bootstrap.ps1 to provision it automatically."
+    Assert-CommandAvailable -Command (Get-UpscalerPython) -HelpText "Provide Python 3.10+, keep the repo .venv available, or run scripts/bootstrap.ps1 to provision it automatically."
 }
 
 function Invoke-CheckedCommand {

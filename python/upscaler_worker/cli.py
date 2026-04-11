@@ -7,12 +7,69 @@ from pathlib import Path
 from upscaler_worker.benchmark import benchmark_fixture, compare_precision_quality, _parse_tile_sizes
 from upscaler_worker.benchmark_pytorch_pipeline_paths import benchmark_pytorch_pipeline_paths, _parse_execution_paths
 from upscaler_worker.media import convert_source_to_mp4, probe_video
+from upscaler_worker.model_catalog import model_catalog, model_backend_id, model_research_runtime, model_runtime_asset
+from upscaler_worker.models.pytorch_sr import ensure_model_checkpoint
 from upscaler_worker.precision import resolve_precision_mode
 from upscaler_worker.models.realesrgan import build_realesrgan_job_plan
 from upscaler_worker.pipeline import run_realesrgan_pipeline
-from upscaler_worker.runtime import ensure_runtime_assets
+from upscaler_worker.runtime import (
+    ensure_rife_runtime,
+    ensure_rvrt_model_weights,
+    ensure_rvrt_repo,
+    ensure_runtime_assets,
+)
 from upscaler_worker.synthetic.av_sync import generate_av_sync_fixture, validate_av_sync
 from upscaler_worker.synthetic.generate_benchmarks import generate_benchmark_fixture
+
+
+def prefetch_app_assets(*, include_rife: bool, include_research: bool) -> dict[str, object]:
+    core_runtime = ensure_runtime_assets()
+    prefetched_models: list[dict[str, object]] = []
+    prefetched_research: list[dict[str, object]] = []
+
+    for model in model_catalog():
+        model_id = str(model.get("id", "")).strip()
+        if not model_id or str(model.get("executionStatus", "planned")) != "runnable":
+            continue
+
+        runtime_asset = model_runtime_asset(model_id)
+        if runtime_asset is not None:
+            checkpoint_path = ensure_model_checkpoint(model_id)
+            prefetched_models.append(
+                {
+                    "modelId": model_id,
+                    "backendId": model_backend_id(model_id),
+                    "assetKind": runtime_asset.get("kind"),
+                    "path": str(checkpoint_path),
+                }
+            )
+            continue
+
+        research_runtime = model_research_runtime(model_id)
+        if (
+            include_research
+            and research_runtime is not None
+            and str(research_runtime.get("kind", "")).strip() == "external-command"
+            and model_backend_id(model_id) == "pytorch-video-sr"
+        ):
+            prefetched_research.append(
+                {
+                    "modelId": model_id,
+                    "backendId": model_backend_id(model_id),
+                    "commandEnvVar": research_runtime.get("commandEnvVar"),
+                    "repo": ensure_rvrt_repo(),
+                    "weights": ensure_rvrt_model_weights(),
+                }
+            )
+
+    result: dict[str, object] = {
+        "coreRuntime": core_runtime,
+        "prefetchedModels": prefetched_models,
+        "prefetchedResearchRuntimes": prefetched_research,
+    }
+    if include_rife:
+        result["rifeRuntime"] = ensure_rife_runtime()
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,6 +113,10 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--crf", type=int, default=18)
 
     subparsers.add_parser("ensure-runtime")
+
+    prefetch = subparsers.add_parser("prefetch-app-assets")
+    prefetch.add_argument("--skip-rife", action="store_true")
+    prefetch.add_argument("--skip-research", action="store_true")
 
     probe = subparsers.add_parser("probe-video")
     probe.add_argument("--source", required=True)
@@ -234,6 +295,14 @@ def main() -> int:
 
     if args.command == "ensure-runtime":
         result = ensure_runtime_assets()
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "prefetch-app-assets":
+        result = prefetch_app_assets(
+            include_rife=not args.skip_rife,
+            include_research=not args.skip_research,
+        )
         print(json.dumps(result, indent=2))
         return 0
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildComparisonWindowUrl,
   buildJobsWindowUrl,
   buildRepeatPipelineRequestEnvelope,
   parseRepeatPipelineRequestEnvelope,
@@ -40,6 +41,7 @@ const baseRequest: RealesrganJobRequest = {
 describe("jobs helpers", () => {
   it("resolves jobs-only view from the query string", () => {
     expect(resolveAppView("?view=jobs")).toBe("jobs");
+    expect(resolveAppView("?view=comparison")).toBe("comparison");
     expect(resolveAppView("?foo=bar")).toBe("main");
     expect(resolveAppView("")).toBe("main");
   });
@@ -47,6 +49,11 @@ describe("jobs helpers", () => {
   it("builds the jobs window URL from the current app location", () => {
     expect(buildJobsWindowUrl({ origin: "http://localhost:1420", pathname: "/" } as Pick<Location, "origin" | "pathname">)).toBe("http://localhost:1420/?view=jobs");
     expect(buildJobsWindowUrl({ origin: "tauri://localhost", pathname: "/index.html" } as Pick<Location, "origin" | "pathname">)).toBe("tauri://localhost/index.html?view=jobs");
+  });
+
+  it("builds the comparison window URL from the current app location", () => {
+    expect(buildComparisonWindowUrl({ origin: "http://localhost:1420", pathname: "/" } as Pick<Location, "origin" | "pathname">)).toBe("http://localhost:1420/?view=comparison");
+    expect(buildComparisonWindowUrl({ origin: "tauri://localhost", pathname: "/index.html" } as Pick<Location, "origin" | "pathname">)).toBe("tauri://localhost/index.html?view=comparison");
   });
 
   it("round-trips repeat-run envelopes", () => {

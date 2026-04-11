@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+import zipfile
+from pathlib import Path
 from unittest.mock import patch
 
-from upscaler_worker.runtime import ensure_runtime_assets
+from upscaler_worker.runtime import ensure_runtime_assets, ensure_rvrt_model_weights, ensure_rvrt_repo
 
 
 class RuntimeStatusTests(unittest.TestCase):
@@ -36,6 +39,50 @@ class RuntimeStatusTests(unittest.TestCase):
         rvrt = runtime["externalResearchRuntimes"]["rvrt-x4"]
         self.assertTrue(rvrt["configured"])
         self.assertEqual(rvrt["source"], "environment")
+
+    def test_ensure_rvrt_model_weights_downloads_expected_release_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+
+            def fake_urlretrieve(url: str, destination: Path) -> tuple[str, object]:
+                Path(destination).write_bytes(b"rvrt-weight")
+                return str(destination), None
+
+            with patch("upscaler_worker.runtime.repo_root", return_value=temp_root), patch(
+                "upscaler_worker.runtime.urllib.request.urlretrieve",
+                side_effect=fake_urlretrieve,
+            ) as urlretrieve_mock:
+                result = ensure_rvrt_model_weights()
+
+            self.assertTrue(Path(result["modelPath"]).exists())
+            self.assertEqual(Path(result["modelPath"]).read_bytes(), b"rvrt-weight")
+            self.assertIn("002_RVRT_videosr_bi_Vimeo_14frames.pth", urlretrieve_mock.call_args.args[0])
+
+    def test_ensure_rvrt_repo_extracts_repo_archive_into_tmp_rvrt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            temp_runtime = temp_root / "artifacts" / "runtime"
+
+            def fake_urlretrieve(_url: str, destination: Path) -> tuple[str, object]:
+                archive_path = Path(destination)
+                archive_path.parent.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    archive.writestr("RVRT-main/main_test_rvrt.py", "print('rvrt')\n")
+                    archive.writestr("RVRT-main/requirements.txt", "einops\n")
+                return str(archive_path), None
+
+            with patch("upscaler_worker.runtime.repo_root", return_value=temp_root), patch(
+                "upscaler_worker.runtime.runtime_root",
+                return_value=temp_runtime,
+            ), patch(
+                "upscaler_worker.runtime.urllib.request.urlretrieve",
+                side_effect=fake_urlretrieve,
+            ):
+                result = ensure_rvrt_repo()
+
+            self.assertTrue((temp_root / "tmp" / "RVRT" / "main_test_rvrt.py").exists())
+            self.assertTrue((temp_root / "tmp" / "RVRT" / "requirements.txt").exists())
+            self.assertEqual(result["rvrtRoot"], str(temp_root / "tmp" / "RVRT"))
 
 
 if __name__ == "__main__":

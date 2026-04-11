@@ -14,7 +14,12 @@ $stderrLog = Join-Path $runtimeDir "desktop-test-tauri.stderr.log"
 $webviewUrl = "http://127.0.0.1:9223/json/version"
 $appUrl = "http://127.0.0.1:1420"
 $desktopModes = @("afterUpscale", "interpolateOnly")
-$blindComparisonSourcePath = Join-Path $repoRoot "public/fixtures/gui-progress-sample.mp4"
+$blindComparisonSourcePath = if ($env:DESKTOP_BLIND_COMPARISON_SOURCE_PATH) {
+    $env:DESKTOP_BLIND_COMPARISON_SOURCE_PATH
+}
+else {
+    Join-Path $repoRoot "public/fixtures/gui-progress-sample.mp4"
+}
 
 function Wait-HttpReady {
     param(

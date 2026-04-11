@@ -1,8 +1,19 @@
 # VideoUpgrader
 
+![VideoUpgrader icon](docs/images/video-upgrader-icon-512.png)
+
 VideoUpgrader is a Windows-first desktop app for evaluating video upscalers the way enthusiasts, researchers, and developers actually use them: by comparing outputs side by side, zooming into problem areas, checking framing behavior, boosting frame rate when needed, and then exporting a full processed video when a model and setting combination earns it.
 
 The project combines a Tauri desktop shell, a React comparison-first UI, and a Python worker that handles probing, synthetic benchmark generation, model execution, interpolation, encode, remux, and diagnostic benchmarking.
+
+## What's New
+
+Updated April 12, 2026.
+
+- The detached comparison window now keeps the Source reference and all blind-comparison players frame-synced in real desktop validation, so you can inspect the same logical frame instead of guessing whether offsets are coming from the tool.
+- The comparison Source pane now uses a valid full-length playable reference instead of falling back to a short browser clip, which removes the black-source and wrong-timestamp failures that made blind comparisons untrustworthy.
+- Comparison controls are now clearer during review: `Shift + wheel` resizes the comparison panes, `Ctrl + wheel` zooms the video content in sync across players, and drag pans the crop only after a real drag starts.
+- The comparison workflow was validated with deterministic AV-sync fixtures and the desktop smoke harness, which matters because it proves the separate comparison window is doing the same job in the native app that it appears to do in the browser tests.
 
 ## What VideoUpgrader Does
 
@@ -97,6 +108,78 @@ The intended workflow is:
 
 The app is designed to support model-vs-model and settings-vs-settings evaluation on the same source material, not just single-pass transcoding.
 
+## Interface Tour
+
+### Main Workspace
+
+The top of the main workspace keeps the source preview, framing, and core run controls in one place.
+
+![Main page top](docs/images/main-page-top.png)
+
+Blind comparison setup lives directly in the main page so you can capture a preview start offset, choose candidate models, and launch anonymized samples without leaving the run configuration flow.
+
+![Main page blind compare](docs/images/main-page-blind-compare.png)
+
+The blind-test box is where you set the one-second or multi-second sample workflow, capture the source position, and open the synchronized comparison workspace.
+
+![Blind test box](docs/images/Blind-test-box.png)
+
+### Model And Pipeline Controls
+
+The right-hand model selector is where you choose among runnable upscale models and switch between evaluation targets quickly.
+
+![Right-hand model selector](docs/images/right-hand-model-selector.png)
+
+The encoder and interpolation controls sit beside the model controls so output codec, container, and frame-rate boost decisions stay visible while you configure a run.
+
+![Right-hand encoder and interpolation controls](docs/images/right-hand-w-encoder-and-interpolation.png)
+
+### Jobs And Comparison
+
+The Jobs page gives you a compact queue and history view for pipeline runs, source conversions, and replayable templates.
+
+![Jobs page](docs/images/jobs-page.png)
+
+The job details page exposes the stored request, progress state, and replay actions needed to restart or reload a run without rebuilding the settings by hand.
+
+![Job details page](docs/images/jobs-details-page.png)
+
+The detached comparison workspace is the core review surface for blind testing: the Source pane and every sample pane stay synchronized while you resize panes, zoom content, and pan around artifacts.
+
+![Model comparison page](docs/images/Model-comparison-page.png)
+
+## Output Showcase
+
+These reference stills in `docs/images/showcase` show the kind of before-and-after material the app is meant to inspect and export.
+
+Source frame example:
+
+![Voyager source](docs/images/showcase/voyager-source-576x432.png)
+
+Upscaled output example:
+
+![Voyager upscaled](docs/images/showcase/voyager-upscaled-2304x1728.png)
+
+Upscaled plus interpolated output example:
+
+![Voyager upscaled and interpolated](docs/images/showcase/voyager-upscaled-interpolated-2304x1728-60fps.png)
+
+Probe frame at `00:02:00.000`:
+
+![Probe 00 02 00](docs/images/showcase/probe-00-02-00_000.png)
+
+Probe frame at `00:02:30.000`:
+
+![Probe 00 02 30](docs/images/showcase/probe-00-02-30_000.png)
+
+Probe frame at `00:03:00.000`:
+
+![Probe 00 03 00](docs/images/showcase/probe-00-03-00_000.png)
+
+Probe frame at `00:03:30.000`:
+
+![Probe 00 03 30](docs/images/showcase/probe-00-03-30_000.png)
+
 ## Upscale And Interpolation Instructions
 
 ### Desktop App
@@ -177,11 +260,15 @@ CLI notes:
 ## Prerequisites
 
 - Windows
-- Node.js 20+
-- npm
+- `winget` available through App Installer on a current Windows install
+
+`bootstrap.ps1` is now the intended soup-to-nuts setup path. It will install any missing local workstation dependencies it needs for this repo, including:
+
+- Node.js LTS
+- Python 3.10
 - Rust and Cargo
-- Python 3.10+ in the project-local `.venv` for the worker runtime
-- FFmpeg available on `PATH`
+- Microsoft C++ Build Tools with the Desktop C++ workload
+- Microsoft Edge WebView2 Runtime
 
 Preferred Python environment variable:
 
@@ -196,6 +283,17 @@ If that variable is not set, the repository scripts prefer the repo-local `.venv
 ```powershell
 ./scripts/bootstrap.ps1
 ```
+
+`bootstrap.ps1` now performs the full local deploy path for a fresh clone:
+
+- installs missing Windows toolchains and runtimes through `winget`
+- creates the repo-local `.venv` when needed
+- installs npm and Python dependencies
+- installs the pinned CUDA PyTorch runtime
+- builds the web and desktop host
+- pre-downloads the current runtime packages and runnable model weights, including the built-in RVRT repo and Vimeo x4 checkpoint
+
+After bootstrap completes, the first app launch should not need to stop for model or runtime downloads.
 
 ## Standard Commands
 

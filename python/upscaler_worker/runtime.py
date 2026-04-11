@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import functools
+import shutil
 import os
 import re
-import shutil
 import subprocess
 import urllib.request
 import zipfile
@@ -19,6 +19,9 @@ REALESRGAN_ZIP_URL = (
     "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
     "realesrgan-ncnn-vulkan-20220424-windows.zip"
 )
+RVRT_REPO_ZIP_URL = "https://codeload.github.com/JingyunLiang/RVRT/zip/refs/heads/main"
+RVRT_RELEASE_BASE_URL = "https://github.com/JingyunLiang/RVRT/releases/download/v0.0"
+RVRT_DEFAULT_TASK = "002_RVRT_videosr_bi_Vimeo_14frames"
 RIFE_ZIP_URL = (
     "https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/"
     "rife-ncnn-vulkan-20221029-windows.zip"
@@ -32,6 +35,34 @@ def repo_root() -> Path:
 
 def runtime_root() -> Path:
     return repo_root() / "artifacts" / "runtime"
+
+
+def _download_file(url: str, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = destination.with_suffix(destination.suffix + ".part")
+    urllib.request.urlretrieve(url, partial_path)
+    partial_path.replace(destination)
+    return destination
+
+
+def _extract_archive_with_optional_root_strip(archive_path: Path, destination: Path) -> None:
+    with zipfile.ZipFile(archive_path) as archive:
+        names = [member.filename.replace("\\", "/") for member in archive.infolist() if member.filename]
+        top_levels = {name.split("/", 1)[0] for name in names if name}
+        strip_root = len(top_levels) == 1
+        root_prefix = f"{next(iter(top_levels))}/" if strip_root else ""
+
+        for member in archive.infolist():
+            raw_name = member.filename.replace("\\", "/")
+            if not raw_name or raw_name.endswith("/"):
+                continue
+            relative_name = raw_name[len(root_prefix):] if strip_root and raw_name.startswith(root_prefix) else raw_name
+            if not relative_name:
+                continue
+            target_path = destination / relative_name
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as source_handle, target_path.open("wb") as target_handle:
+                shutil.copyfileobj(source_handle, target_handle)
 
 
 def _flatten_runtime_install(install_dir: Path, executable_name: str) -> Path:
@@ -59,7 +90,7 @@ def _ensure_portable_runtime(*, install_dir: Path, zip_name: str, zip_url: str, 
 
     install_dir.mkdir(parents=True, exist_ok=True)
     zip_path = runtime_root() / zip_name
-    urllib.request.urlretrieve(zip_url, zip_path)
+    _download_file(zip_url, zip_path)
     with zipfile.ZipFile(zip_path) as archive:
         archive.extractall(install_dir)
     zip_path.unlink(missing_ok=True)
@@ -93,6 +124,41 @@ def ensure_rife_runtime() -> dict[str, str]:
     return {
         "rifePath": str(exe_path),
         "rifeModelRoot": str(install_dir),
+    }
+
+
+def ensure_rvrt_repo() -> dict[str, str]:
+    install_dir = repo_root() / "tmp" / "RVRT"
+    entrypoint = install_dir / "main_test_rvrt.py"
+    if entrypoint.exists():
+        return {
+            "rvrtRoot": str(install_dir),
+            "entryPoint": str(entrypoint),
+        }
+
+    archive_path = runtime_root() / "rvrt-main.zip"
+    _download_file(RVRT_REPO_ZIP_URL, archive_path)
+    if install_dir.exists():
+        shutil.rmtree(install_dir)
+    install_dir.mkdir(parents=True, exist_ok=True)
+    _extract_archive_with_optional_root_strip(archive_path, install_dir)
+    archive_path.unlink(missing_ok=True)
+    if not entrypoint.exists():
+        raise RuntimeError(f"RVRT bootstrap archive did not contain {entrypoint.name}")
+    return {
+        "rvrtRoot": str(install_dir),
+        "entryPoint": str(entrypoint),
+    }
+
+
+def ensure_rvrt_model_weights(task_name: str = RVRT_DEFAULT_TASK) -> dict[str, str]:
+    model_path = repo_root() / "model_zoo" / "rvrt" / f"{task_name}.pth"
+    if not model_path.exists():
+        model_url = f"{RVRT_RELEASE_BASE_URL}/{task_name}.pth"
+        _download_file(model_url, model_path)
+    return {
+        "task": task_name,
+        "modelPath": str(model_path),
     }
 
 

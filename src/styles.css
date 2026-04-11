@@ -1641,6 +1641,11 @@ input {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.comparison-toolbar-readout {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
 .comparison-ready-row {
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
 }
@@ -1698,8 +1703,17 @@ input {
   backdrop-filter: blur(10px);
 }
 
+.comparison-workspace-shell-host {
+  display: grid;
+}
+
+.comparison-workspace-shell-host-standalone {
+  min-height: calc(100vh - 64px);
+}
+
 .comparison-workspace-shell {
-  width: min(1440px, 100%);
+  --comparison-workspace-pane-min-width: calc(50% - 12px);
+  width: min(2160px, 100%);
   max-height: calc(100vh - 48px);
   display: grid;
   gap: 16px;
@@ -1711,6 +1725,16 @@ input {
   box-shadow: 0 24px 72px rgba(18, 15, 12, 0.3);
 }
 
+.comparison-workspace-shell-standalone {
+  width: 100%;
+  max-height: none;
+  min-height: calc(100vh - 64px);
+}
+
+.comparison-workspace-shell-empty {
+  align-content: start;
+}
+
 .comparison-workspace-header {
   display: flex;
   align-items: flex-start;
@@ -1719,11 +1743,18 @@ input {
 }
 
 .comparison-workspace-controls {
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.comparison-workspace-controls > .action-button {
+  flex: 0 0 auto;
+  width: auto;
 }
 
 .comparison-workspace-grid {
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--comparison-workspace-pane-min-width)), 1fr));
 }
 
 .comparison-workspace-card {
@@ -1731,8 +1762,13 @@ input {
 }
 
 .comparison-workspace-viewport {
-  min-height: 420px;
+  min-height: 0;
   touch-action: none;
+  overflow: hidden;
+}
+
+.comparison-workspace-shell-standalone .comparison-workspace-viewport {
+  min-height: 0;
 }
 
 .comparison-workspace-card-actions {
@@ -1743,11 +1779,20 @@ input {
 .comparison-inspector-card {
   display: grid;
   gap: 10px;
+  align-content: start;
 }
 
 .inspection-viewport {
   position: relative;
   min-height: 340px;
+}
+
+.inspection-viewport.is-pannable {
+  cursor: grab;
+}
+
+.inspection-viewport.is-panning {
+  cursor: grabbing;
 }
 
 .inspection-video {
@@ -1756,6 +1801,11 @@ input {
   min-height: 340px;
   object-fit: contain;
   background: #120f0c;
+  image-rendering: pixelated;
+}
+
+.comparison-workspace-viewport .inspection-video {
+  min-height: 0;
 }
 
 .inspection-crosshair {
@@ -1794,7 +1844,7 @@ input {
 
 .comparison-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
   gap: 16px;
   margin-bottom: 16px;
 }

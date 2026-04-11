@@ -4,6 +4,7 @@
     {
       "sourcePath": "C:\\eric\\Breakfast at Tiffany's (3⧸9) Movie CLIP - Moon River (1961) HD [uirBWk-qd9A].webm",
       "previewDurationSeconds": 8,
+      "previewStartOffsetSeconds": null,
       "winnerModelId": "realesrgan-x4plus",
       "candidateModelIds": [
         "realesrgan-x4plus",
@@ -16,6 +17,7 @@
     {
       "sourcePath": "C:\\eric\\Audrey Hepburn Makes Her First Appearance and Johnny Is Nervous ｜ Carson Tonight Show [nXdrhKrdvGc].webm",
       "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": null,
       "winnerModelId": "swinir-realworld-x4",
       "candidateModelIds": [
         "swinir-realworld-x4",
@@ -28,6 +30,7 @@
     {
       "sourcePath": "C:\\eric\\Audrey Hepburn Makes Her First Appearance and Johnny Is Nervous ｜ Carson Tonight Show [nXdrhKrdvGc].webm",
       "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": null,
       "winnerModelId": "swinir-realworld-x4",
       "candidateModelIds": [
         "swinir-realworld-x4",
@@ -40,6 +43,7 @@
     {
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": null,
       "winnerModelId": "realesrnet-x4plus",
       "candidateModelIds": [
         "realesrnet-x4plus",
@@ -52,6 +56,7 @@
     {
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": null,
       "winnerModelId": "realesrnet-x4plus",
       "candidateModelIds": [
         "realesrnet-x4plus",
@@ -64,6 +69,7 @@
     {
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": null,
       "winnerModelId": "bsrgan-x4",
       "candidateModelIds": [
         "bsrgan-x4",
@@ -76,6 +82,7 @@
     {
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": null,
       "winnerModelId": "swinir-realworld-x4",
       "candidateModelIds": [
         "swinir-realworld-x4",
@@ -88,6 +95,7 @@
     {
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": null,
       "winnerModelId": "realesrgan-x4plus",
       "candidateModelIds": [
         "realesrgan-x4plus",
@@ -96,6 +104,133 @@
         "bsrgan-x4"
       ],
       "createdAt": "1775869810"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": 3.25,
+      "winnerModelId": "realesrnet-x4plus",
+      "candidateModelIds": [
+        "realesrnet-x4plus",
+        "swinir-realworld-x4",
+        "bsrgan-x4",
+        "realesrgan-x4plus"
+      ],
+      "createdAt": "1775913475"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": 3.25,
+      "winnerModelId": "realesrnet-x4plus",
+      "candidateModelIds": [
+        "realesrnet-x4plus",
+        "bsrgan-x4",
+        "realesrgan-x4plus",
+        "swinir-realworld-x4"
+      ],
+      "createdAt": "1775913610"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": 3.25,
+      "winnerModelId": "swinir-realworld-x4",
+      "candidateModelIds": [
+        "swinir-realworld-x4",
+        "bsrgan-x4",
+        "realesrnet-x4plus",
+        "realesrgan-x4plus"
+      ],
+      "createdAt": "1775914029"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": 3.25,
+      "winnerModelId": "realesrnet-x4plus",
+      "candidateModelIds": [
+        "realesrnet-x4plus",
+        "bsrgan-x4",
+        "realesrgan-x4plus",
+        "swinir-realworld-x4"
+      ],
+      "createdAt": "1775914167"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": 3.25,
+      "winnerModelId": "swinir-realworld-x4",
+      "candidateModelIds": [
+        "swinir-realworld-x4",
+        "bsrgan-x4",
+        "realesrgan-x4plus",
+        "realesrnet-x4plus"
+      ],
+      "createdAt": "1775914953"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\artifacts\\runtime\\comparison-av-sync.mp4",
+      "previewDurationSeconds": 4,
+      "previewStartOffsetSeconds": 3.0,
+      "winnerModelId": "realesrnet-x4plus",
+      "candidateModelIds": [
+        "realesrnet-x4plus",
+        "realesrgan-x4plus",
+        "swinir-realworld-x4",
+        "bsrgan-x4"
+      ],
+      "createdAt": "1775934718"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\artifacts\\inputs\\av-sync-desktop-smoke.mp4",
+      "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": 3.2,
+      "winnerModelId": "realesrnet-x4plus",
+      "candidateModelIds": [
+        "realesrnet-x4plus",
+        "swinir-realworld-x4",
+        "bsrgan-x4",
+        "realesrgan-x4plus"
+      ],
+      "createdAt": "1775936851"
+    },
+    {
+      "sourcePath": "C:\\eric\\Breakfast at Tiffany's (3⧸9) Movie CLIP - Moon River (1961) HD [uirBWk-qd9A].webm",
+      "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": 38.32360300250208,
+      "winnerModelId": "swinir-realworld-x4",
+      "candidateModelIds": [
+        "swinir-realworld-x4",
+        "realesrgan-x4plus",
+        "rvrt-x4"
+      ],
+      "createdAt": "1775943024"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\artifacts\\inputs\\av-sync-desktop-smoke.mp4",
+      "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": 3.2,
+      "winnerModelId": "swinir-realworld-x4",
+      "candidateModelIds": [
+        "swinir-realworld-x4",
+        "realesrgan-x4plus",
+        "realesrnet-x4plus",
+        "bsrgan-x4"
+      ],
+      "createdAt": "1775943479"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\artifacts\\runtime\\converted-sources\\Star Trek Voyager Season 02 Episode 18 - Deathwish_bd1d1efa2d0795c8.mp4",
+      "previewDurationSeconds": 1,
+      "previewStartOffsetSeconds": 1797.9149291075896,
+      "winnerModelId": "realesrgan-x4plus",
+      "candidateModelIds": [
+        "rvrt-x4",
+        "realesrgan-x4plus"
+      ],
+      "createdAt": "1775947861"
     }
   ]
 }

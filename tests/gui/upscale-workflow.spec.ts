@@ -1188,6 +1188,146 @@ test("captures a blind comparison start offset and forwards it through preview r
 
   await page.getByTestId("open-comparison-workspace-button").click();
   await expect(page.getByTestId("comparison-workspace-modal")).toBeVisible();
+  const comparisonSourceViewport = page.getByTestId("comparison-source-viewport");
+  const comparisonSourceVideo = comparisonSourceViewport.locator("video");
+  const initialTransformOrigin = await comparisonSourceVideo.evaluate((element) => {
+    if (!(element instanceof HTMLVideoElement)) {
+      throw new Error("Comparison source video is unavailable");
+    }
+    return element.style.transformOrigin;
+  });
+  const initialViewportBounds = await comparisonSourceViewport.boundingBox();
+  if (!initialViewportBounds) {
+    throw new Error("Comparison source viewport bounds are unavailable before wheel zoom");
+  }
+  await comparisonSourceViewport.click({ position: { x: 80, y: 80 } });
+  await expect.poll(async () => await comparisonSourceVideo.evaluate((element) => {
+    if (!(element instanceof HTMLVideoElement)) {
+      return null;
+    }
+    return element.style.transformOrigin;
+  })).toBe(initialTransformOrigin);
+  await comparisonSourceViewport.evaluate((element) => {
+    element.dispatchEvent(new WheelEvent("wheel", {
+      deltaY: -120,
+      bubbles: true,
+      cancelable: true,
+    }));
+  });
+  await expect(page.getByTestId("comparison-pane-zoom-readout")).toContainText("1.00x");
+  await comparisonSourceViewport.evaluate((element) => {
+    element.dispatchEvent(new WheelEvent("wheel", {
+      deltaY: -120,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    }));
+  });
+  await expect(page.getByTestId("comparison-pane-zoom-readout")).not.toContainText("1.00x");
+  await expect(page.getByTestId("comparison-zoom-readout")).toContainText("3.00x");
+  const comparisonWorkspaceShell = page.getByTestId("comparison-workspace-modal").locator(".comparison-workspace-shell");
+  await expect.poll(async () => {
+    const viewportBounds = await comparisonSourceViewport.boundingBox();
+    const shellBounds = await comparisonWorkspaceShell.boundingBox();
+    if (!viewportBounds || !shellBounds) {
+      return 0;
+    }
+    return viewportBounds.width / shellBounds.width;
+  }).toBeGreaterThan(0.48);
+  await expect.poll(async () => await comparisonSourceVideo.evaluate((element) => {
+    if (!(element instanceof HTMLVideoElement)) {
+      return null;
+    }
+    return element.style.transformOrigin;
+  })).toBe(initialTransformOrigin);
+  await comparisonSourceViewport.evaluate((element) => {
+    element.dispatchEvent(new WheelEvent("wheel", {
+      deltaY: -120,
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    }));
+  });
+  await expect(page.getByTestId("comparison-zoom-readout")).not.toContainText("3.00x");
+  await expect.poll(async () => await comparisonSourceVideo.evaluate((element) => {
+    if (!(element instanceof HTMLVideoElement)) {
+      return null;
+    }
+    return element.style.transformOrigin;
+  })).toBe(initialTransformOrigin);
+  const viewportBounds = await comparisonSourceViewport.boundingBox();
+  if (!viewportBounds) {
+    throw new Error("Comparison source viewport bounds are unavailable");
+  }
+  await page.mouse.move(viewportBounds.x + (viewportBounds.width / 2), viewportBounds.y + (viewportBounds.height / 2));
+  await page.mouse.down();
+  await page.mouse.move(viewportBounds.x + (viewportBounds.width / 2) + 48, viewportBounds.y + (viewportBounds.height / 2) + 32, { steps: 6 });
+  await page.mouse.up();
+  await expect.poll(async () => await comparisonSourceVideo.evaluate((element) => {
+    if (!(element instanceof HTMLVideoElement)) {
+      return null;
+    }
+    return element.style.transformOrigin;
+  })).not.toBe(initialTransformOrigin);
+  const initialSyncedTimes = await page.evaluate(() => {
+    const sourceVideo = document.querySelector('[data-testid="comparison-source-viewport"] video');
+    const sampleVideo = document.querySelector('[data-testid="comparison-sample-viewport-sample-1"] video');
+    if (!(sourceVideo instanceof HTMLVideoElement) || !(sampleVideo instanceof HTMLVideoElement)) {
+      throw new Error("Comparison workspace videos are unavailable for initial sync validation");
+    }
+
+    return {
+      sourceCurrentTime: sourceVideo.currentTime,
+      sampleCurrentTime: sampleVideo.currentTime,
+    };
+  });
+
+  expect(Math.abs(
+    (initialSyncedTimes.sourceCurrentTime - initialSyncedTimes.sampleCurrentTime)
+    - Number(blindPreviewRequests[0]?.previewStartOffsetSeconds ?? 0),
+  )).toBeLessThan(0.1);
+  await page.getByTestId("comparison-time-slider").evaluate((element) => {
+    if (!(element instanceof HTMLInputElement)) {
+      throw new Error("Comparison timeline slider is unavailable");
+    }
+
+    element.value = "24";
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+
+  await expect.poll(async () => {
+    return await page.evaluate(() => {
+      const sourceVideo = document.querySelector('[data-testid="comparison-source-viewport"] video');
+      const sampleVideo = document.querySelector('[data-testid="comparison-sample-viewport-sample-1"] video');
+      if (!(sourceVideo instanceof HTMLVideoElement) || !(sampleVideo instanceof HTMLVideoElement)) {
+        return null;
+      }
+
+      return {
+        sourceCurrentTime: sourceVideo.currentTime,
+        sampleCurrentTime: sampleVideo.currentTime,
+      };
+    });
+  }).not.toBeNull();
+
+  const syncedTimelineTimes = await page.evaluate(() => {
+    const sourceVideo = document.querySelector('[data-testid="comparison-source-viewport"] video');
+    const sampleVideo = document.querySelector('[data-testid="comparison-sample-viewport-sample-1"] video');
+    if (!(sourceVideo instanceof HTMLVideoElement) || !(sampleVideo instanceof HTMLVideoElement)) {
+      throw new Error("Comparison workspace videos are unavailable");
+    }
+
+    return {
+      sourceCurrentTime: sourceVideo.currentTime,
+      sampleCurrentTime: sampleVideo.currentTime,
+    };
+  });
+
+  expect(Math.abs(
+    (syncedTimelineTimes.sourceCurrentTime - syncedTimelineTimes.sampleCurrentTime)
+    - Number(blindPreviewRequests[0]?.previewStartOffsetSeconds ?? 0),
+  )).toBeLessThan(0.1);
   await page.getByTestId("comparison-pick-sample-1").click();
 
   const appConfig = await page.evaluate(() => window.__UPSCALER_MOCK__.getAppConfig());
@@ -1871,6 +2011,54 @@ test("upgrades an avi preview in the background and still supports manual conver
   await expect(page.getByText("Source converted to MP4.")).toBeVisible();
 });
 
+test("replaces an avi source with the converted mp4 and clears stale comparison state", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    if (!window.__UPSCALER_MOCK__) {
+      return;
+    }
+
+    window.__UPSCALER_MOCK__.selectVideoFile = async () => "C:/fixtures/sample-input.avi";
+    window.__UPSCALER_MOCK__.probeSourceVideo = async (sourcePath) => ({
+      path: sourcePath,
+      previewPath: "C:/fixtures/sample-input-preview.mp4",
+      width: 640,
+      height: 480,
+      durationSeconds: 55,
+      frameRate: 29.97,
+      hasAudio: true,
+      container: "avi",
+      videoCodec: "mpeg4"
+    });
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await expect(page.getByText("C:/fixtures/sample-input.avi")).toBeVisible();
+  await expect(page.getByTestId("source-preview-mode")).toContainText("Full-length converted preview");
+  await openUpscaleControls(page);
+  await page.getByTestId("gpu-select").selectOption("0");
+
+  await page.getByTestId("blind-test-panel-toggle").click();
+  await page.getByTestId("run-blind-comparison-button").click();
+  await expect(page.getByTestId("comparison-inspector")).toBeVisible();
+  await expect(page.getByTestId("comparison-ready-note")).toContainText("4 of 4 samples are ready");
+
+  await page.getByTestId("convert-source-to-mp4-button").click();
+  await expect(page.getByText("Source converted to MP4.")).toBeVisible();
+  await expect(page.getByText("C:/fixtures/sample-input_fastprep.mp4")).toBeVisible();
+  await expect(page.getByText("C:/fixtures/sample-input.avi")).toBeHidden();
+  await expect(page.getByTestId("source-preview-mode")).toContainText("Direct source playback");
+  await expect(page.getByTestId("source-preview-guidance")).toHaveCount(0);
+  await expect(page.getByTestId("convert-source-to-mp4-button")).toHaveCount(0);
+  await expect(page.getByTestId("comparison-inspector")).toHaveCount(0);
+  await expect(page.getByTestId("comparison-workspace-modal")).toHaveCount(0);
+
+  await page.getByTestId("run-upscale-button").click();
+  const { lastRequest } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+  expect(lastRequest?.sourcePath).toBe("C:/fixtures/sample-input_fastprep.mp4");
+});
+
 test("routes webm sources through the converted preview path", async ({ page }) => {
   await page.goto("/");
 
@@ -2368,4 +2556,127 @@ test("renders the standalone jobs view without a close button and keeps the jobs
   }));
 
   expect(tableMetrics.scrollWidth).toBeGreaterThan(tableMetrics.clientWidth);
+});
+
+test("renders the standalone comparison view from shared workspace state", async ({ page }) => {
+  await page.addInitScript(() => {
+    const runtime = {
+      ffmpegPath: "C:/tools/ffmpeg.exe",
+      realesrganPath: "C:/tools/realesrgan-ncnn-vulkan.exe",
+      modelDir: "C:/tools/models",
+      rifePath: "C:/tools/rife-ncnn-vulkan.exe",
+      rifeModelRoot: "C:/tools/rife-models",
+      availableGpus: [
+        { id: 0, name: "Intel(R) Graphics", kind: "integrated" },
+        { id: 1, name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", kind: "discrete" },
+      ],
+      defaultGpuId: 1,
+    };
+    const mediaSummary = {
+      width: 1280,
+      height: 720,
+      frameRate: 24,
+      durationSeconds: 3,
+      frameCount: 72,
+      aspectRatio: 1280 / 720,
+      pixelCount: 1280 * 720,
+      hasAudio: false,
+      container: "mp4",
+      videoCodec: "h264",
+    };
+    const completedProgress = {
+      phase: "completed",
+      percent: 100,
+      message: "Blind comparison sample ready",
+      processedFrames: 72,
+      totalFrames: 72,
+      extractedFrames: 72,
+      upscaledFrames: 72,
+      interpolatedFrames: 0,
+      encodedFrames: 72,
+      remuxedFrames: 0,
+    };
+    window.localStorage.setItem("videoupgrader.comparison.workspace.v1", JSON.stringify({
+      updatedAt: Date.now(),
+      source: {
+        path: "C:/fixtures/sample-input.mp4",
+        previewPath: "C:/fixtures/sample-input-preview.mp4",
+        width: 1280,
+        height: 720,
+        durationSeconds: 12.5,
+        frameRate: 24,
+        hasAudio: true,
+        container: "mp4",
+        videoCodec: "h264",
+      },
+      blindComparison: {
+        state: "ready",
+        previewDurationSeconds: 3,
+        previewStartOffsetSeconds: 2.25,
+        selectedSampleId: null,
+        winnerModelId: null,
+        revealed: false,
+        error: null,
+        entries: [
+          {
+            sampleId: "sample-1",
+            anonymousLabel: "Sample A",
+            modelId: "realesrgan-x4plus",
+            jobId: "job-sample-1",
+            status: {
+              jobId: "job-sample-1",
+              state: "succeeded",
+              progress: completedProgress,
+              result: {
+                outputPath: "C:/exports/blind-sample-a.mp4",
+                workDir: "C:/workspace/artifacts/jobs/job-sample-1",
+                frameCount: 72,
+                hadAudio: false,
+                codec: "h264",
+                container: "mp4",
+                sourceMedia: mediaSummary,
+                outputMedia: mediaSummary,
+                runtime,
+                log: [],
+              },
+              error: null,
+            },
+          },
+          {
+            sampleId: "sample-2",
+            anonymousLabel: "Sample B",
+            modelId: "bsrgan-x4",
+            jobId: "job-sample-2",
+            status: {
+              jobId: "job-sample-2",
+              state: "succeeded",
+              progress: completedProgress,
+              result: {
+                outputPath: "C:/exports/blind-sample-b.mp4",
+                workDir: "C:/workspace/artifacts/jobs/job-sample-2",
+                frameCount: 72,
+                hadAudio: false,
+                codec: "h264",
+                container: "mp4",
+                sourceMedia: mediaSummary,
+                outputMedia: mediaSummary,
+                runtime,
+                log: [],
+              },
+              error: null,
+            },
+          },
+        ],
+      },
+    }));
+  });
+
+  await page.goto("/?view=comparison");
+
+  await expect(page.getByTestId("top-status-panel")).toHaveCount(0);
+  await expect(page.getByTestId("comparison-workspace-window")).toBeVisible();
+  await expect(page.getByTestId("comparison-workspace-window")).toContainText("Source plus 2 blind samples");
+  await expect(page.getByTestId("comparison-workspace-close")).toHaveCount(0);
+  await expect(page.getByTestId("comparison-pane-zoom-readout")).toContainText("1.00x");
+  await expect(page.getByTestId("comparison-zoom-readout")).toContainText("3.00x");
 });

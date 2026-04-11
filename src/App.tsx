@@ -1,11 +1,13 @@
 import { isTauri } from "@tauri-apps/api/core";
-import { Fragment, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent as ReactWheelEvent } from "react";
 import { desktopApi } from "./lib/desktopApi";
 import { getBackendDefinition, getBlindComparisonModels, getModelDefinition, getUiModels, getVisibleModels, type ModelDefinition } from "./lib/catalog";
 import { defaultCropRect, planOutputFraming, resolveAspectRatio, resolveCropRect, type NormalizedCropRect } from "./lib/framing";
 import { buildInterpolationWarning, interpolationTargetFpsOptions, isInterpolationEnabled } from "./lib/interpolation";
 import {
+  buildComparisonWindowUrl,
   buildJobsWindowUrl,
+  COMPARISON_WINDOW_LABEL,
   buildRepeatPipelineRequestEnvelope,
   JOBS_WINDOW_LABEL,
   parseRepeatPipelineRequestEnvelope,
@@ -156,6 +158,7 @@ interface BlindComparisonEntry {
 
 interface BlindComparisonState {
   state: "running" | "ready" | "failed";
+  startedAt?: number;
   entries: BlindComparisonEntry[];
   previewDurationSeconds: number;
   previewStartOffsetSeconds: number;
@@ -230,12 +233,38 @@ interface ProgressEventEntry {
   timestamp: number;
 }
 
+interface ComparisonWorkspaceSnapshot {
+  source: SourceVideoSummary;
+  blindComparison: BlindComparisonState;
+  previewPlaybackPath: string | null;
+  updatedAt: number;
+}
+
+interface BlindComparisonRevealPayload {
+  sourcePath: string;
+  startedAt: number;
+  previewDurationSeconds: number;
+  previewStartOffsetSeconds: number;
+  winnerModelId: ModelId;
+  candidateModelIds: ModelId[];
+}
+
+interface ComparisonPointerDragState {
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  startFocusX: number;
+  startFocusY: number;
+}
+
 type PipelineLaunchState = "idle" | "starting" | PipelineJobStatus["state"];
 
 const CLEANUP_FILTER_STORAGE_KEY = "videoupgrader.cleanup.filter";
 const CLEANUP_SEARCH_STORAGE_KEY = "videoupgrader.cleanup.search";
 const CLEANUP_SORT_STORAGE_KEY = "videoupgrader.cleanup.sort";
 const RUN_SETTINGS_STORAGE_KEY = "videoupgrader.run.settings.v1";
+const COMPARISON_WORKSPACE_STORAGE_KEY = "videoupgrader.comparison.workspace.v1";
+const BLIND_COMPARISON_REVEAL_EVENT = "blind-comparison-reveal";
 const EMBEDDED_FULL_PREVIEW_CONTAINERS = new Set(["mp4"]);
 const BLIND_COMPARISON_PREVIEW_CONTAINER: OutputContainer = "mp4";
 const BLIND_COMPARISON_PREVIEW_CODEC: VideoCodec = "h264";
@@ -1035,6 +1064,32 @@ function safeLocalStorageRemove(key: string): void {
   }
 }
 
+function parseComparisonWorkspaceSnapshot(raw: string | null): ComparisonWorkspaceSnapshot | null {
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<ComparisonWorkspaceSnapshot>;
+    if (!parsed?.source || typeof parsed.source.path !== "string") {
+      return null;
+    }
+    if (!parsed.blindComparison || !Array.isArray(parsed.blindComparison.entries)) {
+      return null;
+    }
+    if (parsed.previewPlaybackPath !== null && parsed.previewPlaybackPath !== undefined && typeof parsed.previewPlaybackPath !== "string") {
+      return null;
+    }
+    if (typeof parsed.updatedAt !== "number" || !Number.isFinite(parsed.updatedAt)) {
+      return null;
+    }
+
+    return parsed as ComparisonWorkspaceSnapshot;
+  } catch {
+    return null;
+  }
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
@@ -1335,10 +1390,71 @@ function toggleIncludedModel(modelIds: ModelId[], targetModelId: ModelId): Model
     : [...modelIds, targetModelId];
 }
 
+function sameCandidateModelSet(left: ModelId[], right: ModelId[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  const normalizedLeft = [...left].sort();
+  const normalizedRight = [...right].sort();
+  return normalizedLeft.every((value, index) => value === normalizedRight[index]);
+}
+
+function sameBlindComparisonRecord(
+  blindComparison: BlindComparisonState,
+  sourcePath: string,
+  record: AppConfig["blindComparisons"][number],
+): boolean {
+  const recordCreatedAt = Number.isFinite(Date.parse(record.createdAt)) ? Date.parse(record.createdAt) : 0;
+  const startedAt = blindComparison.startedAt ?? 0;
+  return record.sourcePath === sourcePath
+    && (startedAt <= 0 || (recordCreatedAt > 0 && recordCreatedAt >= startedAt - 1000))
+    && record.previewDurationSeconds === blindComparison.previewDurationSeconds
+    && Math.abs((record.previewStartOffsetSeconds ?? 0) - blindComparison.previewStartOffsetSeconds) < 0.25
+    && sameCandidateModelSet(record.candidateModelIds, blindComparison.entries.map((entry) => entry.modelId));
+}
+
+function sameBlindComparisonReveal(
+  blindComparison: BlindComparisonState,
+  sourcePath: string,
+  payload: BlindComparisonRevealPayload,
+): boolean {
+  return payload.sourcePath === sourcePath
+    && (blindComparison.startedAt ?? 0) === payload.startedAt
+    && payload.previewDurationSeconds === blindComparison.previewDurationSeconds
+    && Math.abs(payload.previewStartOffsetSeconds - blindComparison.previewStartOffsetSeconds) < 0.25
+    && sameCandidateModelSet(payload.candidateModelIds, blindComparison.entries.map((entry) => entry.modelId));
+}
+
+function applyBlindComparisonReveal(
+  blindComparison: BlindComparisonState | null,
+  winnerModelId: ModelId,
+): BlindComparisonState | null {
+  if (!blindComparison || blindComparison.revealed) {
+    return blindComparison;
+  }
+
+  const selectedEntry = blindComparison.entries.find((entry) => entry.modelId === winnerModelId);
+  if (!selectedEntry) {
+    return blindComparison;
+  }
+
+  return {
+    ...blindComparison,
+    selectedSampleId: selectedEntry.sampleId,
+    winnerModelId,
+    revealed: true,
+  };
+}
+
 export default function App() {
   const persistedRunSettings = parsePersistedRunSettings(safeLocalStorageGet(RUN_SETTINGS_STORAGE_KEY));
-  const isJobsOnlyView = resolveAppView(window.location.search) === "jobs";
-  const canOpenNativeJobsWindow = tauriWindowingAvailable() && !isJobsOnlyView;
+  const appView = resolveAppView(window.location.search);
+  const isJobsOnlyView = appView === "jobs";
+  const isComparisonOnlyView = appView === "comparison";
+  const isStandaloneView = isJobsOnlyView || isComparisonOnlyView;
+  const canOpenNativeJobsWindow = tauriWindowingAvailable() && !isStandaloneView;
+  const canOpenNativeComparisonWindow = tauriWindowingAvailable() && !isStandaloneView;
   const [modelId, setModelId] = useState<ModelId>(persistedRunSettings.modelId ?? "realesrgan-x4plus");
   const [outputMode, setOutputMode] = useState<OutputMode>(persistedRunSettings.outputMode ?? "preserveAspect4k");
   const [qualityPreset, setQualityPreset] = useState<QualityPreset>(persistedRunSettings.qualityPreset ?? "qualityBalanced");
@@ -1417,6 +1533,7 @@ export default function App() {
   const [jobsWindowDragState, setJobsWindowDragState] = useState<JobsWindowDragState | null>(null);
   const [isCropEditing, setIsCropEditing] = useState(false);
   const [comparisonZoom, setComparisonZoom] = useState<number>(3);
+  const [comparisonPaneZoom, setComparisonPaneZoom] = useState<number>(1);
   const [comparisonFocusX, setComparisonFocusX] = useState<number>(50);
   const [comparisonFocusY, setComparisonFocusY] = useState<number>(50);
   const [comparisonFocusPresetId, setComparisonFocusPresetId] = useState<string>(comparisonFocusPresets[0]?.id ?? "dithering");
@@ -1424,6 +1541,7 @@ export default function App() {
   const [comparisonDuration, setComparisonDuration] = useState<number>(0);
   const [comparisonPlaying, setComparisonPlaying] = useState<boolean>(false);
   const [isComparisonWorkspaceOpen, setIsComparisonWorkspaceOpen] = useState<boolean>(false);
+  const [isComparisonPanning, setIsComparisonPanning] = useState<boolean>(false);
   const [sourcePreviewPlaying, setSourcePreviewPlaying] = useState<boolean>(false);
   const [sourcePreviewCurrentTime, setSourcePreviewCurrentTime] = useState<number>(0);
   const [sourcePreviewDuration, setSourcePreviewDuration] = useState<number>(0);
@@ -1439,6 +1557,9 @@ export default function App() {
   const resolvedSourcePreviewUrlRef = useRef<string | null>(null);
   const resolvedComparisonPreviewUrlsRef = useRef<Record<string, string>>({});
   const comparisonDesiredTimeRef = useRef<number>(0);
+  const comparisonPointerDragStateRef = useRef<ComparisonPointerDragState | null>(null);
+  const isApplyingComparisonSnapshotRef = useRef(false);
+  const comparisonSnapshotUpdatedAtRef = useRef(0);
   const jobsPanelRef = useRef<HTMLDivElement | null>(null);
 
   const sizingOptions: OutputSizingOptions = {
@@ -1525,13 +1646,28 @@ export default function App() {
   const comparisonCurrentFrame = comparisonFrameRate > 0
     ? Math.min(comparisonTimelineMax, Math.max(0, Math.round(comparisonCurrentTime * comparisonFrameRate)))
     : 0;
-  const comparisonSourcePreviewPath = source ? (source.previewPath || source.path) : null;
-  const comparisonSourcePreviewSrc = comparisonSourcePreviewPath ? (resolvedSourcePreviewUrl ?? desktopApi.toPreviewSrc(comparisonSourcePreviewPath)) : "";
+  const comparisonPreviewStartOffsetSeconds = blindComparison?.previewStartOffsetSeconds ?? 0;
+  const isComparisonWorkspaceVisible = isComparisonOnlyView || isComparisonWorkspaceOpen;
+  const comparisonRequiresConvertedSourcePreview = Boolean(source && !supportsEmbeddedFullLengthPreview(source.container));
+  const comparisonSourceReferenceReady = Boolean(source && (!comparisonRequiresConvertedSourcePreview || previewPlaybackPath));
+  const comparisonSourcePreviewPath = source
+    ? (supportsEmbeddedFullLengthPreview(source.container) ? source.path : (previewPlaybackPath ?? null))
+    : null;
+  const comparisonSourcePreviewSrc = comparisonSourcePreviewPath
+    ? ((comparisonSourcePreviewPath === previewSourcePath ? resolvedSourcePreviewUrl : null) ?? desktopApi.toPreviewSrc(comparisonSourcePreviewPath))
+    : "";
   const comparisonSourcePreviewMimeType = previewMimeType(comparisonSourcePreviewPath);
   const comparisonPreviewLoadSignature = [
-    comparisonSourcePreviewSrc,
+    comparisonSourcePreviewPath ?? "",
     ...comparisonEntries.map((entry) => resolvedComparisonPreviewUrls[entry.sampleId] ?? (entry.status.result?.outputPath ?? "")),
   ].join("|");
+  const comparisonPaneMinWidthPercent = Math.min(100, Math.max(50, comparisonPaneZoom * 50));
+  const comparisonWorkspaceShellStyle = {
+    "--comparison-workspace-pane-min-width": `calc(${comparisonPaneMinWidthPercent.toFixed(2)}% - 12px)`,
+  } as CSSProperties;
+  const comparisonViewportAspectRatio = framing?.aspectRatio && framing.aspectRatio > 0
+    ? framing.aspectRatio
+    : aspectRatioValue;
   const selectedComparisonPreset = comparisonFocusPresets.find((preset) => preset.id === comparisonFocusPresetId) ?? comparisonFocusPresets[0];
   const usingFallbackPreviewClip = Boolean(source && source.previewPath !== source.path && !previewPlaybackPath);
   const canAutoUpgradePreview = Boolean(
@@ -2004,29 +2140,223 @@ export default function App() {
   }, [comparisonEntries, isComparisonWorkspaceOpen]);
 
   useEffect(() => {
-    if (!isComparisonWorkspaceOpen && comparisonPlaying) {
+    if (!isComparisonWorkspaceVisible && comparisonPlaying) {
       setComparisonPlaying(false);
     }
-  }, [comparisonPlaying, isComparisonWorkspaceOpen]);
+  }, [comparisonPlaying, isComparisonWorkspaceVisible]);
 
   useEffect(() => {
-    if (!isComparisonWorkspaceOpen) {
+    if (!isComparisonWorkspaceVisible) {
       return;
     }
 
     const frameId = window.requestAnimationFrame(() => {
-      if (comparisonFrameRate > 0 && comparisonCurrentFrame > 0) {
-        syncComparisonFrame(comparisonCurrentFrame);
-        return;
-      }
-
-      if (comparisonCurrentTime > 0) {
-        syncComparisonTime(comparisonCurrentTime);
-      }
+      syncComparisonToCurrentPosition();
     });
 
     return () => window.cancelAnimationFrame(frameId);
-  }, [comparisonCurrentFrame, comparisonCurrentTime, comparisonFrameRate, comparisonPreviewLoadSignature, isComparisonWorkspaceOpen]);
+  }, [comparisonCurrentFrame, comparisonCurrentTime, comparisonFrameRate, comparisonPreviewLoadSignature, isComparisonWorkspaceVisible]);
+
+  useEffect(() => {
+    if (!isComparisonWorkspaceVisible || !comparisonPlaying) {
+      return;
+    }
+
+    let frameId = 0;
+
+    const tick = () => {
+      synchronizeComparisonPlaybackFromSource();
+      frameId = window.requestAnimationFrame(tick);
+    };
+
+    frameId = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(frameId);
+  }, [comparisonPlaying, comparisonFrameRate, comparisonDuration, comparisonPreviewStartOffsetSeconds, isComparisonWorkspaceVisible]);
+
+  useEffect(() => {
+    if (isJobsOnlyView) {
+      return;
+    }
+
+    if (isApplyingComparisonSnapshotRef.current) {
+      isApplyingComparisonSnapshotRef.current = false;
+      return;
+    }
+
+    if (!source || !blindComparison || blindComparison.entries.length === 0) {
+      if (!isComparisonOnlyView) {
+        safeLocalStorageRemove(COMPARISON_WORKSPACE_STORAGE_KEY);
+      }
+      return;
+    }
+
+    const snapshotUpdatedAt = Date.now();
+    comparisonSnapshotUpdatedAtRef.current = snapshotUpdatedAt;
+    safeLocalStorageSet(COMPARISON_WORKSPACE_STORAGE_KEY, JSON.stringify({
+      source,
+      blindComparison,
+      previewPlaybackPath,
+      updatedAt: snapshotUpdatedAt,
+    } satisfies ComparisonWorkspaceSnapshot));
+  }, [blindComparison, isComparisonOnlyView, isJobsOnlyView, previewPlaybackPath, source]);
+
+  useEffect(() => {
+    const applySnapshot = (raw: string | null) => {
+      const snapshot = parseComparisonWorkspaceSnapshot(raw);
+      if (!snapshot) {
+        if (isComparisonOnlyView) {
+          setBlindComparison(null);
+          setSource(null);
+        }
+        return;
+      }
+
+      if (snapshot.updatedAt <= comparisonSnapshotUpdatedAtRef.current) {
+        return;
+      }
+
+      comparisonSnapshotUpdatedAtRef.current = snapshot.updatedAt;
+
+      isApplyingComparisonSnapshotRef.current = true;
+      if (isComparisonOnlyView) {
+        setSource(snapshot.source);
+        setBlindComparison(snapshot.blindComparison);
+        setPreviewPlaybackPath(snapshot.previewPlaybackPath ?? null);
+        return;
+      }
+
+      if (!source || source.path !== snapshot.source.path) {
+        return;
+      }
+
+      isApplyingComparisonSnapshotRef.current = true;
+      setBlindComparison((current) => {
+        if (!current) {
+          return current;
+        }
+        return snapshot.blindComparison;
+      });
+
+      if (blindComparison?.revealed !== snapshot.blindComparison.revealed) {
+        void desktopApi.getAppConfig().then((config) => {
+          setAppConfig(config);
+        }).catch(() => {
+          // Ignore cross-window refresh failures.
+        });
+      }
+    };
+
+    applySnapshot(safeLocalStorageGet(COMPARISON_WORKSPACE_STORAGE_KEY));
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== COMPARISON_WORKSPACE_STORAGE_KEY) {
+        return;
+      }
+      applySnapshot(event.newValue);
+    };
+
+    window.addEventListener("storage", handleStorage);
+    const intervalId = window.setInterval(() => {
+      applySnapshot(safeLocalStorageGet(COMPARISON_WORKSPACE_STORAGE_KEY));
+    }, 1000);
+
+    return () => {
+      window.removeEventListener("storage", handleStorage);
+      window.clearInterval(intervalId);
+    };
+  }, [blindComparison?.revealed, isComparisonOnlyView, source]);
+
+  useEffect(() => {
+    if (!tauriWindowingAvailable() || !source || !blindComparison) {
+      return undefined;
+    }
+
+    let disposed = false;
+    let unlisten: null | (() => void) = null;
+
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      unlisten = await listen<BlindComparisonRevealPayload>(BLIND_COMPARISON_REVEAL_EVENT, (event) => {
+        if (disposed || !event.payload) {
+          return;
+        }
+
+        if (!sameBlindComparisonReveal(blindComparison, source.path, event.payload)) {
+          return;
+        }
+
+        setBlindComparison((current) => applyBlindComparisonReveal(current, event.payload.winnerModelId));
+        void desktopApi.getAppConfig().then((config) => {
+          setAppConfig(config);
+        }).catch(() => {
+          // Ignore config refresh failures after cross-window reveal.
+        });
+      });
+    }).catch(() => {
+      // Ignore event bridge setup failures outside Tauri.
+    });
+
+    return () => {
+      disposed = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [blindComparison, source]);
+
+  useEffect(() => {
+    if (isComparisonOnlyView || !source || !blindComparison || blindComparison.revealed) {
+      return undefined;
+    }
+
+    let disposed = false;
+
+    const refreshWinner = async () => {
+      try {
+        const config = await desktopApi.getAppConfig();
+        if (disposed) {
+          return;
+        }
+
+        setAppConfig(config);
+        const matchingRecord = [...config.blindComparisons]
+          .reverse()
+          .find((record) => sameBlindComparisonRecord(blindComparison, source.path, record));
+        if (!matchingRecord) {
+          return;
+        }
+
+        setBlindComparison((current) => {
+          if (!current || current.revealed) {
+            return current;
+          }
+
+          const selectedEntry = current.entries.find((entry) => entry.modelId === matchingRecord.winnerModelId);
+          if (!selectedEntry) {
+            return current;
+          }
+
+          return {
+            ...current,
+            selectedSampleId: selectedEntry.sampleId,
+            winnerModelId: matchingRecord.winnerModelId,
+            revealed: true,
+          };
+        });
+      } catch {
+        // Ignore background config refresh failures.
+      }
+    };
+
+    void refreshWinner();
+    const intervalId = window.setInterval(() => {
+      void refreshWinner();
+    }, 1000);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, [blindComparison, isComparisonOnlyView, source]);
 
   useEffect(() => {
     const preset = comparisonFocusPresets.find((entry) => entry.id === comparisonFocusPresetId);
@@ -2367,6 +2697,11 @@ export default function App() {
           const conversionMode = sourceConversionMode;
           const conversionSourcePath = sourceConversionSourcePath;
           const isCurrentSource = source?.path === conversionSourcePath;
+          const clearConversionTracking = () => {
+            setSourceConversionJobId(null);
+            setSourceConversionMode(null);
+            setSourceConversionSourcePath(null);
+          };
 
           if (conversionMode === "preview") {
             if (isCurrentSource) {
@@ -2374,35 +2709,44 @@ export default function App() {
               void resolveSourcePreviewUrl(nextJob.result.path);
               setStatus("Full-length preview ready.");
             }
-            setSourceConversionJobId(null);
+            clearConversionTracking();
           } else {
-            setSource(nextJob.result);
-            setPreviewPlaybackPath(null);
-            void resolveSourcePreviewUrl(nextJob.result.previewPath || nextJob.result.path);
-            setOutputPath(defaultOutputPath(nextJob.result, container, modelId));
-            setResult(null);
-            setPipelineJob(null);
-            setActiveJobId(null);
-            setActivePipelineRequest(null);
-            setBlindComparison(null);
-            setIsCropEditing(false);
-            setIsComparisonWorkspaceOpen(false);
-            setComparisonCurrentTime(0);
-            setComparisonDuration(0);
-            setComparisonPlaying(false);
-            setSourceConversionJobId(null);
-            setStatus("Source converted to MP4.");
+            if (isCurrentSource) {
+              setSource(nextJob.result);
+              setPreviewPlaybackPath(null);
+              void resolveSourcePreviewUrl(nextJob.result.previewPath || nextJob.result.path);
+              setOutputPath(defaultOutputPath(nextJob.result, container, modelId));
+              setResult(null);
+              setPipelineJob(null);
+              setActiveJobId(null);
+              setActivePipelineRequest(null);
+              setBlindComparison(null);
+              setIsCropEditing(false);
+              setIsComparisonWorkspaceOpen(false);
+              setComparisonCurrentTime(0);
+              setComparisonDuration(0);
+              setComparisonPlaying(false);
+              setIsComparisonPanning(false);
+              setStatus("Source converted to MP4.");
+            } else {
+              setStatus("Source conversion finished, but another source is now loaded.");
+            }
+            clearConversionTracking();
           }
         }
 
         if (nextJob.state === "failed") {
           setError(nextJob.error ?? nextJob.progress.message);
           setSourceConversionJobId(null);
+          setSourceConversionMode(null);
+          setSourceConversionSourcePath(null);
           setStatus("Source conversion failed.");
         }
 
         if (nextJob.state === "cancelled") {
           setSourceConversionJobId(null);
+          setSourceConversionMode(null);
+          setSourceConversionSourcePath(null);
           setStatus("Source conversion cancelled.");
         }
 
@@ -2413,6 +2757,8 @@ export default function App() {
         if (!cancelled) {
           setError(caught instanceof Error ? caught.message : String(caught));
           setSourceConversionJobId(null);
+          setSourceConversionMode(null);
+          setSourceConversionSourcePath(null);
           setStatus("Source conversion failed.");
         }
       }
@@ -3012,15 +3358,102 @@ export default function App() {
   }
 
   function handleComparisonViewportPointerDown(event: ReactPointerEvent<HTMLElement>): void {
-    updateComparisonFocusFromEventTarget(event.currentTarget, event.clientX, event.clientY);
+    comparisonPointerDragStateRef.current = {
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startFocusX: comparisonFocusX,
+      startFocusY: comparisonFocusY,
+    };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
 
   function handleComparisonViewportPointerMove(event: ReactPointerEvent<HTMLElement>): void {
-    if ((event.buttons & 1) !== 1) {
+    const dragState = comparisonPointerDragStateRef.current;
+    if ((event.buttons & 1) !== 1 || !dragState || dragState.pointerId !== event.pointerId) {
       return;
     }
-    updateComparisonFocusFromEventTarget(event.currentTarget, event.clientX, event.clientY);
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
+
+    const deltaX = event.clientX - dragState.startClientX;
+    const deltaY = event.clientY - dragState.startClientY;
+    if (!isComparisonPanning && Math.hypot(deltaX, deltaY) < 4) {
+      return;
+    }
+
+    if (!isComparisonPanning) {
+      setIsComparisonPanning(true);
+      setComparisonFocusPresetId("manual");
+    }
+
+    const nextFocusX = clamp(dragState.startFocusX + ((deltaX / rect.width) * 100), 0, 100);
+    const nextFocusY = clamp(dragState.startFocusY + ((deltaY / rect.height) * 100), 0, 100);
+    setComparisonFocusX(nextFocusX);
+    setComparisonFocusY(nextFocusY);
+  }
+
+  function handleComparisonViewportPointerUp(event: ReactPointerEvent<HTMLElement>): void {
+    setIsComparisonPanning(false);
+    comparisonPointerDragStateRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  function handleComparisonViewportPointerCancel(event: ReactPointerEvent<HTMLElement>): void {
+    setIsComparisonPanning(false);
+    comparisonPointerDragStateRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  function handleComparisonViewportLostPointerCapture(): void {
+    setIsComparisonPanning(false);
+    comparisonPointerDragStateRef.current = null;
+  }
+
+  function adjustComparisonContentZoom(direction: number, step: number): void {
+    setComparisonZoom((current) => Number(clamp(current + (direction * step), 1, 48).toFixed(2)));
+  }
+
+  function adjustComparisonPaneZoom(direction: number, step: number): void {
+    setComparisonPaneZoom((current) => Number(clamp(current + (direction * step), 1, 2).toFixed(2)));
+  }
+
+  function handleComparisonWorkspaceWheel(event: ReactWheelEvent<HTMLElement>): void {
+    if (event.ctrlKey || !event.shiftKey) {
+      return;
+    }
+
+    const dominantDelta = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+    if (dominantDelta === 0) {
+      return;
+    }
+
+    event.preventDefault();
+    const direction = dominantDelta < 0 ? 1 : -1;
+    adjustComparisonPaneZoom(direction, 0.25);
+  }
+
+  function handleComparisonViewportWheel(event: ReactWheelEvent<HTMLElement>): void {
+    if (!event.ctrlKey) {
+      return;
+    }
+
+    const dominantDelta = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+    if (dominantDelta === 0) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    const direction = dominantDelta < 0 ? 1 : -1;
+    adjustComparisonContentZoom(direction, 0.25);
   }
 
   async function ensureComparisonVideoReady(video: HTMLVideoElement): Promise<boolean> {
@@ -3053,25 +3486,113 @@ export default function App() {
     });
   }
 
-  function openComparisonWorkspace(): void {
+  async function openComparisonWorkspace(): Promise<void> {
+    if (!source || !blindComparison || comparisonEntries.length === 0) {
+      return;
+    }
+
+    if (!comparisonSourceReferenceReady) {
+      setStatus("Comparison source is waiting for a full-length playable preview. Finish the preview conversion or fast-convert the source before opening the comparison workspace.");
+      return;
+    }
+
+    safeLocalStorageSet(COMPARISON_WORKSPACE_STORAGE_KEY, JSON.stringify({
+      source,
+      blindComparison,
+      previewPlaybackPath,
+      updatedAt: Date.now(),
+    } satisfies ComparisonWorkspaceSnapshot));
+
+    if (canOpenNativeComparisonWindow) {
+      try {
+        const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+        const existingWindow = await WebviewWindow.getByLabel(COMPARISON_WINDOW_LABEL);
+        if (existingWindow) {
+          await existingWindow.show();
+          await existingWindow.setFocus();
+          setStatus("Comparison window ready.");
+          return;
+        }
+
+        const comparisonUrl = buildComparisonWindowUrl(window.location);
+        const comparisonWindow = new WebviewWindow(COMPARISON_WINDOW_LABEL, {
+          url: comparisonUrl,
+          title: `${APP_NAME} Comparison`,
+          width: 1680,
+          height: 1120,
+          minWidth: 1080,
+          minHeight: 760,
+          resizable: true,
+          focus: true,
+        });
+
+        await new Promise<void>((resolve, reject) => {
+          let settled = false;
+          void comparisonWindow.once("tauri://created", () => {
+            if (!settled) {
+              settled = true;
+              resolve();
+            }
+          });
+          void comparisonWindow.once("tauri://error", (event) => {
+            if (!settled) {
+              settled = true;
+              reject(new Error(String(event.payload ?? "Failed to open the comparison window.")));
+            }
+          });
+        });
+
+        setStatus("Comparison window opened.");
+        return;
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+        setStatus("Failed to open the comparison window.");
+      }
+    }
+
     if (isComparisonWorkspaceOpen) {
       return;
     }
     setIsComparisonWorkspaceOpen(true);
   }
 
-  function closeComparisonWorkspace(): void {
+  async function closeComparisonWorkspace(): Promise<void> {
     comparisonVideoTargets().forEach((video) => video.pause());
     setComparisonPlaying(false);
     comparisonDesiredTimeRef.current = 0;
+
+    if (isComparisonOnlyView) {
+      try {
+        const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+        await getCurrentWebviewWindow().close();
+        return;
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+        setStatus("Failed to close the comparison window.");
+      }
+    }
+
     setIsComparisonWorkspaceOpen(false);
   }
 
   function refreshComparisonDuration(): void {
-    const durations = comparisonVideoTargets()
-      .map((video) => video.duration)
+    const sourceVideo = comparisonSourceVideoRef.current;
+    const sourceDuration = Number.isFinite(sourceVideo?.duration ?? NaN)
+      ? Math.max(0, (sourceVideo?.duration ?? 0) - comparisonPreviewStartOffsetSeconds)
+      : Math.max(0, (source?.durationSeconds ?? 0) - comparisonPreviewStartOffsetSeconds);
+    const sampleDurations = comparisonEntries
+      .map((entry) => comparisonSampleVideoRefs.current[entry.sampleId]?.duration ?? NaN)
       .filter((value): value is number => Number.isFinite(value ?? NaN));
+    const durations = [sourceDuration, ...sampleDurations].filter((value) => value > 0);
     setComparisonDuration(durations.length > 0 ? Math.min(...durations) : 0);
+  }
+
+  function syncComparisonToCurrentPosition(): void {
+    if (comparisonFrameRate > 0) {
+      syncComparisonFrame(comparisonCurrentFrame);
+      return;
+    }
+    syncComparisonTime(comparisonCurrentTime);
   }
 
   function syncComparisonTime(nextTime: number): void {
@@ -3082,7 +3603,10 @@ export default function App() {
         continue;
       }
 
-      const clamped = Math.max(0, Math.min(boundedTime, video.duration || boundedTime));
+      const targetTime = video === comparisonSourceVideoRef.current
+        ? boundedTime + comparisonPreviewStartOffsetSeconds
+        : boundedTime;
+      const clamped = Math.max(0, Math.min(targetTime, video.duration || targetTime));
       if (Math.abs(video.currentTime - clamped) > 0.05) {
         video.currentTime = clamped;
       }
@@ -3129,13 +3653,10 @@ export default function App() {
 
   function handleComparisonLoadedMetadata(): void {
     refreshComparisonDuration();
-    if (comparisonFrameRate > 0 && comparisonCurrentFrame > 0) {
-      syncComparisonFrame(comparisonCurrentFrame);
-      return;
-    }
-    if (comparisonCurrentTime > 0) {
-      syncComparisonTime(comparisonCurrentTime);
-    }
+    syncComparisonToCurrentPosition();
+    window.requestAnimationFrame(() => {
+      syncComparisonToCurrentPosition();
+    });
   }
 
   function handleComparisonSourceTimeUpdate(): void {
@@ -3144,7 +3665,7 @@ export default function App() {
       return;
     }
 
-    const rawNextTime = sourceVideo.currentTime;
+    const rawNextTime = Math.max(0, sourceVideo.currentTime - comparisonPreviewStartOffsetSeconds);
     const nextTime = comparisonDuration > 0 ? Math.min(rawNextTime, comparisonDuration) : rawNextTime;
     if (!comparisonPlaying && Math.abs(nextTime - comparisonDesiredTimeRef.current) > 0.08) {
       return;
@@ -3162,7 +3683,39 @@ export default function App() {
       }
     }
 
-    if (comparisonDuration > 0 && rawNextTime >= comparisonDuration - 0.02) {
+    if (comparisonDuration > 0 && nextTime >= comparisonDuration - 0.02) {
+      comparisonVideoTargets().forEach((video) => video.pause());
+      setComparisonPlaying(false);
+    }
+  }
+
+  function synchronizeComparisonPlaybackFromSource(): void {
+    const sourceVideo = comparisonSourceVideoRef.current;
+    if (!sourceVideo || !Number.isFinite(sourceVideo.currentTime)) {
+      return;
+    }
+
+    const rawNextTime = Math.max(0, sourceVideo.currentTime - comparisonPreviewStartOffsetSeconds);
+    const boundedTime = comparisonDuration > 0 ? Math.min(rawNextTime, comparisonDuration) : rawNextTime;
+    const nextTime = comparisonFrameRate > 0
+      ? Math.min(comparisonTimelineMax, Math.max(0, Math.round(boundedTime * comparisonFrameRate))) / comparisonFrameRate
+      : boundedTime;
+
+    comparisonDesiredTimeRef.current = nextTime;
+    setComparisonCurrentTime((current) => (Math.abs(current - nextTime) > 0.001 ? nextTime : current));
+
+    for (const video of comparisonVideoTargets()) {
+      if (video === sourceVideo || !Number.isFinite(video.duration)) {
+        continue;
+      }
+
+      const clamped = Math.max(0, Math.min(nextTime, video.duration || nextTime));
+      if (Math.abs(video.currentTime - clamped) > 0.015) {
+        video.currentTime = clamped;
+      }
+    }
+
+    if (comparisonDuration > 0 && nextTime >= comparisonDuration - 0.02) {
       comparisonVideoTargets().forEach((video) => video.pause());
       setComparisonPlaying(false);
     }
@@ -3197,7 +3750,10 @@ export default function App() {
 
     const playResults = await Promise.allSettled(readyVideos.map(async (video) => {
       if (Number.isFinite(video.duration)) {
-        const clamped = Math.max(0, Math.min(targetTime, video.duration || targetTime));
+        const targetPlaybackTime = video === comparisonSourceVideoRef.current
+          ? targetTime + comparisonPreviewStartOffsetSeconds
+          : targetTime;
+        const clamped = Math.max(0, Math.min(targetPlaybackTime, video.duration || targetPlaybackTime));
         if (Math.abs(video.currentTime - clamped) > 0.05) {
           video.currentTime = clamped;
         }
@@ -3866,6 +4422,7 @@ export default function App() {
 
       setBlindComparison({
         state: "running",
+        startedAt: Date.now(),
         entries: startedEntries,
         previewDurationSeconds: duration,
         previewStartOffsetSeconds: startOffsetSeconds,
@@ -3975,12 +4532,21 @@ export default function App() {
         candidateModelIds: blindComparison.entries.map((entry) => entry.modelId),
       });
       setAppConfig(config);
-      setBlindComparison((current) => current ? {
-        ...current,
-        selectedSampleId: sampleId,
-        winnerModelId: winner.modelId,
-        revealed: true,
-      } : current);
+      setBlindComparison((current) => applyBlindComparisonReveal(current, winner.modelId));
+
+      if (tauriWindowingAvailable()) {
+        void import("@tauri-apps/api/event").then(({ emit }) => emit(BLIND_COMPARISON_REVEAL_EVENT, {
+          sourcePath: source.path,
+          startedAt: blindComparison.startedAt ?? 0,
+          previewDurationSeconds: blindComparison.previewDurationSeconds,
+          previewStartOffsetSeconds: blindComparison.previewStartOffsetSeconds,
+          winnerModelId: winner.modelId,
+          candidateModelIds: blindComparison.entries.map((entry) => entry.modelId),
+        } satisfies BlindComparisonRevealPayload)).catch(() => {
+          // Ignore cross-window event emission failures outside Tauri.
+        });
+      }
+
       setStatus(`Blind comparison winner saved from ${winner.anonymousLabel}.`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -4069,7 +4635,7 @@ export default function App() {
 
   return (
     <main className="app-shell">
-      {!isJobsOnlyView ? (
+      {!isStandaloneView ? (
       <>
       <section className="hero-panel">
         <div className="hero-copy">
@@ -4529,7 +5095,7 @@ export default function App() {
                           onClick={(event) => {
                             event.preventDefault();
                             event.stopPropagation();
-                            openComparisonWorkspace();
+                            void openComparisonWorkspace();
                           }}
                         >
                           {isComparisonWorkspaceOpen ? (
@@ -4583,8 +5149,8 @@ export default function App() {
                   ))}
                 </div>
                 <div className="inspector-controls-grid">
-                  <button type="button" className="action-button secondary-button" data-testid="open-comparison-workspace-button" onClick={openComparisonWorkspace}>
-                    Open Comparison Workspace
+                  <button type="button" className="action-button secondary-button" data-testid="open-comparison-workspace-button" onClick={() => void openComparisonWorkspace()}>
+                    {canOpenNativeComparisonWindow ? "Open Comparison Window" : "Open Comparison Workspace"}
                   </button>
                   <button type="button" className="action-button secondary-button" data-testid="open-source-external-button" onClick={() => void openMediaInDefaultApp(source.path)}>
                     Open Source Externally
@@ -4595,17 +5161,25 @@ export default function App() {
                 </div>
               </section>
             ) : null}
-            {comparisonEntries.length > 0 && source && isComparisonWorkspaceOpen ? (
-              <div className="comparison-workspace-overlay" data-testid="comparison-workspace-modal" aria-label="Comparison workspace" aria-modal="true" role="dialog">
-                <div className="comparison-workspace-shell">
+            {comparisonEntries.length > 0 && source && isComparisonWorkspaceVisible ? (
+              <div
+                className={isComparisonOnlyView ? "comparison-workspace-shell-host comparison-workspace-shell-host-standalone" : "comparison-workspace-overlay"}
+                data-testid={isComparisonOnlyView ? "comparison-workspace-window" : "comparison-workspace-modal"}
+                aria-label="Comparison workspace"
+                aria-modal={isComparisonOnlyView ? undefined : true}
+                role={isComparisonOnlyView ? "region" : "dialog"}
+              >
+                <div className={`comparison-workspace-shell${isComparisonOnlyView ? " comparison-workspace-shell-standalone" : ""}`} style={comparisonWorkspaceShellStyle} onWheel={handleComparisonWorkspaceWheel}>
                   <div className="comparison-workspace-header">
                     <div className="catalog-card-header">
                       <strong>Comparison Workspace</strong>
                       <span className="catalog-chip">Source plus {comparisonEntries.length} blind samples</span>
                     </div>
-                    <button type="button" className="action-button secondary-button" data-testid="comparison-workspace-close" onClick={closeComparisonWorkspace}>
-                      Close Workspace
-                    </button>
+                    {!isComparisonOnlyView ? (
+                      <button type="button" className="action-button secondary-button" data-testid="comparison-workspace-close" onClick={() => void closeComparisonWorkspace()}>
+                        Close Workspace
+                      </button>
+                    ) : null}
                   </div>
                   <div className="inspector-controls-grid comparison-workspace-controls">
                     <button type="button" className="action-button secondary-button" data-testid="comparison-play-toggle" onClick={() => void toggleComparisonPlayback()}>
@@ -4639,8 +5213,14 @@ export default function App() {
                   </label>
                   <div className="comparison-toolbar-grid">
                     <label>
-                      Zoom
-                      <input data-testid="comparison-zoom-slider" type="range" min={1} max={16} step={0.25} value={comparisonZoom} onChange={(event) => setComparisonZoom(Number(event.target.value))} />
+                      Pane Size
+                      <span className="summary comparison-toolbar-readout" data-testid="comparison-pane-zoom-readout">{comparisonPaneZoom.toFixed(2)}x</span>
+                      <input data-testid="comparison-pane-zoom-slider" type="range" min={1} max={2} step={0.05} value={comparisonPaneZoom} onChange={(event) => setComparisonPaneZoom(Number(event.target.value))} />
+                    </label>
+                    <label>
+                      Content Zoom
+                      <span className="summary comparison-toolbar-readout" data-testid="comparison-zoom-readout">{comparisonZoom.toFixed(2)}x</span>
+                      <input data-testid="comparison-zoom-slider" type="range" min={1} max={48} step={0.25} value={comparisonZoom} onChange={(event) => setComparisonZoom(Number(event.target.value))} />
                     </label>
                     <label>
                       Horizontal Focus
@@ -4687,7 +5267,7 @@ export default function App() {
                     ))}
                   </div>
                   <p className="summary comparison-hint" data-testid="comparison-focus-hint">
-                    {selectedComparisonPreset?.hint ?? "Move around the frame and inspect every sample against the source."}
+                    {`${selectedComparisonPreset?.hint ?? "Move around the frame and inspect every sample against the source."} Use Shift plus wheel to resize the comparison panes, Ctrl plus wheel over a viewport to zoom the video content, and drag to pan.`}
                   </p>
                   <div className="comparison-inspector-grid comparison-workspace-grid">
                     <article className="comparison-inspector-card comparison-workspace-card">
@@ -4696,15 +5276,21 @@ export default function App() {
                         <span className="catalog-chip">Reference</span>
                       </div>
                       <div
-                        className="inspection-viewport comparison-workspace-viewport"
+                        className={`inspection-viewport comparison-workspace-viewport${isComparisonPanning ? " is-panning" : " is-pannable"}`}
                         data-testid="comparison-source-viewport"
+                        style={{ aspectRatio: `${comparisonViewportAspectRatio}` }}
                         onPointerDown={handleComparisonViewportPointerDown}
                         onPointerMove={handleComparisonViewportPointerMove}
+                        onPointerUp={handleComparisonViewportPointerUp}
+                        onPointerCancel={handleComparisonViewportPointerCancel}
+                        onLostPointerCapture={handleComparisonViewportLostPointerCapture}
+                        onWheel={handleComparisonViewportWheel}
                       >
                         <video
                           key={comparisonSourcePreviewSrc || comparisonSourcePreviewPath}
                           ref={setComparisonSourceVideoRef}
                           className="inspection-video"
+                          crossOrigin="anonymous"
                           muted
                           playsInline
                           preload="auto"
@@ -4734,15 +5320,21 @@ export default function App() {
                             <span className="catalog-chip">Blind sample</span>
                           </div>
                           <div
-                            className="inspection-viewport comparison-workspace-viewport"
+                            className={`inspection-viewport comparison-workspace-viewport${isComparisonPanning ? " is-panning" : " is-pannable"}`}
                             data-testid={`comparison-sample-viewport-${entry.sampleId}`}
+                            style={{ aspectRatio: `${comparisonViewportAspectRatio}` }}
                             onPointerDown={handleComparisonViewportPointerDown}
                             onPointerMove={handleComparisonViewportPointerMove}
+                            onPointerUp={handleComparisonViewportPointerUp}
+                            onPointerCancel={handleComparisonViewportPointerCancel}
+                            onLostPointerCapture={handleComparisonViewportLostPointerCapture}
+                            onWheel={handleComparisonViewportWheel}
                           >
                             <video
                               key={comparisonPreviewSrc || entry.sampleId}
                               ref={(node) => setComparisonSampleVideoRef(entry.sampleId, node)}
                               className="inspection-video"
+                              crossOrigin="anonymous"
                               muted
                               playsInline
                               preload="auto"
@@ -5234,6 +5826,217 @@ export default function App() {
         </div>
       </section>
       </>
+      ) : null}
+
+      {isComparisonOnlyView ? (
+        comparisonEntries.length > 0 && source ? (
+          <section className="comparison-workspace-shell-host comparison-workspace-shell-host-standalone" aria-label="Comparison workspace">
+            <div className="comparison-workspace-shell comparison-workspace-shell-standalone" data-testid="comparison-workspace-window" style={comparisonWorkspaceShellStyle} onWheel={handleComparisonWorkspaceWheel}>
+              <div className="comparison-workspace-header">
+                <div className="catalog-card-header">
+                  <strong>Comparison Workspace</strong>
+                  <span className="catalog-chip">Source plus {comparisonEntries.length} blind samples</span>
+                </div>
+              </div>
+              <div className="inspector-controls-grid comparison-workspace-controls">
+                <button type="button" className="action-button secondary-button" data-testid="comparison-play-toggle" onClick={() => void toggleComparisonPlayback()}>
+                  {comparisonPlaying ? "Pause Comparison" : "Play Comparison"}
+                </button>
+                <button type="button" className="action-button secondary-button" data-testid="comparison-restart-button" onClick={restartComparisonPlayback}>
+                  Restart Comparison
+                </button>
+                <button type="button" className="action-button secondary-button" data-testid="open-source-external-button" onClick={() => void openMediaInDefaultApp(source.path)}>
+                  Open Source Externally
+                </button>
+              </div>
+              <label>
+                Comparison Timeline
+                <span className="summary comparison-ready-note" data-testid="comparison-timeline-readout">
+                  {comparisonFrameCount > 0
+                    ? `Frame ${comparisonCurrentFrame.toLocaleString()} / ${comparisonTimelineMax.toLocaleString()}`
+                    : `${comparisonCurrentTime.toFixed(2)}s`}
+                </span>
+                <input
+                  data-testid="comparison-time-slider"
+                  type="range"
+                  min={0}
+                  max={comparisonFrameCount > 0 ? comparisonTimelineMax : Math.max(comparisonDuration, 0.01)}
+                  step={comparisonFrameCount > 0 ? 1 : 0.01}
+                  value={comparisonFrameCount > 0 ? comparisonCurrentFrame : Math.min(comparisonCurrentTime, Math.max(comparisonDuration, 0.01))}
+                  onPointerDown={seekComparisonTimelineFromPointer}
+                  onInput={(event) => handleComparisonTimelineInput(Number((event.target as HTMLInputElement).value))}
+                  onChange={(event) => handleComparisonTimelineInput(Number(event.target.value))}
+                />
+              </label>
+              <div className="comparison-toolbar-grid">
+                <label>
+                  Pane Size
+                  <span className="summary comparison-toolbar-readout" data-testid="comparison-pane-zoom-readout">{comparisonPaneZoom.toFixed(2)}x</span>
+                  <input data-testid="comparison-pane-zoom-slider" type="range" min={1} max={2} step={0.05} value={comparisonPaneZoom} onChange={(event) => setComparisonPaneZoom(Number(event.target.value))} />
+                </label>
+                <label>
+                  Content Zoom
+                  <span className="summary comparison-toolbar-readout" data-testid="comparison-zoom-readout">{comparisonZoom.toFixed(2)}x</span>
+                  <input data-testid="comparison-zoom-slider" type="range" min={1} max={48} step={0.25} value={comparisonZoom} onChange={(event) => setComparisonZoom(Number(event.target.value))} />
+                </label>
+                <label>
+                  Horizontal Focus
+                  <input
+                    data-testid="comparison-focus-x-slider"
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={comparisonFocusX}
+                    onChange={(event) => {
+                      setComparisonFocusPresetId("manual");
+                      setComparisonFocusX(Number(event.target.value));
+                    }}
+                  />
+                </label>
+                <label>
+                  Vertical Focus
+                  <input
+                    data-testid="comparison-focus-y-slider"
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={comparisonFocusY}
+                    onChange={(event) => {
+                      setComparisonFocusPresetId("manual");
+                      setComparisonFocusY(Number(event.target.value));
+                    }}
+                  />
+                </label>
+              </div>
+              <div className="inspector-focus-row">
+                {comparisonFocusPresets.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    className={`inspector-focus-button${preset.id === comparisonFocusPresetId ? " inspector-focus-button-active" : ""}`}
+                    data-testid={`comparison-focus-${preset.id}`}
+                    onClick={() => setComparisonFocusPresetId(preset.id)}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+              <p className="summary comparison-hint" data-testid="comparison-focus-hint">
+                {`${selectedComparisonPreset?.hint ?? "Move around the frame and inspect every sample against the source."} Use Shift plus wheel to resize the comparison panes, Ctrl plus wheel over a viewport to zoom the video content, and drag to pan.`}
+              </p>
+              <div className="comparison-inspector-grid comparison-workspace-grid">
+                <article className="comparison-inspector-card comparison-workspace-card">
+                  <div className="catalog-card-header">
+                    <strong>Source</strong>
+                    <span className="catalog-chip">Reference</span>
+                  </div>
+                  <div
+                    className={`inspection-viewport comparison-workspace-viewport${isComparisonPanning ? " is-panning" : " is-pannable"}`}
+                    data-testid="comparison-source-viewport"
+                    style={{ aspectRatio: `${comparisonViewportAspectRatio}` }}
+                    onPointerDown={handleComparisonViewportPointerDown}
+                    onPointerMove={handleComparisonViewportPointerMove}
+                    onPointerUp={handleComparisonViewportPointerUp}
+                    onPointerCancel={handleComparisonViewportPointerCancel}
+                    onLostPointerCapture={handleComparisonViewportLostPointerCapture}
+                    onWheel={handleComparisonViewportWheel}
+                  >
+                    <video
+                      key={comparisonSourcePreviewSrc || comparisonSourcePreviewPath}
+                      ref={setComparisonSourceVideoRef}
+                      className="inspection-video"
+                      crossOrigin="anonymous"
+                      muted
+                      playsInline
+                      preload="auto"
+                      onLoadedMetadata={handleComparisonLoadedMetadata}
+                      onLoadedData={handleComparisonLoadedMetadata}
+                      onTimeUpdate={handleComparisonSourceTimeUpdate}
+                      onPause={() => setComparisonPlaying(false)}
+                      onPlay={() => setComparisonPlaying(true)}
+                      style={{ transform: `scale(${comparisonZoom})`, transformOrigin: `${comparisonFocusX}% ${comparisonFocusY}%` }}
+                    >
+                      {comparisonSourcePreviewSrc ? <source src={comparisonSourcePreviewSrc} type={comparisonSourcePreviewMimeType} /> : null}
+                    </video>
+                    <span className="inspection-crosshair" />
+                  </div>
+                </article>
+                {comparisonEntries.map((entry) => {
+                  const actualModel = getModelDefinition(entry.modelId);
+                  const actualBackend = getBackendDefinition(actualModel.backendId);
+                  const isWinner = blindComparison?.selectedSampleId === entry.sampleId;
+                  const previewPath = entry.status.result?.outputPath ?? "";
+                  const comparisonPreviewSrc = resolvedComparisonPreviewUrls[entry.sampleId] ?? desktopApi.toPreviewSrc(previewPath);
+                  const comparisonPreviewMimeType = previewMimeType(previewPath);
+                  return (
+                    <article key={entry.sampleId} className="comparison-inspector-card comparison-workspace-card" data-testid={`comparison-workspace-card-${entry.sampleId}`}>
+                      <div className="catalog-card-header">
+                        <strong>{entry.anonymousLabel}</strong>
+                        <span className="catalog-chip">Blind sample</span>
+                      </div>
+                      <div
+                        className={`inspection-viewport comparison-workspace-viewport${isComparisonPanning ? " is-panning" : " is-pannable"}`}
+                        data-testid={`comparison-sample-viewport-${entry.sampleId}`}
+                        style={{ aspectRatio: `${comparisonViewportAspectRatio}` }}
+                        onPointerDown={handleComparisonViewportPointerDown}
+                        onPointerMove={handleComparisonViewportPointerMove}
+                        onPointerUp={handleComparisonViewportPointerUp}
+                        onPointerCancel={handleComparisonViewportPointerCancel}
+                        onLostPointerCapture={handleComparisonViewportLostPointerCapture}
+                        onWheel={handleComparisonViewportWheel}
+                      >
+                        <video
+                          key={comparisonPreviewSrc || entry.sampleId}
+                          ref={(node) => setComparisonSampleVideoRef(entry.sampleId, node)}
+                          className="inspection-video"
+                          crossOrigin="anonymous"
+                          muted
+                          playsInline
+                          preload="auto"
+                          onLoadedMetadata={handleComparisonLoadedMetadata}
+                          onLoadedData={handleComparisonLoadedMetadata}
+                          style={{ transform: `scale(${comparisonZoom})`, transformOrigin: `${comparisonFocusX}% ${comparisonFocusY}%` }}
+                        >
+                          {comparisonPreviewSrc ? <source src={comparisonPreviewSrc} type={comparisonPreviewMimeType} /> : null}
+                        </video>
+                        <span className="inspection-crosshair" />
+                      </div>
+                      <div className="comparison-workspace-card-actions">
+                        <button type="button" className="action-button secondary-button" data-testid={`comparison-open-external-${entry.sampleId}`} onClick={() => void openMediaInDefaultApp(entry.status.result?.outputPath ?? "") }>
+                          Open Externally
+                        </button>
+                        {blindComparison?.state === "ready" && !blindComparison.revealed ? (
+                          <button type="button" className="action-button secondary-button" data-testid={`comparison-pick-${entry.sampleId}`} onClick={() => void chooseBlindWinner(entry.sampleId)}>
+                            Pick {entry.anonymousLabel}
+                          </button>
+                        ) : null}
+                        {blindComparison?.revealed ? (
+                          <div className="blind-reveal-block" data-testid={`comparison-workspace-reveal-${entry.sampleId}`}>
+                            <strong>{actualModel.label}</strong>
+                            <span>{actualBackend.label}</span>
+                            {isWinner ? <span className="winner-pill">Selected winner</span> : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            </div>
+          </section>
+        ) : (
+          <section className="comparison-workspace-shell-host comparison-workspace-shell-host-standalone" aria-label="Comparison workspace">
+            <div className="comparison-workspace-shell comparison-workspace-shell-standalone comparison-workspace-shell-empty" data-testid="comparison-workspace-empty">
+              <div className="catalog-card-header">
+                <strong>Comparison Workspace</strong>
+                <span className="catalog-chip">Waiting for a blind comparison run</span>
+              </div>
+              <p className="summary">Open a blind comparison from the main window first. The detached comparison view will rebuild the same source and sample set from shared workspace state.</p>
+            </div>
+          </section>
+        )
       ) : null}
 
       {isJobsOnlyView || isCleanupPanelOpen ? (

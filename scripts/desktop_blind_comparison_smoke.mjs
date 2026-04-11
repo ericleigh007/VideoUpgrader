@@ -4,6 +4,12 @@ import path from 'node:path';
 const sourcePath = process.env.REAL_SOURCE_PATH;
 const cdpUrl = process.env.CDP_URL ?? 'http://127.0.0.1:9223';
 const timeoutMs = Number.parseInt(process.env.RUN_TIMEOUT_MS ?? '1800000', 10);
+const previewDurationSeconds = Number.parseInt(process.env.BLIND_PREVIEW_DURATION_SECONDS ?? '1', 10);
+const comparisonStartOffsetSeconds = Number.parseFloat(process.env.COMPARISON_START_OFFSET_SECONDS ?? '3.2');
+const assertFlashAlignment = /^(1|true|yes)$/i.test(process.env.EXPECT_FLASH_ALIGNMENT ?? '');
+const avSyncFps = Number.parseFloat(process.env.AV_SYNC_FPS ?? '30');
+const avSyncFlashIntervalSeconds = Number.parseFloat(process.env.AV_SYNC_FLASH_INTERVAL_SECONDS ?? '1');
+const avSyncFlashDurationSeconds = Number.parseFloat(process.env.AV_SYNC_FLASH_DURATION_SECONDS ?? '0.08');
 
 if (!sourcePath) {
   throw new Error('REAL_SOURCE_PATH is required');
@@ -20,6 +26,13 @@ function logStep(step, expectation, extra) {
     ...(extra ? { extra } : {}),
   };
   console.log(JSON.stringify(payload));
+}
+
+function formatClockLabel(seconds) {
+  const totalSeconds = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainingSeconds = totalSeconds % 60;
+  return `${minutes}:${String(remainingSeconds).padStart(2, '0')}`;
 }
 
 async function openPanelIfCollapsed(page, workspaceTestId, toggleTestId) {
@@ -100,6 +113,77 @@ async function captureComparisonPlaybackSnapshot(page) {
       sampleB: readVideo('[data-testid="comparison-sample-viewport-sample-2"] video'),
     };
   });
+}
+
+async function captureComparisonFrameBrightness(page) {
+  return page.evaluate(() => {
+    const readBrightness = (video) => {
+      if (!(video instanceof HTMLVideoElement) || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.videoWidth <= 0 || video.videoHeight <= 0) {
+        return null;
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = 48;
+      canvas.height = 27;
+      const context = canvas.getContext('2d', { willReadFrequently: true });
+      if (!context) {
+        return null;
+      }
+
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      let totalLuma = 0;
+      for (let index = 0; index < pixels.length; index += 4) {
+        totalLuma += (pixels[index] * 0.299) + (pixels[index + 1] * 0.587) + (pixels[index + 2] * 0.114);
+      }
+      return totalLuma / (pixels.length / 4);
+    };
+
+    const sourceVideo = document.querySelector('[data-testid="comparison-source-viewport"] video');
+    const sampleVideos = Array.from(document.querySelectorAll('[data-testid^="comparison-sample-viewport-"] video'));
+
+    return {
+      source: readBrightness(sourceVideo),
+      samples: sampleVideos.map((video, index) => ({
+        index,
+        brightness: readBrightness(video),
+      })),
+    };
+  });
+}
+
+function expectedFlashStateAtLogicalTime(logicalTimeSeconds) {
+  const absoluteTimeSeconds = logicalTimeSeconds + comparisonStartOffsetSeconds;
+  const normalizedTime = ((absoluteTimeSeconds % avSyncFlashIntervalSeconds) + avSyncFlashIntervalSeconds) % avSyncFlashIntervalSeconds;
+  return normalizedTime <= avSyncFlashDurationSeconds;
+}
+
+async function verifyFlashAlignment(page) {
+  const flashCheckpoints = [0.04, 0.35, 1.04, 1.35, 2.04, 2.35]
+    .filter((time) => time < Math.max(0.1, previewDurationSeconds - 0.02));
+
+  for (const logicalTimeSeconds of flashCheckpoints) {
+    const targetFrame = Math.max(0, Math.round(logicalTimeSeconds * avSyncFps));
+    await seekComparisonTimeline(page, targetFrame);
+    await page.waitForTimeout(120);
+
+    const brightness = await captureComparisonFrameBrightness(page);
+    const values = [brightness.source, ...brightness.samples.map((sample) => sample.brightness)].filter((value) => typeof value === 'number');
+    if (values.length < 3) {
+      throw new Error(`Could not read enough comparison frame brightness values: ${JSON.stringify({ logicalTimeSeconds, brightness })}`);
+    }
+
+    const expectedFlash = expectedFlashStateAtLogicalTime(logicalTimeSeconds);
+    const minimum = Math.min(...values);
+    const maximum = Math.max(...values);
+    if (expectedFlash) {
+      if (minimum < 160 || (maximum - minimum) > 45) {
+        throw new Error(`Flash alignment check failed for bright frame: ${JSON.stringify({ logicalTimeSeconds, brightness, minimum, maximum })}`);
+      }
+    } else if (maximum > 80 || (maximum - minimum) > 35) {
+      throw new Error(`Flash alignment check failed for dark frame: ${JSON.stringify({ logicalTimeSeconds, brightness, minimum, maximum })}`);
+    }
+  }
 }
 
 async function waitForComparisonMediaReady(page, timeout = 30000) {
@@ -195,6 +279,19 @@ async function getDesktopPage(context, timeout = 15000) {
   return page;
 }
 
+async function getComparisonPage(context, timeout = 15000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const comparisonPage = context.pages().find((candidate) => candidate.url().includes('localhost:1420') && candidate.url().includes('view=comparison'));
+    if (comparisonPage) {
+      return comparisonPage;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  throw new Error('Could not find the detached comparison webview target');
+}
+
 async function withDesktopPage(context, action, timeout = 30000) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const page = await getDesktopPage(context, timeout);
@@ -263,9 +360,9 @@ async function main() {
     if (!(await previewCheckbox.isChecked())) {
       await previewCheckbox.check();
     }
-    await page.getByTestId('preview-duration-input').fill('1');
+    await page.getByTestId('preview-duration-input').fill(String(previewDurationSeconds));
     await openPanelIfCollapsed(page, 'blind-comparison-panel', 'blind-test-panel-toggle');
-    await expect(page.getByTestId('blind-comparison-panel')).toContainText('1s preview exports');
+    await expect(page.getByTestId('blind-comparison-panel')).toContainText(`${previewDurationSeconds}s preview exports`);
 
     logStep(
       'Capturing a non-zero comparison start offset',
@@ -280,16 +377,16 @@ async function main() {
       }),
       { timeout: 30000 },
     ).toBeGreaterThan(1);
-    await page.getByTestId('source-preview-seek').evaluate((element) => {
+    await page.getByTestId('source-preview-seek').evaluate((element, targetSeconds) => {
       if (!(element instanceof HTMLInputElement)) {
         throw new Error('Source preview seek slider is unavailable');
       }
-      element.value = '2.2';
+      element.value = String(targetSeconds);
       element.dispatchEvent(new Event('input', { bubbles: true }));
       element.dispatchEvent(new Event('change', { bubbles: true }));
-    });
+    }, comparisonStartOffsetSeconds);
     await page.getByTestId('blind-capture-current-preview-position').click();
-    await expect(page.getByTestId('blind-start-offset-readout')).toContainText('0:02');
+    await expect(page.getByTestId('blind-start-offset-readout')).toContainText(formatClockLabel(comparisonStartOffsetSeconds));
 
     logStep(
       'Starting the blind comparison',
@@ -344,27 +441,48 @@ async function main() {
     await expect(page.getByTestId('comparison-inspector')).toBeVisible();
     await expect(page.locator('[data-testid^="blind-reveal-"]')).toHaveCount(0);
     await page.getByTestId('open-comparison-workspace-button').click();
-    await expect(page.getByTestId('comparison-workspace-modal')).toBeVisible();
-    await page.getByTestId('comparison-focus-diagonals').click();
-    await page.getByTestId('comparison-zoom-slider').fill('4');
-    await expect(page.getByTestId('comparison-focus-hint')).toContainText(/diagonal|corners|eyes|texture/i);
-    await waitForComparisonMediaReady(page);
+    let comparisonPage = null;
+    const inlineModalVisible = await page.getByTestId('comparison-workspace-modal').isVisible().catch(() => false);
+    if (inlineModalVisible) {
+      comparisonPage = page;
+    } else {
+      comparisonPage = await getComparisonPage(context, 30000);
+      await comparisonPage.bringToFront();
+      await expect(comparisonPage.getByTestId('comparison-workspace-window')).toBeVisible();
+    }
+    await comparisonPage.getByTestId('comparison-focus-diagonals').click();
+    await comparisonPage.getByTestId('comparison-zoom-slider').fill('4');
+    await expect(comparisonPage.getByTestId('comparison-focus-hint')).toContainText(/diagonal|corners|eyes|texture/i);
+    await waitForComparisonMediaReady(comparisonPage);
 
     logStep(
       'Scrubbing the comparison timeline',
       'The frame slider should move to a mid-range frame and the source and samples should all land on roughly the same playback time.',
     );
-    const targetFrame = await page.getByTestId('comparison-time-slider').evaluate((element) => {
+    const targetFrame = await comparisonPage.getByTestId('comparison-time-slider').evaluate((element) => {
       const sliderMax = Number(element.max || '0');
       return Math.min(Math.max(1, Math.floor(sliderMax / 2)), sliderMax);
     });
-    await seekComparisonTimeline(page, targetFrame);
-    const scrubbedSnapshot = await captureComparisonPlaybackSnapshot(page);
+    await seekComparisonTimeline(comparisonPage, targetFrame);
+    const scrubbedSnapshot = await captureComparisonPlaybackSnapshot(comparisonPage);
     if (!scrubbedSnapshot.source || !scrubbedSnapshot.sampleA) {
       throw new Error(`Comparison players were not available after scrub: ${JSON.stringify(scrubbedSnapshot)}`);
     }
-    if (Math.abs((scrubbedSnapshot.source.currentTime ?? 0) - (scrubbedSnapshot.sampleA.currentTime ?? 0)) > 0.15) {
-      throw new Error(`Comparison scrub did not keep players aligned: ${JSON.stringify(scrubbedSnapshot)}`);
+    const scrubOffsetDelta = Math.abs(
+      ((scrubbedSnapshot.source.currentTime ?? 0) - (scrubbedSnapshot.sampleA.currentTime ?? 0))
+      - comparisonStartOffsetSeconds,
+    );
+    if (scrubOffsetDelta > 0.2) {
+      throw new Error(`Comparison scrub did not keep the source offset aligned: ${JSON.stringify({ scrubbedSnapshot, comparisonStartOffsetSeconds, scrubOffsetDelta })}`);
+    }
+
+    if (assertFlashAlignment) {
+      logStep(
+        'Checking synthetic flash alignment',
+        'A time-coded synthetic source should show the same bright and dark states across the source and every comparison sample at the same logical frames.',
+        { previewDurationSeconds, comparisonStartOffsetSeconds, avSyncFps, avSyncFlashIntervalSeconds, avSyncFlashDurationSeconds },
+      );
+      await verifyFlashAlignment(comparisonPage);
     }
 
     logStep(
@@ -372,11 +490,11 @@ async function main() {
       'Play should advance all players together and pause should leave them stopped on the same frame neighborhood.',
       scrubbedSnapshot,
     );
-    await page.getByTestId('comparison-play-toggle').click();
+    await comparisonPage.getByTestId('comparison-play-toggle').click();
     const playbackStartedAt = Date.now();
-    let playingSnapshot = await captureComparisonPlaybackSnapshot(page);
+    let playingSnapshot = await captureComparisonPlaybackSnapshot(comparisonPage);
     while (Date.now() - playbackStartedAt < 700) {
-      playingSnapshot = await captureComparisonPlaybackSnapshot(page);
+      playingSnapshot = await captureComparisonPlaybackSnapshot(comparisonPage);
       if (playingSnapshot.source && playingSnapshot.sampleA) {
         const sourceAdvanced = (playingSnapshot.source.currentTime ?? 0) > ((scrubbedSnapshot.source?.currentTime ?? 0) + 0.05);
         const sampleAdvanced = (playingSnapshot.sampleA.currentTime ?? 0) > ((scrubbedSnapshot.sampleA?.currentTime ?? 0) + 0.05);
@@ -385,7 +503,7 @@ async function main() {
         }
       }
 
-      await page.waitForTimeout(75);
+      await comparisonPage.waitForTimeout(75);
     }
     if (!playingSnapshot.source || !playingSnapshot.sampleA) {
       throw new Error(`Comparison players were not available during playback: ${JSON.stringify(playingSnapshot)}`);
@@ -393,30 +511,42 @@ async function main() {
     if (playingSnapshot.source.paused || playingSnapshot.sampleA.paused) {
       throw new Error(`Comparison playback did not start across players: ${JSON.stringify(playingSnapshot)}`);
     }
-    await page.getByTestId('comparison-play-toggle').click();
-    const pausedSnapshot = await captureComparisonPlaybackSnapshot(page);
+    await comparisonPage.getByTestId('comparison-play-toggle').click();
+    const pausedSnapshot = await captureComparisonPlaybackSnapshot(comparisonPage);
     if (!pausedSnapshot.source || !pausedSnapshot.sampleA) {
       throw new Error(`Comparison players were not available after pause: ${JSON.stringify(pausedSnapshot)}`);
     }
     if (!pausedSnapshot.source.paused || !pausedSnapshot.sampleA.paused) {
       throw new Error(`Comparison playback did not pause across players: ${JSON.stringify(pausedSnapshot)}`);
     }
-    if (Math.abs((pausedSnapshot.source.currentTime ?? 0) - (pausedSnapshot.sampleA.currentTime ?? 0)) > 0.2) {
-      throw new Error(`Comparison pause left players out of sync: ${JSON.stringify(pausedSnapshot)}`);
+    const pauseOffsetDelta = Math.abs(
+      ((pausedSnapshot.source.currentTime ?? 0) - (pausedSnapshot.sampleA.currentTime ?? 0))
+      - comparisonStartOffsetSeconds,
+    );
+    if (pauseOffsetDelta > 0.25) {
+      throw new Error(`Comparison pause left players out of sync: ${JSON.stringify({ pausedSnapshot, comparisonStartOffsetSeconds, pauseOffsetDelta })}`);
     }
 
     logStep(
       'Picking a blind winner',
       'Reveal badges should stay hidden before the click, then all four samples should reveal their true models and exactly one should show Selected winner.',
     );
-    await page.getByTestId('comparison-pick-sample-1').click();
-    await expect(page.locator('[data-testid^="blind-reveal-"]')).toHaveCount(4, { timeout: 30000 });
-    await expect(page.getByTestId('comparison-workspace-reveal-sample-1')).toContainText('Selected winner', { timeout: 30000 });
+    await comparisonPage.getByTestId('comparison-pick-sample-1').click();
+    await expect(comparisonPage.getByTestId('comparison-workspace-reveal-sample-1')).toContainText('Selected winner', { timeout: 30000 });
 
     const finalConfig = await getAppConfig(page);
     const finalBlindPickCount = Array.isArray(finalConfig?.blindComparisons) ? finalConfig.blindComparisons.length : initialBlindPickCount;
     const latestBlindPick = Array.isArray(finalConfig?.blindComparisons) ? finalConfig.blindComparisons.at(-1) ?? null : null;
     const finalSnapshot = await snapshotBlindPanel(page);
+    const mainRevealSyncReached = await expect
+      .poll(async () => await page.locator('[data-testid^="blind-reveal-"]').count(), { timeout: 10000 })
+      .toBe(4)
+      .then(() => true)
+      .catch(() => false);
+
+    if (!mainRevealSyncReached) {
+      throw new Error(`Detached winner reveal did not propagate back to the main window: ${JSON.stringify(finalSnapshot)}`);
+    }
 
     if (finalBlindPickCount < initialBlindPickCount + 1) {
       throw new Error(`Blind comparison winner was not persisted: ${JSON.stringify({ initialBlindPickCount, finalBlindPickCount, finalSnapshot })}`);
@@ -432,6 +562,8 @@ async function main() {
       finalBlindPickCount,
       blindPickDelta: finalBlindPickCount - initialBlindPickCount,
       previewStartOffsetSeconds: latestBlindPick.previewStartOffsetSeconds,
+      previewDurationSeconds,
+      mainRevealSyncReached,
       finalSnapshot,
     }, null, 2));
 }
