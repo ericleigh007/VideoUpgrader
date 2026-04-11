@@ -204,7 +204,7 @@ function Ensure-UpscalerSystemDependencies {
 
     Refresh-ProcessPath
     $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
-    if (Test-Path $cargoBin -and -not (($env:Path -split ";") -contains $cargoBin)) {
+    if ((Test-Path $cargoBin) -and -not (($env:Path -split ";") -contains $cargoBin)) {
         $env:Path = "$cargoBin;$env:Path"
     }
 }
