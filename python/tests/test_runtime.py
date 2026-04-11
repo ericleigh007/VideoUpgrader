@@ -3,11 +3,12 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from upscaler_worker.runtime import ensure_runtime_assets, ensure_rvrt_model_weights, ensure_rvrt_repo
+from upscaler_worker.runtime import download_file_with_retries, ensure_runtime_assets, ensure_rvrt_model_weights, ensure_rvrt_repo
 
 
 class RuntimeStatusTests(unittest.TestCase):
@@ -83,6 +84,29 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertTrue((temp_root / "tmp" / "RVRT" / "main_test_rvrt.py").exists())
             self.assertTrue((temp_root / "tmp" / "RVRT" / "requirements.txt").exists())
             self.assertEqual(result["rvrtRoot"], str(temp_root / "tmp" / "RVRT"))
+
+    def test_download_file_with_retries_retries_transient_http_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "download.bin"
+            attempts: list[int] = []
+
+            def flaky_urlretrieve(_url: str, target: Path) -> tuple[str, object]:
+                attempts.append(len(attempts))
+                if len(attempts) < 3:
+                    raise urllib.error.HTTPError("https://example.invalid/model.bin", 502, "Bad Gateway", hdrs=None, fp=None)
+                Path(target).write_bytes(b"ok")
+                return str(target), None
+
+            with patch("upscaler_worker.runtime.urllib.request.urlretrieve", side_effect=flaky_urlretrieve), patch(
+                "upscaler_worker.runtime.time.sleep",
+                return_value=None,
+            ):
+                result = download_file_with_retries("https://example.invalid/model.bin", destination)
+
+            self.assertEqual(result, destination)
+            self.assertTrue(destination.exists())
+            self.assertEqual(destination.read_bytes(), b"ok")
+            self.assertEqual(len(attempts), 3)
 
 
 if __name__ == "__main__":

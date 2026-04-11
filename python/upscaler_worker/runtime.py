@@ -5,6 +5,8 @@ import shutil
 import os
 import re
 import subprocess
+import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -27,6 +29,9 @@ RIFE_ZIP_URL = (
     "rife-ncnn-vulkan-20221029-windows.zip"
 )
 GPU_LINE_PATTERN = re.compile(r"^\[(\d+)\s+([^\]]+)\]")
+TRANSIENT_DOWNLOAD_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+DOWNLOAD_RETRY_ATTEMPTS = 4
+DOWNLOAD_RETRY_BASE_DELAY_SECONDS = 1.0
 
 
 def repo_root() -> Path:
@@ -37,12 +42,38 @@ def runtime_root() -> Path:
     return repo_root() / "artifacts" / "runtime"
 
 
-def _download_file(url: str, destination: Path) -> Path:
+def _is_transient_download_error(error: BaseException) -> bool:
+    if isinstance(error, urllib.error.HTTPError):
+        return int(getattr(error, "code", 0)) in TRANSIENT_DOWNLOAD_STATUS_CODES
+    return isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, OSError))
+
+
+def download_file_with_retries(url: str, destination: Path, *, attempts: int = DOWNLOAD_RETRY_ATTEMPTS) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial_path = destination.with_suffix(destination.suffix + ".part")
-    urllib.request.urlretrieve(url, partial_path)
-    partial_path.replace(destination)
-    return destination
+    last_error: BaseException | None = None
+
+    for attempt_index in range(max(1, attempts)):
+        partial_path.unlink(missing_ok=True)
+        try:
+            urllib.request.urlretrieve(url, partial_path)
+            partial_path.replace(destination)
+            return destination
+        except BaseException as error:
+            last_error = error
+            partial_path.unlink(missing_ok=True)
+            is_last_attempt = attempt_index >= max(1, attempts) - 1
+            if is_last_attempt or not _is_transient_download_error(error):
+                raise
+            time.sleep(DOWNLOAD_RETRY_BASE_DELAY_SECONDS * (attempt_index + 1))
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Could not download {url}")
+
+
+def _download_file(url: str, destination: Path) -> Path:
+    return download_file_with_retries(url, destination)
 
 
 def _extract_archive_with_optional_root_strip(archive_path: Path, destination: Path) -> None:

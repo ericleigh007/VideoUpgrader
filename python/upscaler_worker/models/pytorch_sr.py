@@ -13,7 +13,7 @@ from spandrel import ImageModelDescriptor, ModelLoader
 
 from upscaler_worker.model_catalog import ensure_runnable_model, model_label, model_runtime_asset
 from upscaler_worker.precision import resolve_precision_mode
-from upscaler_worker.runtime import runtime_root
+from upscaler_worker.runtime import download_file_with_retries, runtime_root
 
 
 MODEL_TILE_OVERLAP = 32
@@ -62,9 +62,7 @@ def ensure_model_checkpoint(model_id: str) -> Path:
         return checkpoint_path
 
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    partial_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".part")
-    urllib.request.urlretrieve(download_url, partial_path)
-    partial_path.replace(checkpoint_path)
+    download_file_with_retries(download_url, checkpoint_path)
     return checkpoint_path
 
 
