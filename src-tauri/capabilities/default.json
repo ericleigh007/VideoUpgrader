@@ -2,9 +2,13 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default capabilities for the Upscaler desktop window.",
-  "windows": ["main"],
+  "windows": ["main", "jobs"],
   "permissions": [
     "core:default",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-create",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
     "dialog:allow-open",
     "dialog:allow-save"
   ]

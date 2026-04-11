@@ -6,10 +6,23 @@ from pathlib import Path
 from unittest.mock import patch
 
 from upscaler_worker.interpolation import resolve_segment_output_frame_count
-from upscaler_worker.pipeline import PipelineSegment, _plan_interpolation_segments, run_realesrgan_pipeline
+from upscaler_worker.pipeline import (
+    PipelineProgressState,
+    PipelineSegment,
+    _plan_interpolation_segments,
+    _should_publish_stage_progress,
+    run_realesrgan_pipeline,
+)
 
 
 class InterpolationPipelineTests(unittest.TestCase):
+    def test_extracting_progress_is_suppressed_after_downstream_stage_starts(self) -> None:
+        progress_state = PipelineProgressState(extracted_frames=2396, upscaled_frames=128)
+
+        self.assertFalse(_should_publish_stage_progress("extracting", progress_state))
+        self.assertTrue(_should_publish_stage_progress("upscaling", progress_state))
+        self.assertTrue(_should_publish_stage_progress("encoding", progress_state))
+
     def test_plan_interpolation_segments_adds_boundary_overlap_and_trim_windows(self) -> None:
         segments = [
             PipelineSegment(index=0, start_frame=0, frame_count=240, start_seconds=0.0, duration_seconds=10.0),
@@ -34,6 +47,93 @@ class InterpolationPipelineTests(unittest.TestCase):
         self.assertEqual(plans[1].overlap_after_frames, 0)
         self.assertEqual(plans[1].output_start_frame, 2)
         self.assertEqual(plans[1].output_frame_count, 150)
+
+    @patch("upscaler_worker.pipeline._run_ffmpeg_with_frame_progress", side_effect=[(12, 12), (12, 12)])
+    @patch("upscaler_worker.pipeline.probe_video")
+    @patch("upscaler_worker.pipeline.ensure_runtime_assets")
+    @patch("upscaler_worker.pipeline.model_backend_id", return_value="realesrgan-ncnn")
+    @patch("upscaler_worker.pipeline.ensure_runnable_model")
+    @patch("upscaler_worker.pipeline._resolve_video_encoder_config")
+    @patch("upscaler_worker.pipeline._extract_segment_frames", return_value=12)
+    @patch("upscaler_worker.pipeline._upscale_ncnn_segment", return_value=12)
+    @patch("upscaler_worker.pipeline._encode_segment_video", return_value=12)
+    def test_pipeline_uses_explicit_job_id_for_workdir(
+        self,
+        _encode_mock,
+        _upscale_mock,
+        _extract_mock,
+        resolve_video_encoder_config_mock,
+        _ensure_runnable_model_mock,
+        _model_backend_id_mock,
+        ensure_runtime_assets_mock,
+        probe_video_mock,
+        _ffmpeg_progress_mock,
+    ) -> None:
+        ensure_runtime_assets_mock.return_value = {
+            "ffmpegPath": "ffmpeg",
+            "realesrganPath": "realesrgan.exe",
+            "modelDir": "models/realesrgan",
+            "availableGpus": [],
+            "defaultGpuId": None,
+        }
+        resolve_video_encoder_config_mock.return_value = type(
+            "EncoderConfig",
+            (),
+            {"encoder": "libx264", "quality_args": (), "label": "software-cpu", "hardware_accelerated": False},
+        )()
+        probe_video_mock.return_value = {
+            "width": 320,
+            "height": 180,
+            "frameRate": 24.0,
+            "durationSeconds": 0.5,
+            "hasAudio": False,
+            "videoCodec": "h264",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            output_path = temp_root / "output.mp4"
+            progress_path = temp_root / "progress.json"
+
+            result = run_realesrgan_pipeline(
+                source_path="C:/fixtures/input.mp4",
+                model_id="realesrgan-x4plus",
+                output_mode="preserveAspect4k",
+                preset="qualityBalanced",
+                interpolation_mode="off",
+                interpolation_target_fps=None,
+                gpu_id=0,
+                aspect_ratio_preset="16:9",
+                custom_aspect_width=None,
+                custom_aspect_height=None,
+                resolution_basis="exact",
+                target_width=640,
+                target_height=360,
+                crop_left=None,
+                crop_top=None,
+                crop_width=None,
+                crop_height=None,
+                job_id="canonical-job-id",
+                progress_path=str(progress_path),
+                cancel_path=None,
+                preview_mode=True,
+                preview_duration_seconds=0.5,
+                segment_duration_seconds=None,
+                output_path=str(output_path),
+                codec="h264",
+                container="mp4",
+                tile_size=0,
+                fp16=False,
+                torch_compile_enabled=False,
+                crf=18,
+            )
+
+            self.assertTrue(str(result["workDir"]).endswith("job_canonical-job-id"))
+            progress_payload = json.loads(progress_path.read_text(encoding="utf-8"))
+            self.assertEqual(progress_payload["jobId"], "canonical-job-id")
+            self.assertEqual(progress_payload["sourcePath"], "C:/fixtures/input.mp4")
+            self.assertEqual(progress_payload["outputPath"], str(output_path))
+            self.assertTrue(str(progress_payload["scratchPath"]).endswith("job_canonical-job-id"))
 
     @patch("upscaler_worker.pipeline._run_ffmpeg_with_frame_progress", side_effect=[(750, 750), (750, 750)])
     @patch("upscaler_worker.pipeline._concat_segment_videos", return_value=750)
@@ -295,7 +395,7 @@ class InterpolationPipelineTests(unittest.TestCase):
             output_dir = kwargs["output_dir"]
             if "segment_0000" in str(output_dir):
                 return 603
-            overlap_verified["value"] = first_encode_started.is_set()
+            overlap_verified["value"] = first_encode_started.wait(timeout=2.0)
             second_segment_interpolation_started.set()
             return 153
 

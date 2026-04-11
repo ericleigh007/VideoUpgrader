@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 import re
 import shutil
 import subprocess
@@ -9,6 +10,9 @@ import zipfile
 from pathlib import Path
 
 import imageio_ffmpeg
+
+from upscaler_worker.model_catalog import model_catalog
+from upscaler_worker.models.pytorch_video_sr import resolve_external_video_sr_command_template
 
 
 REALESRGAN_ZIP_URL = (
@@ -161,15 +165,38 @@ def detect_available_gpus() -> tuple[list[dict[str, object]], int | None]:
     return devices, default_gpu_id
 
 
+def detect_external_research_runtimes() -> dict[str, object]:
+    statuses: dict[str, object] = {}
+    for model in model_catalog():
+        model_id = str(model.get("id", "")).strip()
+        research_runtime = model.get("researchRuntime")
+        if not model_id or not isinstance(research_runtime, dict):
+            continue
+        if str(research_runtime.get("kind", "")).strip() != "external-command":
+            continue
+
+        command_env_var = str(research_runtime.get("commandEnvVar", "")).strip()
+        command_template, command_source = resolve_external_video_sr_command_template(model_id, command_env_var)
+        statuses[model_id] = {
+            "kind": "external-command",
+            "commandEnvVar": command_env_var,
+            "configured": bool(command_template),
+            "source": command_source,
+        }
+    return statuses
+
+
 def ensure_runtime_assets() -> dict[str, object]:
     runtime_root().mkdir(parents=True, exist_ok=True)
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     realesrgan = ensure_realesrgan_runtime()
     available_gpus, default_gpu_id = detect_available_gpus()
+    external_research_runtimes = detect_external_research_runtimes()
     return {
         "ffmpegPath": str(ffmpeg_path),
         "realesrganPath": realesrgan["realesrganPath"],
         "modelDir": realesrgan["modelDir"],
         "availableGpus": available_gpus,
         "defaultGpuId": default_gpu_id,
+        "externalResearchRuntimes": external_research_runtimes,
     }

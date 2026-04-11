@@ -2,6 +2,7 @@ import unittest
 
 from upscaler_worker.model_catalog import (
     comparison_eligible_models,
+    ensure_benchmarkable_model,
     ensure_runnable_model,
     get_backend_definition,
     get_model_definition,
@@ -9,6 +10,7 @@ from upscaler_worker.model_catalog import (
     model_execution_status,
     model_loader,
     model_native_scale,
+    model_research_runtime,
     model_runtime_name,
     model_special_handling,
     top_rated_models,
@@ -27,6 +29,7 @@ class ModelCatalogTests(unittest.TestCase):
                 "realesrnet-x4plus",
                 "bsrgan-x4",
                 "swinir-realworld-x4",
+                "rvrt-x4",
             ],
         )
 
@@ -80,6 +83,16 @@ class ModelCatalogTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             ensure_runnable_model("hat-realhat-gan-x4")
+
+    def test_research_video_model_is_runnable_through_external_runner_contract(self) -> None:
+        self.assertEqual(model_execution_status("rvrt-x4"), "runnable")
+        self.assertEqual(ensure_runnable_model("rvrt-x4"), "rvrt-x4")
+        self.assertEqual(ensure_benchmarkable_model("rvrt-x4"), "rvrt-x4")
+        self.assertEqual(model_research_runtime("rvrt-x4")["commandEnvVar"], "UPSCALER_RVRT_COMMAND")
+
+    def test_non_research_planned_model_is_not_benchmarkable(self) -> None:
+        with self.assertRaises(ValueError):
+            ensure_benchmarkable_model("hat-realhat-gan-x4")
 
 
 if __name__ == "__main__":

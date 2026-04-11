@@ -7,14 +7,15 @@ import subprocess
 import threading
 from pathlib import Path
 
-from upscaler_worker.cancellation import JobCancelledError, cancellation_requested, ensure_not_cancelled, terminate_process
+from upscaler_worker.cancellation import JobCancelledError, cancellation_requested, ensure_not_cancelled, terminate_process, terminate_process_tree, wait_if_paused
 from upscaler_worker.runtime import ensure_runtime_assets
+from upscaler_worker.video_encoding import VideoEncoderConfig, probe_video_encoder, select_runtime_gpu
 
 
 PREVIEW_COMPATIBLE_CONTAINERS = {"mp4"}
 PREVIEW_CLIP_SECONDS = 30
 PREVIEW_MAX_WIDTH = 960
-FAST_MP4_VERSION = "fast-mp4-v1"
+FAST_MP4_VERSION = "fast-mp4-v2"
 STREAM_LINE_PATTERN = r"^\s*Stream\s+#\d+:\d+(?:\[[^\]]+\])?(?:\([^)]+\))?:\s*{kind}:\s+.+$"
 
 
@@ -43,13 +44,6 @@ def _converted_source_key(source_path: str) -> str:
 def _fast_mp4_output_path(source_path: str) -> Path:
     source = Path(source_path)
     return _converted_source_root() / f"{source.stem}_{_converted_source_key(source_path)}.mp4"
-
-
-def _prefers_nvidia_encoder(runtime: dict[str, object]) -> bool:
-    available_gpus = runtime.get("availableGpus", [])
-    if not isinstance(available_gpus, list):
-        return False
-    return any("nvidia" in str(device.get("name", "")).lower() for device in available_gpus if isinstance(device, dict))
 
 
 def _run_ffmpeg(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -139,6 +133,7 @@ def _run_ffmpeg_with_time_progress(
     *,
     progress_path: str | None,
     cancel_path: str | None,
+    pause_path: str | None,
     phase: str,
     duration_seconds: float,
     message_prefix: str,
@@ -196,11 +191,35 @@ def _run_ffmpeg_with_time_progress(
 
     try:
         while process.poll() is None:
+            wait_if_paused(
+                pause_path,
+                cancel_path=cancel_path,
+                process=process,
+                on_pause=lambda: _write_progress(
+                    progress_path,
+                    phase="paused",
+                    percent=min(99, int((state["processed_units"] / max(total_units, 1)) * 100)),
+                    message=f"Paused: {message_prefix} ({state['processed_units'] / 1000:.1f}s / {duration_seconds:.1f}s)",
+                    processed_frames=state["processed_units"],
+                    total_frames=total_units,
+                ),
+                on_resume=lambda: _write_progress(
+                    progress_path,
+                    phase=phase,
+                    percent=min(99, int((state["processed_units"] / max(total_units, 1)) * 100)),
+                    message=f"Resumed: {message_prefix} ({state['processed_units'] / 1000:.1f}s / {duration_seconds:.1f}s)",
+                    processed_frames=state["processed_units"],
+                    total_frames=total_units,
+                ),
+            )
             if cancellation_requested(cancel_path):
                 terminate_process(process)
                 raise JobCancelledError("Job cancelled by user")
             reader_thread.join(timeout=0.1)
         reader_thread.join(timeout=1)
+    except BaseException:
+        terminate_process_tree(process)
+        raise
     finally:
         if process.stdout:
             process.stdout.close()
@@ -211,9 +230,15 @@ def _run_ffmpeg_with_time_progress(
         raise RuntimeError(f"Command failed with exit code {return_code}: {' '.join(progress_command)}\n{output_text}")
 
 
-def convert_source_to_mp4(source_path: str, progress_path: str | None = None, cancel_path: str | None = None) -> dict[str, object]:
+def convert_source_to_mp4(
+    source_path: str,
+    progress_path: str | None = None,
+    cancel_path: str | None = None,
+    pause_path: str | None = None,
+) -> dict[str, object]:
     source = Path(source_path)
     ensure_not_cancelled(cancel_path)
+    wait_if_paused(pause_path, cancel_path=cancel_path)
     if source.suffix.lower() == ".mp4":
         _write_progress(
             progress_path,
@@ -231,6 +256,7 @@ def convert_source_to_mp4(source_path: str, progress_path: str | None = None, ca
     output_path = _fast_mp4_output_path(source_path)
     if output_path.exists():
         ensure_not_cancelled(cancel_path)
+        wait_if_paused(pause_path, cancel_path=cancel_path)
         cached_metadata = probe_video(str(output_path))
         cached_duration_units = max(1, int(round(float(cached_metadata["durationSeconds"]) * 1000)))
         _write_progress(
@@ -246,6 +272,9 @@ def convert_source_to_mp4(source_path: str, progress_path: str | None = None, ca
     ffmpeg_path = str(runtime["ffmpegPath"])
     source_metadata = probe_video(source_path)
     duration_seconds = float(source_metadata["durationSeconds"])
+    selected_gpu = select_runtime_gpu(runtime, None)
+    gpu_name = str(selected_gpu.get("name", "")).strip() if selected_gpu is not None else ""
+    prefers_nvidia = any(token in gpu_name.lower() for token in ["nvidia", "geforce", "rtx", "quadro"])
     common_args = [
         ffmpeg_path,
         "-y",
@@ -269,16 +298,24 @@ def convert_source_to_mp4(source_path: str, progress_path: str | None = None, ca
         "192k",
     ]
 
-    if _prefers_nvidia_encoder(runtime):
+    if prefers_nvidia:
+        nvenc_config = VideoEncoderConfig(
+            encoder="h264_nvenc",
+            quality_args=("-preset", "p1", "-cq", "19", "-b:v", "0"),
+            label=f"nvidia-nvenc ({gpu_name})",
+            hardware_accelerated=True,
+        )
+        nvenc_available, nvenc_probe_details = probe_video_encoder(ffmpeg_path, nvenc_config)
+    else:
+        nvenc_config = None
+        nvenc_available = False
+        nvenc_probe_details = None
+
+    if nvenc_config is not None and nvenc_available:
         nvenc_command = common_args + [
             "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p1",
-            "-cq",
-            "19",
-            "-b:v",
-            "0",
+            nvenc_config.encoder,
+            *nvenc_config.quality_args,
             str(output_path),
         ]
         try:
@@ -286,6 +323,7 @@ def convert_source_to_mp4(source_path: str, progress_path: str | None = None, ca
                 nvenc_command,
                 progress_path=progress_path,
                 cancel_path=cancel_path,
+                pause_path=pause_path,
                 phase="encoding",
                 duration_seconds=duration_seconds,
                 message_prefix="Fast converting source with NVIDIA encoder",
@@ -295,14 +333,19 @@ def convert_source_to_mp4(source_path: str, progress_path: str | None = None, ca
             nvenc_stderr = str(error)
     else:
         nvenc_stderr = ""
+        if nvenc_config is not None and nvenc_probe_details:
+            nvenc_stderr = f"NVENC probe failed for {nvenc_config.encoder} on {gpu_name}: {nvenc_probe_details}"
 
+    software_config = VideoEncoderConfig(
+        encoder="libx264",
+        quality_args=("-preset", "ultrafast", "-crf", "18"),
+        label="software-cpu",
+        hardware_accelerated=False,
+    )
     x264_command = common_args + [
         "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-crf",
-        "18",
+        software_config.encoder,
+        *software_config.quality_args,
         str(output_path),
     ]
     try:
@@ -310,6 +353,7 @@ def convert_source_to_mp4(source_path: str, progress_path: str | None = None, ca
             x264_command,
             progress_path=progress_path,
             cancel_path=cancel_path,
+            pause_path=pause_path,
             phase="encoding",
             duration_seconds=duration_seconds,
             message_prefix="Fast converting source with x264 fallback",

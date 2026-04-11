@@ -407,6 +407,7 @@ def load_runtime_model(
     dtype = torch.float32
     autocast_dtype: torch.dtype | None = None
     batching_dtype = torch.float32
+    effective_precision_mode = precision_mode
     if device.type == "cuda" and precision_mode == "fp16" and bool(descriptor.supports_half):
         descriptor = descriptor.half()
         dtype = torch.float16
@@ -414,6 +415,7 @@ def load_runtime_model(
         log.append("Using fp16 inference for PyTorch image SR.")
     elif device.type == "cuda" and precision_mode == "fp16":
         descriptor = descriptor.float()
+        effective_precision_mode = "fp32"
         log.append("FP16 requested, but this PyTorch image SR model/runtime does not support half precision. Using fp32 instead.")
     elif device.type == "cuda" and precision_mode == "bf16" and bool(getattr(descriptor, "supports_bfloat16", False)):
         descriptor = descriptor.float()
@@ -422,6 +424,7 @@ def load_runtime_model(
         log.append("Using bf16 autocast inference for PyTorch image SR.")
     elif device.type == "cuda" and precision_mode == "bf16":
         descriptor = descriptor.float()
+        effective_precision_mode = "fp32"
         log.append("BF16 requested, but this PyTorch image SR model/runtime does not support bfloat16 precision. Using fp32 instead.")
     else:
         descriptor = descriptor.float()
@@ -457,7 +460,7 @@ def load_runtime_model(
         device=device,
         dtype=dtype,
         autocast_dtype=autocast_dtype,
-        precision_mode=precision_mode,
+        precision_mode=effective_precision_mode,
         runner=resolved_runner,
         scale=int(descriptor.scale),
         frame_batch_size=frame_batch_size,

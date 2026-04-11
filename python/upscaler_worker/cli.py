@@ -64,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--source", required=True)
     convert.add_argument("--progress-path")
     convert.add_argument("--cancel-path")
+    convert.add_argument("--pause-path")
 
     run_job = subparsers.add_parser("run-realesrgan-pipeline")
     run_job.add_argument("--source", required=True)
@@ -83,10 +84,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_job.add_argument("--crop-top", type=float)
     run_job.add_argument("--crop-width", type=float)
     run_job.add_argument("--crop-height", type=float)
+    run_job.add_argument("--job-id")
     run_job.add_argument("--progress-path")
     run_job.add_argument("--cancel-path")
+    run_job.add_argument("--pause-path")
     run_job.add_argument("--preview-mode", action="store_true")
     run_job.add_argument("--preview-duration-seconds", type=float)
+    run_job.add_argument("--preview-start-offset-seconds", type=float)
     run_job.add_argument("--segment-duration-seconds", type=float)
     run_job.add_argument("--output-path", required=True)
     run_job.add_argument("--codec", choices=["h264", "h265"], default="h264")
@@ -239,7 +243,7 @@ def main() -> int:
         return 0
 
     if args.command == "convert-source-to-mp4":
-        result = convert_source_to_mp4(args.source, progress_path=args.progress_path, cancel_path=args.cancel_path)
+        result = convert_source_to_mp4(args.source, progress_path=args.progress_path, cancel_path=args.cancel_path, pause_path=args.pause_path)
         print(json.dumps(result, indent=2))
         return 0
 
@@ -262,10 +266,13 @@ def main() -> int:
             crop_top=args.crop_top,
             crop_width=args.crop_width,
             crop_height=args.crop_height,
+            job_id=args.job_id,
             progress_path=args.progress_path,
             cancel_path=args.cancel_path,
+            pause_path=args.pause_path,
             preview_mode=args.preview_mode,
             preview_duration_seconds=args.preview_duration_seconds,
+            preview_start_offset_seconds=args.preview_start_offset_seconds,
             segment_duration_seconds=args.segment_duration_seconds,
             output_path=args.output_path,
             codec=args.codec,

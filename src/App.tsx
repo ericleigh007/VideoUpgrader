@@ -1,14 +1,25 @@
-import { Fragment, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { isTauri } from "@tauri-apps/api/core";
+import { Fragment, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { desktopApi } from "./lib/desktopApi";
-import { getBackendDefinition, getBlindComparisonModels, getModelDefinition, getUiModels } from "./lib/catalog";
+import { getBackendDefinition, getBlindComparisonModels, getModelDefinition, getUiModels, getVisibleModels, type ModelDefinition } from "./lib/catalog";
 import { defaultCropRect, planOutputFraming, resolveAspectRatio, resolveCropRect, type NormalizedCropRect } from "./lib/framing";
 import { buildInterpolationWarning, interpolationTargetFpsOptions, isInterpolationEnabled } from "./lib/interpolation";
+import {
+  buildJobsWindowUrl,
+  buildRepeatPipelineRequestEnvelope,
+  JOBS_WINDOW_LABEL,
+  parseRepeatPipelineRequestEnvelope,
+  REPEAT_PIPELINE_REQUEST_STORAGE_KEY,
+  resolveAppView,
+} from "./lib/jobs";
+import type { RepeatPipelineRequestAction, RepeatPipelineRequestEnvelope } from "./lib/jobs";
 import type {
   AppConfig,
   AspectRatioPreset,
   InterpolationMode,
   InterpolationTargetFps,
   ManagedJobSummary,
+  ManagedPipelineRunDetails,
   ModelId,
   OutputContainer,
   OutputMode,
@@ -16,7 +27,10 @@ import type {
   PathStats,
   PipelineProgress,
   PipelineJobStatus,
+  PipelineMediaSummary,
+  PipelineResourcePeaks,
   PipelineResult,
+  PipelineStageTimings,
   PytorchRunner,
   QualityPreset,
   RealesrganJobRequest,
@@ -29,7 +43,8 @@ import type {
 } from "./types";
 
 const models = getUiModels();
-const blindComparisonCandidates = getBlindComparisonModels();
+const blindComparisonDefaultCandidates = getBlindComparisonModels();
+const blindComparisonAvailableModels = getVisibleModels().filter((model) => model.executionStatus === "runnable");
 const runnableModels = models.filter((model) => model.executionStatus === "runnable");
 const plannedModels = models.filter((model) => model.executionStatus !== "runnable");
 
@@ -63,6 +78,29 @@ const pytorchRunners: Array<{ value: PytorchRunner; label: string }> = [
 const APP_NAME = "VideoUpgrader";
 const MOTION_SECTION_NAME = "Frame Rate Booster";
 const OUTPUT_ROOT = "artifacts/video-upgrader/outputs";
+
+function modelLaunchRequirement(model: ModelDefinition, runtime: RuntimeStatus | null): string | null {
+  if (model.executionStatus !== "runnable") {
+    return `${model.label} is cataloged but not implemented yet.`;
+  }
+
+  if (model.researchRuntime?.kind !== "external-command") {
+    return null;
+  }
+
+  const runtimeStatus = runtime?.externalResearchRuntimes?.[model.value];
+  if (runtimeStatus?.configured) {
+    return null;
+  }
+
+  const commandEnvVar = runtimeStatus?.commandEnvVar || model.researchRuntime.commandEnvVar;
+  return `${model.label} requires ${commandEnvVar} to be set before it can run.`;
+}
+
+function tauriWindowingAvailable(): boolean {
+  return isTauri();
+}
+
 function recommendedPytorchRunner(modelId: ModelId): PytorchRunner {
   const model = getModelDefinition(modelId);
   if (model.backendId === "pytorch-image-sr" && model.value === "swinir-realworld-x4") {
@@ -96,6 +134,18 @@ interface DragState {
   startRect: NormalizedCropRect;
 }
 
+interface JobsWindowBounds {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+interface JobsWindowDragState {
+  pointerOffsetX: number;
+  pointerOffsetY: number;
+}
+
 interface BlindComparisonEntry {
   sampleId: string;
   anonymousLabel: string;
@@ -108,6 +158,7 @@ interface BlindComparisonState {
   state: "running" | "ready" | "failed";
   entries: BlindComparisonEntry[];
   previewDurationSeconds: number;
+  previewStartOffsetSeconds: number;
   selectedSampleId: string | null;
   winnerModelId: ModelId | null;
   revealed: boolean;
@@ -135,7 +186,7 @@ type TrackedJobEntry = {
   id: string;
   jobKind: string;
   label: string;
-  state: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  state: "queued" | "running" | "paused" | "succeeded" | "failed" | "cancelled" | "interrupted";
   phase: string;
   progress: PipelineProgress;
   modelId: string | null;
@@ -149,18 +200,26 @@ type TrackedJobEntry = {
   scratchSizeBytes: number;
   outputPath: string | null;
   outputSizeBytes: number;
+  pipelineRunDetails: ManagedPipelineRunDetails | null;
+  onPause: null | (() => void);
+  onResume: null | (() => void);
   onStop: null | (() => void);
   onClearScratch: null | (() => void);
   onDeleteOutput: null | (() => void);
 };
 
 type CleanupJobFilter = "all" | "running" | "succeeded" | "cancelled" | "failed";
-type CleanupSortColumn = "state" | "id" | "size" | "updatedAt" | "input" | "output";
+type CleanupSortColumn = "state" | "id" | "scratchSize" | "outputSize" | "updatedAt" | "input" | "output";
 type CleanupSortDirection = "asc" | "desc";
 
 type CleanupJobSort = {
   column: CleanupSortColumn;
   direction: CleanupSortDirection;
+};
+
+type ResolvedRepeatRequest = {
+  request: RealesrganJobRequest;
+  exact: boolean;
 };
 
 interface ProgressEventEntry {
@@ -171,12 +230,18 @@ interface ProgressEventEntry {
   timestamp: number;
 }
 
+type PipelineLaunchState = "idle" | "starting" | PipelineJobStatus["state"];
+
 const CLEANUP_FILTER_STORAGE_KEY = "videoupgrader.cleanup.filter";
 const CLEANUP_SEARCH_STORAGE_KEY = "videoupgrader.cleanup.search";
 const CLEANUP_SORT_STORAGE_KEY = "videoupgrader.cleanup.sort";
 const RUN_SETTINGS_STORAGE_KEY = "videoupgrader.run.settings.v1";
 const EMBEDDED_FULL_PREVIEW_CONTAINERS = new Set(["mp4"]);
+const BLIND_COMPARISON_PREVIEW_CONTAINER: OutputContainer = "mp4";
+const BLIND_COMPARISON_PREVIEW_CODEC: VideoCodec = "h264";
 const AUTO_PREVIEW_UPGRADE_MAX_DURATION_SECONDS = 300;
+const ACTIVE_PIPELINE_POLL_INTERVAL_MS = 250;
+const MANAGED_JOBS_POLL_INTERVAL_MS = 5_000;
 const comparisonFocusPresets: ComparisonFocusPreset[] = [
   {
     id: "dithering",
@@ -255,6 +320,22 @@ function pathLabel(path: string | null | undefined, emptyLabel: string): string 
   return leaf || emptyLabel;
 }
 
+const GENERIC_MANAGED_JOB_LABELS = new Set(["Upscale Export", "Upscale Job", "Source Conversion"]);
+
+function managedJobLabel(label: string | null | undefined, sourcePath: string | null | undefined): string {
+  const normalizedLabel = String(label ?? "").trim();
+  if (normalizedLabel && !GENERIC_MANAGED_JOB_LABELS.has(normalizedLabel)) {
+    return normalizedLabel;
+  }
+
+  const sourceLeaf = pathLeaf(sourcePath);
+  if (sourceLeaf) {
+    return sourceLeaf;
+  }
+
+  return normalizedLabel || "Unnamed Job";
+}
+
 function normalizeTimestampMillis(timestamp: number | string | null | undefined): number {
   const parsed = typeof timestamp === "number" ? timestamp : Number(timestamp);
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -273,6 +354,26 @@ function blindComparisonOutputPath(source: SourceVideoSummary, container: Output
 function parsePositiveIntegerInput(value: string): number | null {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function normalizePreviewStartOffsetSeconds(source: SourceVideoSummary | null, requestedOffsetSeconds: number | null | undefined): number {
+  if (!source) {
+    return 0;
+  }
+
+  const frameRate = Number.isFinite(source.frameRate) && source.frameRate > 0 ? source.frameRate : 0;
+  const totalDuration = Number.isFinite(source.durationSeconds) && source.durationSeconds > 0 ? source.durationSeconds : 0;
+  if (frameRate <= 0 || totalDuration <= 0) {
+    return 0;
+  }
+
+  const clampedOffset = clamp(requestedOffsetSeconds ?? 0, 0, totalDuration);
+  const totalFrameCount = Math.max(1, Math.round(totalDuration * frameRate));
+  const startFrameIndex = Math.min(
+    totalFrameCount - 1,
+    Math.max(0, Math.ceil((clampedOffset * frameRate) - 0.000001)),
+  );
+  return startFrameIndex / frameRate;
 }
 
 function supportsEmbeddedFullLengthPreview(container: string | null | undefined): boolean {
@@ -474,17 +575,82 @@ function formatFramesPerSecond(value: number | null | undefined): string {
   return `${resolved.toFixed(resolved >= 10 ? 1 : 2)} fps`;
 }
 
+function computePixelsPerSecond(media: PipelineMediaSummary | null | undefined, framesPerSecond: number | null | undefined): number | null {
+  if (!media || !Number.isFinite(media.pixelCount) || media.pixelCount <= 0 || !Number.isFinite(framesPerSecond ?? NaN) || (framesPerSecond ?? 0) <= 0) {
+    return null;
+  }
+  return media.pixelCount * (framesPerSecond ?? 0);
+}
+
+function formatPixelsPerSecond(value: number | null | undefined): string {
+  if (!Number.isFinite(value ?? NaN) || (value ?? 0) <= 0) {
+    return "calculating";
+  }
+  const resolved = value ?? 0;
+  if (resolved >= 1_000_000) {
+    return `${(resolved / 1_000_000).toFixed(resolved >= 10_000_000 ? 1 : 2)} MP/s (${Math.round(resolved).toLocaleString()} px/s)`;
+  }
+  return `${Math.round(resolved).toLocaleString()} px/s`;
+}
+
+function formatMediaSummary(media: PipelineMediaSummary | null | undefined): string {
+  if (!media) {
+    return "Unavailable";
+  }
+  return [
+    `${media.width.toLocaleString()} x ${media.height.toLocaleString()}`,
+    `${media.frameRate.toFixed(media.frameRate >= 10 ? 2 : 3)} fps`,
+    `${media.frameCount.toLocaleString()} frames`,
+    `${media.durationSeconds.toFixed(media.durationSeconds >= 10 ? 1 : 2)}s`,
+  ].join(" • ");
+}
+
+function mediaFrameCount(media: PipelineMediaSummary | null | undefined): number | null {
+  const frameCount = media?.frameCount;
+  if (!Number.isFinite(frameCount ?? NaN) || (frameCount ?? 0) <= 0) {
+    return null;
+  }
+  return Math.max(1, Math.round(frameCount ?? 0));
+}
+
+function derivePreviewFrameCount(durationSeconds: number | null | undefined, frameRate: number | null | undefined): number | null {
+  if (!Number.isFinite(durationSeconds ?? NaN) || (durationSeconds ?? 0) <= 0 || !Number.isFinite(frameRate ?? NaN) || (frameRate ?? 0) <= 0) {
+    return null;
+  }
+  return Math.max(1, Math.round((durationSeconds ?? 0) * (frameRate ?? 0)));
+}
+
+function formatStageTimingsSummary(timings: PipelineStageTimings | null | undefined): string | null {
+  if (!timings) {
+    return null;
+  }
+
+  const values = [
+    { label: "extract", value: timings.extractSeconds },
+    { label: "upscale", value: timings.upscaleSeconds },
+    { label: "interpolate", value: timings.interpolateSeconds },
+    { label: "encode", value: timings.encodeSeconds },
+    { label: "remux", value: timings.remuxSeconds },
+  ].filter((entry) => Number.isFinite(entry.value ?? NaN) && (entry.value ?? 0) >= 0);
+
+  if (values.length === 0) {
+    return null;
+  }
+
+  return values
+    .filter((entry) => entry.label !== "interpolate" || (entry.value ?? 0) > 0)
+    .map((entry) => `${entry.label} ${formatElapsedSeconds(entry.value)}`)
+    .join(", ");
+}
+
 function formatStageTimings(progress: PipelineProgress): string {
-  const parts = [
-    `extract ${formatElapsedSeconds(progress.extractStageSeconds)}`,
-    `upscale ${formatElapsedSeconds(progress.upscaleStageSeconds)}`,
-    ...(progress.interpolateStageSeconds !== null && progress.interpolateStageSeconds !== undefined && progress.interpolateStageSeconds > 0
-      ? [`interpolate ${formatElapsedSeconds(progress.interpolateStageSeconds)}`]
-      : []),
-    `encode ${formatElapsedSeconds(progress.encodeStageSeconds)}`,
-    `remux ${formatElapsedSeconds(progress.remuxStageSeconds)}`,
-  ];
-  return parts.join(", ");
+  return formatStageTimingsSummary({
+    extractSeconds: progress.extractStageSeconds ?? 0,
+    upscaleSeconds: progress.upscaleStageSeconds ?? 0,
+    interpolateSeconds: progress.interpolateStageSeconds ?? 0,
+    encodeSeconds: progress.encodeStageSeconds ?? 0,
+    remuxSeconds: progress.remuxStageSeconds ?? 0,
+  }) ?? "unavailable";
 }
 
 function formatGpuMemory(usedBytes: number | null | undefined, totalBytes: number | null | undefined): string {
@@ -495,6 +661,14 @@ function formatGpuMemory(usedBytes: number | null | undefined, totalBytes: numbe
     return formatBytes(usedBytes ?? 0);
   }
   return `${formatBytes(usedBytes ?? 0)} / ${formatBytes(totalBytes ?? 0)}`;
+}
+
+function formatPeakRam(peaks: PipelineResourcePeaks | null | undefined): string {
+  return formatBytes(peaks?.processRssBytes ?? 0);
+}
+
+function formatPeakGpuMemory(peaks: PipelineResourcePeaks | null | undefined): string {
+  return formatGpuMemory(peaks?.gpuMemoryUsedBytes, peaks?.gpuMemoryTotalBytes);
 }
 
 function formatBytes(bytes: number): string {
@@ -615,6 +789,27 @@ function buildResultOutputSummary(result: PipelineResult, outputSizeBytes: numbe
   ].join(" • ");
 }
 
+function formatQualityPresetLabel(value: string | null | undefined): string {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) {
+    return "Unknown";
+  }
+  return qualityPresets.find((entry) => entry.value === normalized)?.label ?? formatTitleCase(normalized);
+}
+
+function formatPrecisionSourceLabel(value: string | null | undefined): string {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) {
+    return "Unknown";
+  }
+  const labels: Record<string, string> = {
+    "explicit-request": "Manual override",
+    "preset-default": "Preset default",
+    "backend-fixed": "Backend fixed",
+  };
+  return labels[normalized] ?? formatTitleCase(normalized);
+}
+
 function buildInterpolationDiagnosticsSummary(result: PipelineResult): string {
   if (!result.interpolationDiagnostics) {
     return "Interpolation details unavailable";
@@ -668,6 +863,9 @@ function formatRelativeTime(timestamp: number): string {
 }
 
 function buildPipelineActivityTitle(progress: PipelineProgress): string {
+  if (progress.phase === "paused") {
+    return "Pipeline paused";
+  }
   if (progress.phase === "extracting") {
     return "Extracting source frames";
   }
@@ -693,6 +891,9 @@ function buildPipelineActivityTitle(progress: PipelineProgress): string {
 }
 
 function formatPipelinePhaseLabel(phase: string): string {
+  if (phase === "paused") {
+    return "Paused";
+  }
   if (phase === "extracting") {
     return "Extracting";
   }
@@ -773,6 +974,14 @@ function buildProgressEvent(progress: PipelineProgress, timestamp: number): Prog
   };
 }
 
+function isCleanupAttentionState(state: TrackedJobEntry["state"]): boolean {
+  return state === "failed" || state === "interrupted";
+}
+
+function isActiveCleanupState(state: TrackedJobEntry["state"]): boolean {
+  return state === "queued" || state === "running" || state === "paused";
+}
+
 function cleanupKindLabel(job: TrackedJobEntry): string {
   if (job.jobKind === "sourceConversion") {
     return "Conversion";
@@ -818,6 +1027,47 @@ function safeLocalStorageSet(key: string, value: string): void {
   }
 }
 
+function safeLocalStorageRemove(key: string): void {
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    // Ignore local storage failures.
+  }
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function defaultJobsWindowBounds(): JobsWindowBounds {
+  if (typeof window === "undefined") {
+    return { left: 32, top: 110, width: 720, height: 760 };
+  }
+
+  const width = Math.round(clamp(window.innerWidth * 0.42, 560, 820));
+  const height = Math.round(clamp(window.innerHeight * 0.72, 420, 860));
+  const left = Math.round(clamp(window.innerWidth - width - 24, 16, Math.max(16, window.innerWidth - width - 16)));
+  const top = 96;
+  return { left, top, width, height };
+}
+
+function clampJobsWindowBounds(bounds: JobsWindowBounds, width: number, height: number): JobsWindowBounds {
+  if (typeof window === "undefined") {
+    return bounds;
+  }
+
+  const clampedWidth = Math.round(clamp(width, 520, Math.max(520, window.innerWidth - 32)));
+  const clampedHeight = Math.round(clamp(height, 360, Math.max(360, window.innerHeight - 32)));
+  const maxLeft = Math.max(16, window.innerWidth - clampedWidth - 16);
+  const maxTop = Math.max(16, window.innerHeight - clampedHeight - 16);
+  return {
+    left: Math.round(clamp(bounds.left, 16, maxLeft)),
+    top: Math.round(clamp(bounds.top, 16, maxTop)),
+    width: clampedWidth,
+    height: clampedHeight,
+  };
+}
+
 type PersistedRunSettings = {
   modelId: ModelId;
   outputMode: OutputMode;
@@ -844,6 +1094,10 @@ type PersistedRunSettings = {
   isOutputPanelOpen: boolean;
   isBlindPanelOpen: boolean;
   isCleanupPanelOpen: boolean;
+  jobsWindowLeft: number;
+  jobsWindowTop: number;
+  jobsWindowWidth: number;
+  jobsWindowHeight: number;
 };
 
 function parsePersistedRunSettings(raw: string | null): Partial<PersistedRunSettings> {
@@ -930,6 +1184,18 @@ function parsePersistedRunSettings(raw: string | null): Partial<PersistedRunSett
     if (typeof parsed.isCleanupPanelOpen === "boolean") {
       settings.isCleanupPanelOpen = parsed.isCleanupPanelOpen;
     }
+    if (typeof parsed.jobsWindowLeft === "number" && Number.isFinite(parsed.jobsWindowLeft)) {
+      settings.jobsWindowLeft = parsed.jobsWindowLeft;
+    }
+    if (typeof parsed.jobsWindowTop === "number" && Number.isFinite(parsed.jobsWindowTop)) {
+      settings.jobsWindowTop = parsed.jobsWindowTop;
+    }
+    if (typeof parsed.jobsWindowWidth === "number" && Number.isFinite(parsed.jobsWindowWidth) && parsed.jobsWindowWidth > 0) {
+      settings.jobsWindowWidth = parsed.jobsWindowWidth;
+    }
+    if (typeof parsed.jobsWindowHeight === "number" && Number.isFinite(parsed.jobsWindowHeight) && parsed.jobsWindowHeight > 0) {
+      settings.jobsWindowHeight = parsed.jobsWindowHeight;
+    }
 
     return settings;
   } catch {
@@ -943,22 +1209,25 @@ function parseCleanupFilter(value: string | null): CleanupJobFilter {
 
 function parseCleanupSort(value: string | null): CleanupJobSort {
   if (!value) {
-    return { column: "size", direction: "desc" };
+    return { column: "scratchSize", direction: "desc" };
   }
 
   const [column, direction] = value.split(":", 2);
+  const normalizedColumn = column === "size" ? "scratchSize" : column;
   if (
-    (column === "state" || column === "id" || column === "size" || column === "updatedAt" || column === "input" || column === "output")
+    (normalizedColumn === "state"
+      || normalizedColumn === "id"
+      || normalizedColumn === "scratchSize"
+      || normalizedColumn === "outputSize"
+      || normalizedColumn === "updatedAt"
+      || normalizedColumn === "input"
+      || normalizedColumn === "output")
     && (direction === "asc" || direction === "desc")
   ) {
-    return { column, direction };
+    return { column: normalizedColumn, direction };
   }
 
-  return { column: "size", direction: "desc" };
-}
-
-function cleanupJobTotalBytes(job: TrackedJobEntry): number {
-  return job.scratchSizeBytes + job.outputSizeBytes;
+  return { column: "scratchSize", direction: "desc" };
 }
 
 function toggleCleanupSort(currentSort: CleanupJobSort, column: CleanupSortColumn): CleanupJobSort {
@@ -1011,8 +1280,11 @@ function sortCleanupJobs(left: TrackedJobEntry, right: TrackedJobEntry, sortMode
     case "id":
       comparison = compareText(left.id, right.id);
       break;
-    case "size":
-      comparison = cleanupJobTotalBytes(left) - cleanupJobTotalBytes(right);
+    case "scratchSize":
+      comparison = left.scratchSizeBytes - right.scratchSizeBytes;
+      break;
+    case "outputSize":
+      comparison = left.outputSizeBytes - right.outputSizeBytes;
       break;
     case "updatedAt":
       comparison = left.updatedAt - right.updatedAt;
@@ -1042,6 +1314,10 @@ function isManagedArtifactPath(path: string | null | undefined): boolean {
   return path.replace(/\\/g, "/").toLowerCase().includes("/artifacts/");
 }
 
+function buildDeleteConfirmation(title: string, path: string, details: string[]): string {
+  return [title, "", `Path: ${path}`, ...details].join("\n");
+}
+
 function shuffleModels(modelIds: ModelId[]): ModelId[] {
   const next = [...modelIds];
   for (let index = next.length - 1; index > 0; index -= 1) {
@@ -1053,8 +1329,16 @@ function shuffleModels(modelIds: ModelId[]): ModelId[] {
   return next;
 }
 
+function toggleIncludedModel(modelIds: ModelId[], targetModelId: ModelId): ModelId[] {
+  return modelIds.includes(targetModelId)
+    ? modelIds.filter((modelId) => modelId !== targetModelId)
+    : [...modelIds, targetModelId];
+}
+
 export default function App() {
   const persistedRunSettings = parsePersistedRunSettings(safeLocalStorageGet(RUN_SETTINGS_STORAGE_KEY));
+  const isJobsOnlyView = resolveAppView(window.location.search) === "jobs";
+  const canOpenNativeJobsWindow = tauriWindowingAvailable() && !isJobsOnlyView;
   const [modelId, setModelId] = useState<ModelId>(persistedRunSettings.modelId ?? "realesrgan-x4plus");
   const [outputMode, setOutputMode] = useState<OutputMode>(persistedRunSettings.outputMode ?? "preserveAspect4k");
   const [qualityPreset, setQualityPreset] = useState<QualityPreset>(persistedRunSettings.qualityPreset ?? "qualityBalanced");
@@ -1080,9 +1364,11 @@ export default function App() {
   const [source, setSource] = useState<SourceVideoSummary | null>(null);
   const [outputPath, setOutputPath] = useState<string | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [isPipelineLaunchPending, setIsPipelineLaunchPending] = useState(false);
   const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
   const [result, setResult] = useState<PipelineResult | null>(null);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [activePipelineRequest, setActivePipelineRequest] = useState<RealesrganJobRequest | null>(null);
   const [pipelineJob, setPipelineJob] = useState<PipelineJobStatus | null>(null);
   const [pipelineProgressEvents, setPipelineProgressEvents] = useState<ProgressEventEntry[]>([]);
   const [lastPipelineProgressAt, setLastPipelineProgressAt] = useState<number | null>(null);
@@ -1105,14 +1391,31 @@ export default function App() {
   const [isOutputPanelOpen, setIsOutputPanelOpen] = useState(persistedRunSettings.isOutputPanelOpen ?? true);
   const [isBlindPanelOpen, setIsBlindPanelOpen] = useState(persistedRunSettings.isBlindPanelOpen ?? false);
   const [isCleanupPanelOpen, setIsCleanupPanelOpen] = useState(persistedRunSettings.isCleanupPanelOpen ?? false);
+  const [jobsWindowBounds, setJobsWindowBounds] = useState<JobsWindowBounds>(() => {
+    const defaults = defaultJobsWindowBounds();
+    return clampJobsWindowBounds(
+      {
+        left: persistedRunSettings.jobsWindowLeft ?? defaults.left,
+        top: persistedRunSettings.jobsWindowTop ?? defaults.top,
+        width: persistedRunSettings.jobsWindowWidth ?? defaults.width,
+        height: persistedRunSettings.jobsWindowHeight ?? defaults.height,
+      },
+      persistedRunSettings.jobsWindowWidth ?? defaults.width,
+      persistedRunSettings.jobsWindowHeight ?? defaults.height,
+    );
+  });
+  const [selectedBlindComparisonModelIds, setSelectedBlindComparisonModelIds] = useState<ModelId[]>(
+    blindComparisonDefaultCandidates.map((candidate) => candidate.value),
+  );
+  const [blindComparisonStartOffsetSeconds, setBlindComparisonStartOffsetSeconds] = useState<number>(0);
   const [blindComparison, setBlindComparison] = useState<BlindComparisonState | null>(null);
   const [status, setStatus] = useState<string>("Idle");
   const [error, setError] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   const [isSavingRating, setIsSavingRating] = useState(false);
   const [dragState, setDragState] = useState<DragState | null>(null);
+  const [jobsWindowDragState, setJobsWindowDragState] = useState<JobsWindowDragState | null>(null);
   const [isCropEditing, setIsCropEditing] = useState(false);
-  const [comparisonSampleId, setComparisonSampleId] = useState<string | null>(null);
   const [comparisonZoom, setComparisonZoom] = useState<number>(3);
   const [comparisonFocusX, setComparisonFocusX] = useState<number>(50);
   const [comparisonFocusY, setComparisonFocusY] = useState<number>(50);
@@ -1120,17 +1423,22 @@ export default function App() {
   const [comparisonCurrentTime, setComparisonCurrentTime] = useState<number>(0);
   const [comparisonDuration, setComparisonDuration] = useState<number>(0);
   const [comparisonPlaying, setComparisonPlaying] = useState<boolean>(false);
+  const [isComparisonWorkspaceOpen, setIsComparisonWorkspaceOpen] = useState<boolean>(false);
   const [sourcePreviewPlaying, setSourcePreviewPlaying] = useState<boolean>(false);
   const [sourcePreviewCurrentTime, setSourcePreviewCurrentTime] = useState<number>(0);
   const [sourcePreviewDuration, setSourcePreviewDuration] = useState<number>(0);
   const [resolvedSourcePreviewUrl, setResolvedSourcePreviewUrl] = useState<string | null>(null);
+  const [resolvedComparisonPreviewUrls, setResolvedComparisonPreviewUrls] = useState<Record<string, string>>({});
   const previewRef = useRef<HTMLDivElement | null>(null);
   const sourcePreviewVideoRef = useRef<HTMLVideoElement | null>(null);
   const comparisonSourceVideoRef = useRef<HTMLVideoElement | null>(null);
-  const comparisonOutputVideoRef = useRef<HTMLVideoElement | null>(null);
+  const comparisonSampleVideoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
   const pipelineProgressSignatureRef = useRef<string | null>(null);
+  const lastAppliedRepeatRequestAtRef = useRef<number>(0);
   const sourcePreviewAutoResumeRef = useRef(false);
   const resolvedSourcePreviewUrlRef = useRef<string | null>(null);
+  const resolvedComparisonPreviewUrlsRef = useRef<Record<string, string>>({});
+  const comparisonDesiredTimeRef = useRef<number>(0);
   const jobsPanelRef = useRef<HTMLDivElement | null>(null);
 
   const sizingOptions: OutputSizingOptions = {
@@ -1150,7 +1458,7 @@ export default function App() {
     ? planOutputFraming({ width: source.width, height: source.height }, outputMode, sizingOptions)
     : null;
   const previewSourcePath = source ? ((previewPlaybackPath ?? source.previewPath) || source.path) : null;
-  const previewSrc = resolvedSourcePreviewUrl;
+  const previewSrc = !isComparisonWorkspaceOpen && previewSourcePath ? (resolvedSourcePreviewUrl ?? desktopApi.toPreviewSrc(previewSourcePath)) : null;
   const sourcePreviewMimeType = previewMimeType(previewSourcePath);
   const resultPreviewSrc = result ? desktopApi.toPreviewSrc(result.outputPath) : null;
   const previewDurationSeconds = parsePositiveIntegerInput(previewDurationInput);
@@ -1158,6 +1466,7 @@ export default function App() {
   const displayedWidth = resolutionBasis === "height" && framing ? String(framing.canvas.width) : targetWidthInput;
   const displayedHeight = resolutionBasis === "width" && framing ? String(framing.canvas.height) : targetHeightInput;
   const sourcePreviewSeekMax = Math.max(sourcePreviewDuration, 0.01);
+  const normalizedBlindComparisonStartOffsetSeconds = normalizePreviewStartOffsetSeconds(source, blindComparisonStartOffsetSeconds);
   const previewCropRect = source && outputMode === "cropTo4k"
     ? resolveCropRect({ width: source.width, height: source.height }, sizingOptions)
     : null;
@@ -1170,23 +1479,59 @@ export default function App() {
       }
     : undefined;
   const aspectRatioValue = source ? resolveAspectRatio({ width: source.width, height: source.height }, sizingOptions) : 16 / 9;
-  const isBlockingSourceConversionRunning = Boolean(sourceConversionJob && (sourceConversionJob.state === "queued" || sourceConversionJob.state === "running") && sourceConversionMode !== "preview");
+  const isSourceConversionPaused = sourceConversionJob?.state === "paused";
+  const isSourceConversionRunning = sourceConversionJob?.state === "queued" || sourceConversionJob?.state === "running" || sourceConversionJob?.state === "paused";
+  const isBlockingSourceConversionRunning = Boolean(sourceConversionJob && isSourceConversionRunning && sourceConversionMode !== "preview");
   const activePrimaryJob = sourceConversionJob && isBlockingSourceConversionRunning
     ? sourceConversionJob
     : pipelineJob;
-  const progressPercent = activePrimaryJob?.progress.percent ?? (result ? 100 : 0);
-  const progressMessage = activePrimaryJob?.progress.message ?? status;
-  const isPipelineRunning = pipelineJob?.state === "queued" || pipelineJob?.state === "running";
-  const isSourceConversionRunning = sourceConversionJob?.state === "queued" || sourceConversionJob?.state === "running";
+  const activeManagedJob = !activePrimaryJob
+    ? [...managedJobs]
+      .filter((job) => isActiveCleanupState(job.state as TrackedJobEntry["state"]))
+      .sort((left, right) => normalizeTimestampMillis(right.updatedAt) - normalizeTimestampMillis(left.updatedAt))[0] ?? null
+    : null;
+  const activeDisplayProgress = activePrimaryJob?.progress ?? activeManagedJob?.progress ?? null;
+  const progressPercent = activeDisplayProgress?.percent ?? (result ? 100 : 0);
+  const progressMessage = activeDisplayProgress?.message ?? status;
+  const isPipelinePaused = pipelineJob?.state === "paused";
+  const isPipelineRunning = pipelineJob?.state === "queued" || pipelineJob?.state === "running" || pipelineJob?.state === "paused";
+  const pipelineLaunchState: PipelineLaunchState = isPipelineLaunchPending
+    ? "starting"
+    : pipelineJob?.state ?? "idle";
+  const pipelineLaunchStateLabel = pipelineLaunchState === "starting" ? "launching" : pipelineLaunchState;
+  const hasRecoveredManagedJob = Boolean(activeManagedJob);
   const isBlindComparisonRunning = blindComparison?.state === "running";
   const selectedGpu = runtime?.availableGpus.find((gpu) => gpu.id === selectedGpuId) ?? null;
   const selectedModel = getModelDefinition(modelId);
   const selectedBackend = getBackendDefinition(selectedModel.backendId);
   const isSelectedModelImplemented = selectedModel.executionStatus === "runnable";
+  const selectedModelLaunchRequirement = modelLaunchRequirement(selectedModel, runtime);
+  const isSelectedModelLaunchable = selectedModelLaunchRequirement === null;
   const supportsPytorchRunner = selectedBackend.id === "pytorch-image-sr";
   const selectedModelRating = appConfig?.modelRatings[selectedModel.value]?.rating ?? null;
+  const selectedBlindComparisonModels = blindComparisonAvailableModels.filter((model) => selectedBlindComparisonModelIds.includes(model.value));
   const comparisonEntries = blindComparison?.entries.filter((entry) => Boolean(entry.status.result?.outputPath)) ?? [];
-  const selectedComparisonEntry = comparisonEntries.find((entry) => entry.sampleId === comparisonSampleId) ?? comparisonEntries[0] ?? null;
+  const comparisonFrameRateCandidates = [
+    source?.frameRate ?? null,
+    ...comparisonEntries.map((entry) => entry.status.result?.outputMedia?.frameRate ?? null),
+  ].filter((value): value is number => Number.isFinite(value ?? NaN) && (value ?? 0) > 0);
+  const comparisonFrameRate = comparisonFrameRateCandidates[0] ?? 0;
+  const comparisonFrameCountCandidates = [
+    source && blindComparison ? derivePreviewFrameCount(blindComparison.previewDurationSeconds, source.frameRate) : null,
+    ...comparisonEntries.map((entry) => mediaFrameCount(entry.status.result?.outputMedia)),
+  ].filter((value): value is number => Number.isFinite(value ?? NaN) && (value ?? 0) > 0);
+  const comparisonFrameCount = comparisonFrameCountCandidates.length > 0 ? Math.min(...comparisonFrameCountCandidates) : 0;
+  const comparisonTimelineMax = comparisonFrameCount > 0 ? comparisonFrameCount - 1 : 0;
+  const comparisonCurrentFrame = comparisonFrameRate > 0
+    ? Math.min(comparisonTimelineMax, Math.max(0, Math.round(comparisonCurrentTime * comparisonFrameRate)))
+    : 0;
+  const comparisonSourcePreviewPath = source ? (source.previewPath || source.path) : null;
+  const comparisonSourcePreviewSrc = comparisonSourcePreviewPath ? (resolvedSourcePreviewUrl ?? desktopApi.toPreviewSrc(comparisonSourcePreviewPath)) : "";
+  const comparisonSourcePreviewMimeType = previewMimeType(comparisonSourcePreviewPath);
+  const comparisonPreviewLoadSignature = [
+    comparisonSourcePreviewSrc,
+    ...comparisonEntries.map((entry) => resolvedComparisonPreviewUrls[entry.sampleId] ?? (entry.status.result?.outputPath ?? "")),
+  ].join("|");
   const selectedComparisonPreset = comparisonFocusPresets.find((preset) => preset.id === comparisonFocusPresetId) ?? comparisonFocusPresets[0];
   const usingFallbackPreviewClip = Boolean(source && source.previewPath !== source.path && !previewPlaybackPath);
   const canAutoUpgradePreview = Boolean(
@@ -1233,8 +1578,8 @@ export default function App() {
     || isPipelineRunning
     || isBlockingSourceConversionRunning
     || !hasEnabledPipelineStep
-    || (isUpscaleStepEnabled && !isSelectedModelImplemented);
-  const isBlindComparisonDisabled = isBusy || !source || isBlindComparisonRunning || isPipelineRunning || isBlockingSourceConversionRunning || blindComparisonCandidates.length < 2;
+    || (isUpscaleStepEnabled && !isSelectedModelLaunchable);
+  const isBlindComparisonDisabled = isBusy || !source || isBlindComparisonRunning || isPipelineRunning || isBlockingSourceConversionRunning || selectedBlindComparisonModelIds.length < 2;
   const nowTimestamp = uiNow;
   const trackedJobCandidates: Array<TrackedJobEntry | null> = [
     sourceConversionJob ? {
@@ -1255,12 +1600,22 @@ export default function App() {
       scratchSizeBytes: 0,
       outputPath: sourceConversionJob.result?.path ?? null,
       outputSizeBytes: sourceConversionJob.progress.outputSizeBytes ?? (sourceConversionJob.result ? sourcePathStats?.sizeBytes ?? 0 : 0),
+      pipelineRunDetails: activePipelineRequest ? { request: activePipelineRequest } : null,
+      onPause: sourceConversionJob.state === "queued" || sourceConversionJob.state === "running" ? () => {
+        void pauseSourceConversion();
+      } : null,
+      onResume: sourceConversionJob.state === "paused" ? () => {
+        void resumeSourceConversion();
+      } : null,
       onStop: isSourceConversionRunning ? () => {
         void cancelSourceConversion();
       } : null,
       onClearScratch: null as null | (() => void),
       onDeleteOutput: sourceConversionJob.result?.path && isManagedArtifactPath(sourceConversionJob.result.path)
-        ? () => void deleteManagedArtifact(sourceConversionJob.result!.path, "Converted input", clearLoadedInput)
+        ? () => void deleteManagedArtifact(sourceConversionJob.result!.path, "Converted input", clearLoadedInput, [
+          "Removes the generated MP4 copy created for conversion or preview compatibility.",
+          "Clears it from the current input slot if this converted file is loaded.",
+        ])
         : null,
     } : null,
     pipelineJob ? {
@@ -1281,14 +1636,27 @@ export default function App() {
       scratchSizeBytes: pipelineJob.progress.scratchSizeBytes ?? workDirStats?.sizeBytes ?? 0,
       outputPath: result?.outputPath ?? outputPath ?? null,
       outputSizeBytes: pipelineJob.progress.outputSizeBytes ?? outputPathStats?.sizeBytes ?? 0,
+      pipelineRunDetails: null,
+      onPause: pipelineJob.state === "queued" || pipelineJob.state === "running" ? () => {
+        void pausePipeline();
+      } : null,
+      onResume: pipelineJob.state === "paused" ? () => {
+        void resumePipeline();
+      } : null,
       onStop: isPipelineRunning ? () => {
         void cancelPipeline();
       } : null,
       onClearScratch: result?.workDir && isManagedArtifactPath(result.workDir)
-        ? () => void deleteManagedArtifact(result.workDir, "Job scratch", () => setWorkDirStats(null))
+        ? () => void deleteManagedArtifact(result.workDir, "Job scratch", () => setWorkDirStats(null), [
+          "Deletes intermediate extracted, upscaled, interpolated, and staging files for this job.",
+          "The job history entry remains, but reruns will need to regenerate these artifacts.",
+        ])
         : null,
       onDeleteOutput: result?.outputPath && isManagedArtifactPath(result.outputPath)
-        ? () => void deleteManagedArtifact(result.outputPath, "Job output", clearCurrentOutputSelection)
+        ? () => void deleteManagedArtifact(result.outputPath, "Job output", clearCurrentOutputSelection, [
+          "Deletes the exported video file for this job.",
+          "Clears the current output selection if it points at this file.",
+        ])
         : null,
     } : null,
   ];
@@ -1296,7 +1664,7 @@ export default function App() {
   const historicalJobs = managedJobs.map<TrackedJobEntry>((job) => ({
     id: job.jobId,
     jobKind: job.jobKind,
-    label: job.label,
+    label: managedJobLabel(job.label, job.sourcePath),
     state: job.state as TrackedJobEntry["state"],
     phase: job.progress.phase,
     progress: job.progress,
@@ -1306,17 +1674,29 @@ export default function App() {
     recordedCount: job.recordedCount,
     message: job.progress.message,
     updatedAt: normalizeTimestampMillis(job.updatedAt),
-    sourcePath: job.sourcePath,
+    sourcePath: job.sourcePath ?? job.pipelineRunDetails?.request.sourcePath ?? null,
     scratchPath: job.scratchPath,
     scratchSizeBytes: job.progress.scratchSizeBytes ?? job.scratchStats?.sizeBytes ?? 0,
-    outputPath: job.outputPath,
+    outputPath: job.outputPath ?? job.pipelineRunDetails?.request.outputPath ?? null,
     outputSizeBytes: job.progress.outputSizeBytes ?? job.outputStats?.sizeBytes ?? 0,
+    pipelineRunDetails: job.pipelineRunDetails ?? null,
+    onPause: null,
+    onResume: null,
     onStop: null,
     onClearScratch: job.scratchPath && isManagedArtifactPath(job.scratchPath)
-      ? () => void deleteManagedArtifact(job.scratchPath!, `${job.label} scratch`, () => {})
+      ? () => void deleteManagedArtifact(job.scratchPath!, `${job.label} scratch`, () => {}, [
+        "Deletes this job's stored intermediate artifacts and scratch directory.",
+        "Historical metadata remains so the run can still be inspected later.",
+      ])
       : null,
     onDeleteOutput: job.outputPath && isManagedArtifactPath(job.outputPath)
-      ? () => void deleteManagedArtifact(job.outputPath!, `${job.label} output`, () => {})
+      ? () => void deleteManagedArtifact(job.outputPath!, `${job.label} output`, () => {}, job.jobKind === "sourceConversion" ? [
+        "Removes the converted source file created by the app.",
+        "Use this when you no longer need the compatibility copy in artifacts/runtime/converted-sources.",
+      ] : [
+        "Deletes the exported output file for this historical job.",
+        "The job record remains, but the output file itself will be gone.",
+      ])
       : null,
   }));
   const cleanupJobsById = new Map<string, TrackedJobEntry>();
@@ -1336,6 +1716,9 @@ export default function App() {
       scratchSizeBytes: job.scratchSizeBytes || existing?.scratchSizeBytes || job.progress.scratchSizeBytes || 0,
       outputPath: job.outputPath ?? existing?.outputPath ?? null,
       outputSizeBytes: job.outputSizeBytes || existing?.outputSizeBytes || job.progress.outputSizeBytes || 0,
+      pipelineRunDetails: job.pipelineRunDetails ?? existing?.pipelineRunDetails ?? null,
+      onPause: job.onPause ?? existing?.onPause ?? null,
+      onResume: job.onResume ?? existing?.onResume ?? null,
       onStop: job.onStop ?? existing?.onStop ?? null,
       onClearScratch: job.onClearScratch ?? existing?.onClearScratch ?? null,
       onDeleteOutput: job.onDeleteOutput ?? existing?.onDeleteOutput ?? null,
@@ -1344,21 +1727,24 @@ export default function App() {
   const cleanupJobs = Array.from(cleanupJobsById.values()).sort((left, right) => sortCleanupJobs(left, right, cleanupSort));
   const cleanupStateCounts = {
     all: cleanupJobs.length,
-    running: cleanupJobs.filter((job) => job.state === "queued" || job.state === "running").length,
+    running: cleanupJobs.filter((job) => isActiveCleanupState(job.state)).length,
     succeeded: cleanupJobs.filter((job) => job.state === "succeeded").length,
     cancelled: cleanupJobs.filter((job) => job.state === "cancelled").length,
-    failed: cleanupJobs.filter((job) => job.state === "failed").length,
+    failed: cleanupJobs.filter((job) => isCleanupAttentionState(job.state)).length,
   };
   const filteredCleanupJobs = cleanupJobs.filter((job) => {
     if (cleanupFilter === "all") {
       return matchesCleanupSearch(job, cleanupSearch);
     }
     if (cleanupFilter === "running") {
-      return (job.state === "queued" || job.state === "running") && matchesCleanupSearch(job, cleanupSearch);
+      return isActiveCleanupState(job.state) && matchesCleanupSearch(job, cleanupSearch);
+    }
+    if (cleanupFilter === "failed") {
+      return isCleanupAttentionState(job.state) && matchesCleanupSearch(job, cleanupSearch);
     }
     return job.state === cleanupFilter && matchesCleanupSearch(job, cleanupSearch);
   });
-  const hasActiveCleanupJobs = cleanupJobs.some((job) => job.state === "queued" || job.state === "running");
+  const hasActiveCleanupJobs = cleanupJobs.some((job) => isActiveCleanupState(job.state));
   const pipelinePhaseBars = pipelineJob ? [
     {
       id: "extract",
@@ -1397,10 +1783,20 @@ export default function App() {
   const pipelineActivityDetail = pipelineJob ? buildPipelineActivityDetail(pipelineJob.progress) : null;
   const pipelinePhaseLabel = pipelineJob ? formatPipelinePhaseLabel(pipelineJob.progress.phase) : null;
   const pipelineLastUpdateLabel = lastPipelineProgressAt ? formatRelativeTime(lastPipelineProgressAt) : "waiting for first update";
-  const compactStatusTitle = isPipelineRunning
-    ? "Pipeline Running"
-    : isSourceConversionRunning
-      ? "Source Conversion Running"
+  const compactStatusTitle = isPipelineLaunchPending
+    ? "Pipeline Starting"
+    : isPipelinePaused
+    ? "Pipeline Paused"
+    : isPipelineRunning
+      ? "Pipeline Running"
+      : isSourceConversionPaused
+        ? "Source Conversion Paused"
+        : isSourceConversionRunning
+          ? "Source Conversion Running"
+          : activeManagedJob?.state === "paused"
+            ? "Recovered Paused Job"
+            : hasRecoveredManagedJob
+              ? "Recovered Running Job"
       : result
         ? "Last Output Ready"
         : "Ready To Configure";
@@ -1421,32 +1817,139 @@ export default function App() {
         return "upscale";
     }
   })();
-  const compactStatusDetail = pipelineJob
+  const compactStatusDetail = isPipelineLaunchPending && !pipelineJob
+    ? "Launch accepted • waiting for worker job id"
+    : pipelineJob
     ? `${pipelinePhaseLabel ?? "Preparing"} • ${pipelineJob.progress.percent}% • ${activePrimaryJob && (activePrimaryJob.progress.estimatedRemainingSeconds ?? 0) > 0 ? `ETA ${formatElapsedSeconds(activePrimaryJob.progress.estimatedRemainingSeconds)}` : "ETA pending"}`
-    : isSourceConversionRunning
-      ? "Preparing source preview"
+    : isSourceConversionPaused
+      ? "Source conversion paused"
+      : isSourceConversionRunning
+        ? "Preparing source preview"
+        : activeManagedJob
+          ? `${formatPipelinePhaseLabel(activeManagedJob.progress.phase)} • ${activeManagedJob.progress.percent}% • ${(activeManagedJob.progress.estimatedRemainingSeconds ?? 0) > 0 ? `ETA ${formatElapsedSeconds(activeManagedJob.progress.estimatedRemainingSeconds)}` : "ETA pending"}`
       : result
         ? `Ready • ${pathLeaf(result.outputPath)}`
         : "Ready to configure";
+  const topStatusPauseAction = isPipelinePaused
+    ? () => {
+        void resumePipeline();
+      }
+    : isPipelineRunning
+      ? () => {
+          void pausePipeline();
+        }
+      : isSourceConversionPaused
+        ? () => {
+            void resumeSourceConversion();
+          }
+        : isSourceConversionRunning
+          ? () => {
+              void pauseSourceConversion();
+            }
+          : null;
+  const topStatusStopAction = isPipelineRunning
+    ? () => {
+        void cancelPipeline();
+      }
+    : isSourceConversionRunning
+      ? () => {
+          void cancelSourceConversion();
+        }
+      : null;
   const runtimeFactsSummary = runtime
     ? `${runtime.availableGpus.length > 0 ? `${runtime.availableGpus.length} GPU${runtime.availableGpus.length === 1 ? "" : "s"}` : "No GPUs detected"} • ${selectedGpu ? `GPU ${selectedGpu.id}` : "Auto GPU"}`
     : "Runtime assets download on first use";
 
   function toggleCleanupPanel(): void {
     setIsCleanupPanelOpen((current) => !current);
+  }
 
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => {
-        const panel = jobsPanelRef.current;
-        if (!panel) {
-          return;
-        }
+  async function openJobsWindow(): Promise<void> {
+    if (!canOpenNativeJobsWindow) {
+      toggleCleanupPanel();
+      return;
+    }
 
-        const bounds = panel.getBoundingClientRect();
-        if (bounds.top < 0 || bounds.bottom > window.innerHeight) {
-          panel.scrollIntoView({ behavior: "smooth", block: "start" });
-        }
+    try {
+      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+      const existingWindow = await WebviewWindow.getByLabel(JOBS_WINDOW_LABEL);
+      if (existingWindow) {
+        await existingWindow.show();
+        await existingWindow.setFocus();
+        setStatus("Jobs window ready.");
+        return;
+      }
+
+      const jobsUrl = buildJobsWindowUrl(window.location);
+
+      const jobsWindow = new WebviewWindow(JOBS_WINDOW_LABEL, {
+        url: jobsUrl,
+        title: `${APP_NAME} Jobs`,
+        width: 1180,
+        height: 900,
+        minWidth: 840,
+        minHeight: 620,
+        resizable: true,
+        focus: true,
       });
+
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        void jobsWindow.once("tauri://created", () => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        });
+        void jobsWindow.once("tauri://error", (event) => {
+          if (!settled) {
+            settled = true;
+            reject(new Error(String(event.payload ?? "Failed to open the jobs window.")));
+          }
+        });
+      });
+
+      setStatus("Jobs window opened.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setStatus("Failed to open the jobs window.");
+    }
+  }
+
+  async function closeJobsWindow(): Promise<void> {
+    if (!isJobsOnlyView) {
+      toggleCleanupPanel();
+      return;
+    }
+
+    try {
+      const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+      await getCurrentWebviewWindow().close();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setStatus("Failed to close the jobs window.");
+    }
+  }
+
+  function beginJobsWindowDrag(event: ReactMouseEvent<HTMLElement>): void {
+    if (isJobsOnlyView) {
+      return;
+    }
+
+    const target = event.target as HTMLElement;
+    if (target.closest("button, input, select, textarea, summary, a")) {
+      return;
+    }
+
+    const panel = jobsPanelRef.current;
+    if (!panel) {
+      return;
+    }
+
+    const bounds = panel.getBoundingClientRect();
+    setJobsWindowDragState({
+      pointerOffsetX: event.clientX - bounds.left,
+      pointerOffsetY: event.clientY - bounds.top,
     });
   }
 
@@ -1487,16 +1990,43 @@ export default function App() {
 
   useEffect(() => {
     if (comparisonEntries.length === 0) {
-      if (comparisonSampleId !== null) {
-        setComparisonSampleId(null);
+      comparisonSampleVideoRefs.current = {};
+      if (isComparisonWorkspaceOpen) {
+        setIsComparisonWorkspaceOpen(false);
       }
       return;
     }
 
-    if (!comparisonSampleId || !comparisonEntries.some((entry) => entry.sampleId === comparisonSampleId)) {
-      setComparisonSampleId(comparisonEntries[0]?.sampleId ?? null);
+    const activeSampleIds = new Set(comparisonEntries.map((entry) => entry.sampleId));
+    comparisonSampleVideoRefs.current = Object.fromEntries(
+      Object.entries(comparisonSampleVideoRefs.current).filter(([sampleId]) => activeSampleIds.has(sampleId)),
+    );
+  }, [comparisonEntries, isComparisonWorkspaceOpen]);
+
+  useEffect(() => {
+    if (!isComparisonWorkspaceOpen && comparisonPlaying) {
+      setComparisonPlaying(false);
     }
-  }, [comparisonEntries, comparisonSampleId]);
+  }, [comparisonPlaying, isComparisonWorkspaceOpen]);
+
+  useEffect(() => {
+    if (!isComparisonWorkspaceOpen) {
+      return;
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      if (comparisonFrameRate > 0 && comparisonCurrentFrame > 0) {
+        syncComparisonFrame(comparisonCurrentFrame);
+        return;
+      }
+
+      if (comparisonCurrentTime > 0) {
+        syncComparisonTime(comparisonCurrentTime);
+      }
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [comparisonCurrentFrame, comparisonCurrentTime, comparisonFrameRate, comparisonPreviewLoadSignature, isComparisonWorkspaceOpen]);
 
   useEffect(() => {
     const preset = comparisonFocusPresets.find((entry) => entry.id === comparisonFocusPresetId);
@@ -1565,6 +2095,10 @@ export default function App() {
       }
     ));
   }, [source?.path, source?.width, source?.height, outputMode, aspectRatioPreset, customAspectWidthInput, customAspectHeightInput]);
+
+  useEffect(() => {
+    setBlindComparisonStartOffsetSeconds(0);
+  }, [source?.path]);
 
   useEffect(() => {
     if (!dragState) {
@@ -1652,6 +2186,10 @@ export default function App() {
           setActiveJobId(null);
           setStatus("Pipeline cancelled.");
         }
+
+        if (nextJob.state === "paused") {
+          setStatus(nextJob.progress.message || "Pipeline paused.");
+        }
       } catch (caught) {
         if (!cancelled) {
           setError(caught instanceof Error ? caught.message : String(caught));
@@ -1664,7 +2202,7 @@ export default function App() {
     void pollJob();
     const intervalId = window.setInterval(() => {
       void pollJob();
-    }, 1000);
+    }, ACTIVE_PIPELINE_POLL_INTERVAL_MS);
 
     return () => {
       cancelled = true;
@@ -1721,6 +2259,14 @@ export default function App() {
     }
   }, []);
 
+  useEffect(() => () => {
+    Object.values(resolvedComparisonPreviewUrlsRef.current).forEach((url) => {
+      if (url.startsWith("blob:")) {
+        URL.revokeObjectURL(url);
+      }
+    });
+  }, []);
+
   function replaceResolvedSourcePreviewUrl(nextUrl: string | null): void {
     const currentUrl = resolvedSourcePreviewUrlRef.current;
     if (currentUrl?.startsWith("blob:") && currentUrl !== nextUrl) {
@@ -1728,6 +2274,17 @@ export default function App() {
     }
     resolvedSourcePreviewUrlRef.current = nextUrl;
     setResolvedSourcePreviewUrl(nextUrl);
+  }
+
+  function replaceResolvedComparisonPreviewUrls(nextUrls: Record<string, string>): void {
+    for (const [sampleId, currentUrl] of Object.entries(resolvedComparisonPreviewUrlsRef.current)) {
+      if (currentUrl.startsWith("blob:") && nextUrls[sampleId] !== currentUrl) {
+        URL.revokeObjectURL(currentUrl);
+      }
+    }
+
+    resolvedComparisonPreviewUrlsRef.current = nextUrls;
+    setResolvedComparisonPreviewUrls(nextUrls);
   }
 
   async function resolveSourcePreviewUrl(path: string | null): Promise<void> {
@@ -1745,6 +2302,49 @@ export default function App() {
       replaceResolvedSourcePreviewUrl(null);
     }
   }
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function resolveComparisonPreviewUrls(): Promise<void> {
+      if (comparisonEntries.length === 0) {
+        replaceResolvedComparisonPreviewUrls({});
+        return;
+      }
+
+      const nextPairs = await Promise.all(comparisonEntries.map(async (entry) => {
+        const outputPath = entry.status.result?.outputPath;
+        if (!outputPath) {
+          return [entry.sampleId, null] as const;
+        }
+
+        try {
+          const nextUrl = await desktopApi.loadPreviewUrl(outputPath);
+          return [entry.sampleId, nextUrl] as const;
+        } catch {
+          return [entry.sampleId, null] as const;
+        }
+      }));
+
+      const nextUrls = Object.fromEntries(nextPairs.filter((entry): entry is readonly [string, string] => typeof entry[1] === "string"));
+      if (cancelled) {
+        Object.values(nextUrls).forEach((url) => {
+          if (url.startsWith("blob:")) {
+            URL.revokeObjectURL(url);
+          }
+        });
+        return;
+      }
+
+      replaceResolvedComparisonPreviewUrls(nextUrls);
+    }
+
+    void resolveComparisonPreviewUrls();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [comparisonEntries]);
 
   useEffect(() => {
     if (!sourceConversionJobId) {
@@ -1783,9 +2383,10 @@ export default function App() {
             setResult(null);
             setPipelineJob(null);
             setActiveJobId(null);
+            setActivePipelineRequest(null);
             setBlindComparison(null);
             setIsCropEditing(false);
-            setComparisonSampleId(null);
+            setIsComparisonWorkspaceOpen(false);
             setComparisonCurrentTime(0);
             setComparisonDuration(0);
             setComparisonPlaying(false);
@@ -1803,6 +2404,10 @@ export default function App() {
         if (nextJob.state === "cancelled") {
           setSourceConversionJobId(null);
           setStatus("Source conversion cancelled.");
+        }
+
+        if (nextJob.state === "paused") {
+          setStatus(nextJob.progress.message || "Source conversion paused.");
         }
       } catch (caught) {
         if (!cancelled) {
@@ -1824,24 +2429,33 @@ export default function App() {
     };
   }, [container, modelId, source, sourceConversionJobId, sourceConversionMode, sourceConversionSourcePath]);
 
-  async function loadManagedArtifacts(): Promise<{
-    scratchSummary: ScratchStorageSummary;
+  async function loadManagedArtifacts(includeScratchSummary = true): Promise<{
+    scratchSummary: ScratchStorageSummary | null;
     managedJobs: ManagedJobSummary[];
+  }> {
+    const [nextScratch, nextManagedJobs] = await Promise.all([
+      includeScratchSummary ? desktopApi.getScratchStorageSummary() : Promise.resolve(null),
+      desktopApi.listManagedJobs(),
+    ]);
+
+    return {
+      scratchSummary: nextScratch,
+      managedJobs: nextManagedJobs,
+    };
+  }
+
+  async function loadSelectedPathStats(): Promise<{
     sourcePathStats: PathStats | null;
     outputPathStats: PathStats | null;
     workDirStats: PathStats | null;
   }> {
-    const [nextScratch, nextManagedJobs, nextSource, nextOutput, nextWorkDir] = await Promise.all([
-      desktopApi.getScratchStorageSummary(),
-      desktopApi.listManagedJobs(),
+    const [nextSource, nextOutput, nextWorkDir] = await Promise.all([
       source ? desktopApi.getPathStats(source.path) : Promise.resolve(null),
       result ? desktopApi.getPathStats(result.outputPath) : Promise.resolve(outputPath ? desktopApi.getPathStats(outputPath) : null),
       result ? desktopApi.getPathStats(result.workDir) : Promise.resolve(null),
     ]);
 
     return {
-      scratchSummary: nextScratch,
-      managedJobs: nextManagedJobs,
       sourcePathStats: nextSource,
       outputPathStats: nextOutput,
       workDirStats: nextWorkDir,
@@ -1849,25 +2463,69 @@ export default function App() {
   }
 
   function applyManagedArtifacts(snapshot: {
-    scratchSummary: ScratchStorageSummary;
+    scratchSummary: ScratchStorageSummary | null;
     managedJobs: ManagedJobSummary[];
+  }): void {
+    if (snapshot.scratchSummary) {
+      setScratchSummary(snapshot.scratchSummary);
+    }
+    setManagedJobs(snapshot.managedJobs);
+  }
+
+  function applySelectedPathStats(snapshot: {
     sourcePathStats: PathStats | null;
     outputPathStats: PathStats | null;
     workDirStats: PathStats | null;
   }): void {
-    setScratchSummary(snapshot.scratchSummary);
-    setManagedJobs(snapshot.managedJobs);
     setSourcePathStats(snapshot.sourcePathStats);
     setOutputPathStats(snapshot.outputPathStats);
     setWorkDirStats(snapshot.workDirStats);
   }
 
+  async function refreshManagedWorkspaceState(options?: { includeScratchSummary?: boolean }): Promise<void> {
+    const includeScratchSummary = options?.includeScratchSummary ?? true;
+    const [managedSnapshot, pathStatsSnapshot] = await Promise.all([
+      loadManagedArtifacts(includeScratchSummary),
+      loadSelectedPathStats(),
+    ]);
+    applyManagedArtifacts(managedSnapshot);
+    applySelectedPathStats(pathStatsSnapshot);
+  }
+
   useEffect(() => {
     let disposed = false;
 
+    async function refreshPathStats(): Promise<void> {
+      try {
+        const snapshot = await loadSelectedPathStats();
+
+        if (disposed) {
+          return;
+        }
+
+        applySelectedPathStats(snapshot);
+      } catch {
+        if (!disposed) {
+          setSourcePathStats(null);
+          setOutputPathStats(null);
+          setWorkDirStats(null);
+        }
+      }
+    }
+
+    void refreshPathStats();
+    return () => {
+      disposed = true;
+    };
+  }, [outputPath, result, source]);
+
+  useEffect(() => {
+    let disposed = false;
+    const includeScratchSummary = isJobsOnlyView || isCleanupPanelOpen;
+
     async function refreshStorage(): Promise<void> {
       try {
-        const snapshot = await loadManagedArtifacts();
+        const snapshot = await loadManagedArtifacts(includeScratchSummary);
 
         if (disposed) {
           return;
@@ -1883,10 +2541,20 @@ export default function App() {
     }
 
     void refreshStorage();
+    const shouldPollStorage = isJobsOnlyView || isCleanupPanelOpen || isPipelineRunning || isSourceConversionRunning;
+    const intervalId = shouldPollStorage
+      ? window.setInterval(() => {
+        void refreshStorage();
+      }, MANAGED_JOBS_POLL_INTERVAL_MS)
+      : null;
+
     return () => {
       disposed = true;
+      if (intervalId !== null) {
+        window.clearInterval(intervalId);
+      }
     };
-  }, [outputPath, result, source, sourceConversionJob]);
+  }, [isCleanupPanelOpen, isJobsOnlyView, isPipelineRunning, isSourceConversionRunning]);
 
   useEffect(() => {
     safeLocalStorageSet(CLEANUP_FILTER_STORAGE_KEY, cleanupFilter);
@@ -1899,6 +2567,52 @@ export default function App() {
   useEffect(() => {
     safeLocalStorageSet(CLEANUP_SORT_STORAGE_KEY, `${cleanupSort.column}:${cleanupSort.direction}`);
   }, [cleanupSort]);
+
+  useEffect(() => {
+    if (isJobsOnlyView) {
+      return undefined;
+    }
+
+    const applyReplayEnvelope = (raw: string | null) => {
+      if (!raw) {
+        return;
+      }
+
+      try {
+        const envelope = parseRepeatPipelineRequestEnvelope(raw);
+        if (!envelope?.request || envelope.requestedAt <= lastAppliedRepeatRequestAtRef.current) {
+          return;
+        }
+
+        lastAppliedRepeatRequestAtRef.current = envelope.requestedAt;
+        void (async () => {
+          try {
+            await applyRepeatedPipelineRequest(envelope.request);
+            if (envelope.action === "restart") {
+              setStatus(`Restarting ${pathLeaf(envelope.request.sourcePath)}...`);
+              await startPipelineFromRequest(envelope.request, { ensureRuntime: false, queuedStatus: "Restarted job queued." });
+            }
+          } finally {
+            safeLocalStorageRemove(REPEAT_PIPELINE_REQUEST_STORAGE_KEY);
+          }
+        })();
+      } catch {
+        safeLocalStorageRemove(REPEAT_PIPELINE_REQUEST_STORAGE_KEY);
+      }
+    };
+
+    applyReplayEnvelope(safeLocalStorageGet(REPEAT_PIPELINE_REQUEST_STORAGE_KEY));
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== REPEAT_PIPELINE_REQUEST_STORAGE_KEY) {
+        return;
+      }
+      applyReplayEnvelope(event.newValue);
+    };
+
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, [isJobsOnlyView]);
 
   useEffect(() => {
     const nextSettings: PersistedRunSettings = {
@@ -1927,6 +2641,10 @@ export default function App() {
       isOutputPanelOpen,
       isBlindPanelOpen,
       isCleanupPanelOpen,
+      jobsWindowLeft: jobsWindowBounds.left,
+      jobsWindowTop: jobsWindowBounds.top,
+      jobsWindowWidth: jobsWindowBounds.width,
+      jobsWindowHeight: jobsWindowBounds.height,
     };
     safeLocalStorageSet(RUN_SETTINGS_STORAGE_KEY, JSON.stringify(nextSettings));
   }, [
@@ -1943,6 +2661,10 @@ export default function App() {
     isInterpolationStepEnabled,
     isOutputPanelOpen,
     isUpscaleStepEnabled,
+    jobsWindowBounds.height,
+    jobsWindowBounds.left,
+    jobsWindowBounds.top,
+    jobsWindowBounds.width,
     modelId,
     outputMode,
     previewDurationInput,
@@ -1958,41 +2680,462 @@ export default function App() {
   ]);
 
   useEffect(() => {
+    if (!isCleanupPanelOpen || !jobsPanelRef.current || typeof ResizeObserver === "undefined") {
+      return undefined;
+    }
+
+    const panel = jobsPanelRef.current;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) {
+        return;
+      }
+
+      const nextWidth = Math.round(entry.contentRect.width);
+      const nextHeight = Math.round(entry.contentRect.height);
+      setJobsWindowBounds((current) => {
+        const normalized = clampJobsWindowBounds(current, nextWidth, nextHeight);
+        if (
+          normalized.left === current.left
+          && normalized.top === current.top
+          && normalized.width === current.width
+          && normalized.height === current.height
+        ) {
+          return current;
+        }
+        return normalized;
+      });
+    });
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [isCleanupPanelOpen]);
+
+  useEffect(() => {
+    if (!jobsWindowDragState) {
+      return undefined;
+    }
+
+    const handleMouseMove = (event: MouseEvent) => {
+      setJobsWindowBounds((current) => {
+        const nextLeft = event.clientX - jobsWindowDragState.pointerOffsetX;
+        const nextTop = event.clientY - jobsWindowDragState.pointerOffsetY;
+        return clampJobsWindowBounds({ ...current, left: nextLeft, top: nextTop }, current.width, current.height);
+      });
+    };
+
+    const handleMouseUp = () => {
+      setJobsWindowDragState(null);
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [jobsWindowDragState]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      setJobsWindowBounds((current) => clampJobsWindowBounds(current, current.width, current.height));
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
     setExpandedCleanupJobIds((current) => current.filter((jobId) => cleanupJobs.some((job) => job.id === jobId)));
   }, [cleanupJobs]);
 
-  async function ensureRuntime(): Promise<void> {
+  async function ensureRuntime(): Promise<RuntimeStatus> {
     setStatus("Preparing runtime assets...");
     const nextRuntime = await desktopApi.ensureRuntimeAssets();
     setRuntime(nextRuntime);
+    return nextRuntime;
+  }
+
+  async function loadSourceFromPath(sourcePath: string): Promise<SourceVideoSummary> {
+    await ensureRuntime();
+    const summary = await desktopApi.probeSourceVideo(sourcePath);
+    setSource(summary);
+    await resolveSourcePreviewUrl(summary.previewPath || summary.path);
+    setPreviewPlaybackPath(null);
+    setResult(null);
+    setPipelineJob(null);
+    setActiveJobId(null);
+    setSourceConversionJob(null);
+    setSourceConversionJobId(null);
+    setSourceConversionMode(null);
+    setSourceConversionSourcePath(null);
+    setBlindComparison(null);
+    setPipelineProgressEvents([]);
+    setLastPipelineProgressAt(null);
+    pipelineProgressSignatureRef.current = null;
+    setIsCropEditing(false);
+    setIsComparisonWorkspaceOpen(false);
+    setComparisonCurrentTime(0);
+    setComparisonDuration(0);
+    setComparisonPlaying(false);
+    return summary;
+  }
+
+  function resolveRepeatRequest(job: TrackedJobEntry): ResolvedRepeatRequest | null {
+    if (job.jobKind !== "pipeline") {
+      return null;
+    }
+
+    if (job.pipelineRunDetails?.request) {
+      const exactRequest = job.pipelineRunDetails.request;
+      return {
+        request: {
+          ...exactRequest,
+          sourcePath: job.sourcePath ?? exactRequest.sourcePath,
+          modelId: job.modelId ?? exactRequest.modelId,
+          codec: (job.codec === "h264" || job.codec === "h265") ? job.codec : exactRequest.codec,
+          container: (job.container === "mp4" || job.container === "mkv") ? job.container : exactRequest.container,
+          outputPath: normalizeOutputPath(job.outputPath ?? exactRequest.outputPath, (job.container === "mp4" || job.container === "mkv") ? job.container : exactRequest.container),
+        },
+        exact: true,
+      };
+    }
+
+    if (!job.sourcePath || !job.outputPath || !job.modelId || (job.codec !== "h264" && job.codec !== "h265") || (job.container !== "mp4" && job.container !== "mkv")) {
+      return null;
+    }
+
+    const inferredInterpolationMode: InterpolationMode = (job.progress.interpolatedFrames ?? 0) > 0
+      ? (job.progress.upscaledFrames ?? 0) > 0
+        ? "afterUpscale"
+        : "interpolateOnly"
+      : "off";
+    const historicalBackend = getBackendDefinition(getModelDefinition(job.modelId).backendId);
+
+    return {
+      exact: false,
+      request: {
+        sourcePath: job.sourcePath,
+        modelId: job.modelId,
+        outputMode,
+        qualityPreset,
+        interpolationMode: inferredInterpolationMode,
+        interpolationTargetFps: inferredInterpolationMode === "off" ? null : interpolationTargetFps,
+        pytorchRunner: historicalBackend.id === "pytorch-image-sr" ? recommendedPytorchRunner(job.modelId) : "torch",
+        gpuId: selectedGpuId,
+        aspectRatioPreset,
+        customAspectWidth: sizingOptions.customAspectWidth,
+        customAspectHeight: sizingOptions.customAspectHeight,
+        resolutionBasis,
+        targetWidth: sizingOptions.targetWidth,
+        targetHeight: sizingOptions.targetHeight,
+        cropLeft: sizingOptions.cropLeft,
+        cropTop: sizingOptions.cropTop,
+        cropWidth: sizingOptions.cropWidth,
+        cropHeight: sizingOptions.cropHeight,
+        previewMode: false,
+        previewDurationSeconds: null,
+        segmentDurationSeconds: segmentDurationSeconds ?? 10,
+        outputPath: normalizeOutputPath(job.outputPath, job.container),
+        codec: job.codec,
+        container: job.container,
+        tileSize,
+        fp16: false,
+        crf,
+      },
+    };
+  }
+
+  async function applyRepeatedPipelineRequest(request: RealesrganJobRequest): Promise<void> {
+    const nextInterpolationEnabled = request.interpolationMode !== "off";
+    const nextUpscaleEnabled = request.interpolationMode !== "interpolateOnly";
+
+    setModelId(request.modelId);
+    setOutputMode(request.outputMode);
+    setQualityPreset(request.qualityPreset);
+    setSelectedGpuId(request.gpuId);
+    setAspectRatioPreset(request.aspectRatioPreset);
+    setCustomAspectWidthInput(request.customAspectWidth ? String(request.customAspectWidth) : "");
+    setCustomAspectHeightInput(request.customAspectHeight ? String(request.customAspectHeight) : "");
+    setResolutionBasis(request.resolutionBasis);
+    setTargetWidthInput(request.targetWidth ? String(request.targetWidth) : "");
+    setTargetHeightInput(request.targetHeight ? String(request.targetHeight) : "");
+    setCodec(request.codec);
+    setContainer(request.container);
+    setTileSize(request.tileSize);
+    setCrf(request.crf);
+    setIsUpscaleStepEnabled(nextUpscaleEnabled);
+    setIsInterpolationStepEnabled(nextInterpolationEnabled);
+    setInterpolationTargetFps(request.interpolationTargetFps ?? 60);
+    setPytorchRunner(request.pytorchRunner);
+    setPreviewMode(request.previewMode);
+    setPreviewDurationInput(request.previewDurationSeconds ? String(request.previewDurationSeconds) : "8");
+    setSegmentDurationInput(request.segmentDurationSeconds ? String(request.segmentDurationSeconds) : "10");
+    setCropRect(
+      request.cropLeft !== null && request.cropTop !== null && request.cropWidth !== null && request.cropHeight !== null
+        ? {
+            left: request.cropLeft,
+            top: request.cropTop,
+            width: request.cropWidth,
+            height: request.cropHeight,
+          }
+        : null
+    );
+
+    const summary = await loadSourceFromPath(request.sourcePath);
+  setBlindComparisonStartOffsetSeconds(normalizePreviewStartOffsetSeconds(summary, request.previewStartOffsetSeconds ?? 0));
+    setOutputPath(normalizeOutputPath(request.outputPath, request.container));
+
+    if (!supportsEmbeddedFullLengthPreview(summary.container)) {
+      if (summary.durationSeconds <= AUTO_PREVIEW_UPGRADE_MAX_DURATION_SECONDS) {
+        setStatus("Run settings restored. Preparing full-length preview in the background...");
+        void startSourceConversionJob(summary.path, "preview", { background: true });
+      } else {
+        setStatus(`Run settings restored from ${pathLeaf(request.sourcePath)}.`);
+      }
+    } else {
+      setStatus(`Run settings restored from ${pathLeaf(request.sourcePath)}.`);
+    }
+  }
+
+  async function repeatTrackedJob(job: TrackedJobEntry): Promise<void> {
+    const resolvedRepeat = resolveRepeatRequest(job);
+    if (!resolvedRepeat) {
+      setError("This job does not contain enough recorded information to restore template settings.");
+      setStatus("Template settings are unavailable for the selected job.");
+      return;
+    }
+
+    if (!resolvedRepeat.exact) {
+      setStatus(`Restoring ${pathLeaf(resolvedRepeat.request.sourcePath)} with recorded source/output settings and current advanced defaults.`);
+    }
+
+    await repeatPipelineRun(resolvedRepeat.request);
+  }
+
+  async function handoffPipelineRequestToMainWindow(request: RealesrganJobRequest, action: RepeatPipelineRequestAction): Promise<void> {
+    safeLocalStorageSet(REPEAT_PIPELINE_REQUEST_STORAGE_KEY, JSON.stringify(buildRepeatPipelineRequestEnvelope(request, Date.now(), action)));
+    try {
+      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+      const mainWindow = await WebviewWindow.getByLabel("main");
+      if (mainWindow) {
+        await mainWindow.show();
+        await mainWindow.setFocus();
+      }
+    } catch {
+      // Ignore focus handoff failures; the replay request is already persisted.
+    }
+  }
+
+  async function restartTrackedJob(job: TrackedJobEntry): Promise<void> {
+    const resolvedRepeat = resolveRepeatRequest(job);
+    if (!resolvedRepeat) {
+      setError("This job does not contain enough recorded information to restart.");
+      setStatus("Restart is unavailable for the selected job.");
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      setError(null);
+      if (isJobsOnlyView) {
+        await handoffPipelineRequestToMainWindow(resolvedRepeat.request, "restart");
+        setStatus(`Sent ${pathLeaf(resolvedRepeat.request.sourcePath)} to the main window for restart.`);
+        return;
+      }
+
+      setStatus(`Reloading ${pathLeaf(resolvedRepeat.request.sourcePath)} for restart...`);
+      await applyRepeatedPipelineRequest(resolvedRepeat.request);
+      setStatus(`Restarting ${pathLeaf(resolvedRepeat.request.sourcePath)}...`);
+      await startPipelineFromRequest(resolvedRepeat.request, { ensureRuntime: false, queuedStatus: "Restarted job queued." });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setStatus("Failed to restart the selected job.");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function repeatPipelineRun(request: RealesrganJobRequest): Promise<void> {
+    try {
+      setIsBusy(true);
+      setError(null);
+
+      if (isJobsOnlyView) {
+        await handoffPipelineRequestToMainWindow(request, "repeat");
+        setStatus(`Sent ${pathLeaf(request.sourcePath)} template settings to the main window.`);
+        return;
+      }
+
+      await applyRepeatedPipelineRequest(request);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setStatus("Failed to restore template settings from the selected run.");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  function comparisonVideoTargets(): HTMLVideoElement[] {
+    return [
+      comparisonSourceVideoRef.current,
+      ...comparisonEntries.map((entry) => comparisonSampleVideoRefs.current[entry.sampleId] ?? null),
+    ].filter((video): video is HTMLVideoElement => Boolean(video));
+  }
+
+  function setComparisonSourceVideoRef(node: HTMLVideoElement | null): void {
+    comparisonSourceVideoRef.current = node;
+  }
+
+  function setComparisonSampleVideoRef(sampleId: string, node: HTMLVideoElement | null): void {
+    if (node) {
+      comparisonSampleVideoRefs.current[sampleId] = node;
+    } else {
+      delete comparisonSampleVideoRefs.current[sampleId];
+    }
+  }
+
+  function updateComparisonFocusFromEventTarget(target: EventTarget | null, clientX: number, clientY: number): void {
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+
+    const rect = target.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
+
+    const nextFocusX = Math.max(0, Math.min(100, ((clientX - rect.left) / rect.width) * 100));
+    const nextFocusY = Math.max(0, Math.min(100, ((clientY - rect.top) / rect.height) * 100));
+    setComparisonFocusPresetId("manual");
+    setComparisonFocusX(nextFocusX);
+    setComparisonFocusY(nextFocusY);
+  }
+
+  function handleComparisonViewportPointerDown(event: ReactPointerEvent<HTMLElement>): void {
+    updateComparisonFocusFromEventTarget(event.currentTarget, event.clientX, event.clientY);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function handleComparisonViewportPointerMove(event: ReactPointerEvent<HTMLElement>): void {
+    if ((event.buttons & 1) !== 1) {
+      return;
+    }
+    updateComparisonFocusFromEventTarget(event.currentTarget, event.clientX, event.clientY);
+  }
+
+  async function ensureComparisonVideoReady(video: HTMLVideoElement): Promise<boolean> {
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      return true;
+    }
+
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const complete = (ready: boolean) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.clearTimeout(timeoutId);
+        video.removeEventListener("loadeddata", handleReady);
+        video.removeEventListener("canplay", handleReady);
+        video.removeEventListener("error", handleError);
+        resolve(ready);
+      };
+
+      const handleReady = () => complete(true);
+      const handleError = () => complete(false);
+      const timeoutId = window.setTimeout(() => complete(video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA), 5_000);
+
+      video.addEventListener("loadeddata", handleReady, { once: true });
+      video.addEventListener("canplay", handleReady, { once: true });
+      video.addEventListener("error", handleError, { once: true });
+      video.load();
+    });
+  }
+
+  function openComparisonWorkspace(): void {
+    if (isComparisonWorkspaceOpen) {
+      return;
+    }
+    setIsComparisonWorkspaceOpen(true);
+  }
+
+  function closeComparisonWorkspace(): void {
+    comparisonVideoTargets().forEach((video) => video.pause());
+    setComparisonPlaying(false);
+    comparisonDesiredTimeRef.current = 0;
+    setIsComparisonWorkspaceOpen(false);
   }
 
   function refreshComparisonDuration(): void {
-    const sourceDuration = comparisonSourceVideoRef.current?.duration;
-    const outputDuration = comparisonOutputVideoRef.current?.duration;
-    const durations = [sourceDuration, outputDuration].filter((value): value is number => Number.isFinite(value ?? NaN));
-    setComparisonDuration(durations.length > 0 ? Math.max(...durations) : 0);
+    const durations = comparisonVideoTargets()
+      .map((video) => video.duration)
+      .filter((value): value is number => Number.isFinite(value ?? NaN));
+    setComparisonDuration(durations.length > 0 ? Math.min(...durations) : 0);
   }
 
   function syncComparisonTime(nextTime: number): void {
-    const sourceVideo = comparisonSourceVideoRef.current;
-    const outputVideo = comparisonOutputVideoRef.current;
-    const syncTargets = [sourceVideo, outputVideo];
-    for (const video of syncTargets) {
+    const boundedTime = comparisonDuration > 0 ? Math.min(nextTime, comparisonDuration) : nextTime;
+    comparisonDesiredTimeRef.current = boundedTime;
+    for (const video of comparisonVideoTargets()) {
       if (!video || !Number.isFinite(video.duration)) {
         continue;
       }
 
-      const clamped = Math.max(0, Math.min(nextTime, video.duration || nextTime));
+      const clamped = Math.max(0, Math.min(boundedTime, video.duration || boundedTime));
       if (Math.abs(video.currentTime - clamped) > 0.05) {
         video.currentTime = clamped;
       }
     }
-    setComparisonCurrentTime(nextTime);
+    setComparisonCurrentTime(boundedTime);
+  }
+
+  function syncComparisonFrame(nextFrame: number): void {
+    if (comparisonFrameRate <= 0) {
+      syncComparisonTime(nextFrame);
+      return;
+    }
+
+    const clampedFrame = Math.max(0, Math.min(nextFrame, comparisonTimelineMax));
+    syncComparisonTime(clampedFrame / comparisonFrameRate);
+  }
+
+  function handleComparisonTimelineInput(nextValue: number): void {
+    if (comparisonFrameCount > 0) {
+      syncComparisonFrame(nextValue);
+      return;
+    }
+    syncComparisonTime(nextValue);
+  }
+
+  function seekComparisonTimelineFromPointer(event: ReactPointerEvent<HTMLInputElement>): void {
+    const input = event.currentTarget;
+    const bounds = input.getBoundingClientRect();
+    if (bounds.width <= 0) {
+      return;
+    }
+
+    const min = Number(input.min || "0");
+    const max = Number(input.max || "0");
+    if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+      return;
+    }
+
+    const ratio = clamp((event.clientX - bounds.left) / bounds.width, 0, 1);
+    const rawValue = min + ((max - min) * ratio);
+    const nextValue = comparisonFrameCount > 0 ? Math.round(rawValue) : rawValue;
+    handleComparisonTimelineInput(nextValue);
   }
 
   function handleComparisonLoadedMetadata(): void {
     refreshComparisonDuration();
+    if (comparisonFrameRate > 0 && comparisonCurrentFrame > 0) {
+      syncComparisonFrame(comparisonCurrentFrame);
+      return;
+    }
+    if (comparisonCurrentTime > 0) {
+      syncComparisonTime(comparisonCurrentTime);
+    }
   }
 
   function handleComparisonSourceTimeUpdate(): void {
@@ -2001,30 +3144,72 @@ export default function App() {
       return;
     }
 
-    const nextTime = sourceVideo.currentTime;
+    const rawNextTime = sourceVideo.currentTime;
+    const nextTime = comparisonDuration > 0 ? Math.min(rawNextTime, comparisonDuration) : rawNextTime;
+    if (!comparisonPlaying && Math.abs(nextTime - comparisonDesiredTimeRef.current) > 0.08) {
+      return;
+    }
+
+    comparisonDesiredTimeRef.current = nextTime;
     setComparisonCurrentTime(nextTime);
-    const outputVideo = comparisonOutputVideoRef.current;
-    if (outputVideo && Number.isFinite(outputVideo.duration) && Math.abs(outputVideo.currentTime - nextTime) > 0.08) {
-      outputVideo.currentTime = Math.max(0, Math.min(nextTime, outputVideo.duration || nextTime));
+    for (const video of comparisonVideoTargets()) {
+      if (video === sourceVideo || !Number.isFinite(video.duration)) {
+        continue;
+      }
+
+      if (Math.abs(video.currentTime - nextTime) > 0.08) {
+        video.currentTime = Math.max(0, Math.min(nextTime, video.duration || nextTime));
+      }
+    }
+
+    if (comparisonDuration > 0 && rawNextTime >= comparisonDuration - 0.02) {
+      comparisonVideoTargets().forEach((video) => video.pause());
+      setComparisonPlaying(false);
     }
   }
 
   async function toggleComparisonPlayback(): Promise<void> {
-    const sourceVideo = comparisonSourceVideoRef.current;
-    const outputVideo = comparisonOutputVideoRef.current;
-    if (!sourceVideo || !outputVideo) {
+    const videos = comparisonVideoTargets();
+    if (videos.length < 2) {
       return;
     }
 
     if (comparisonPlaying) {
-      sourceVideo.pause();
-      outputVideo.pause();
+      videos.forEach((video) => video.pause());
       setComparisonPlaying(false);
       return;
     }
 
-    await Promise.all([sourceVideo.play(), outputVideo.play()]);
-    setComparisonPlaying(true);
+    const targetTime = comparisonFrameRate > 0
+      ? (comparisonCurrentFrame >= comparisonTimelineMax ? 0 : comparisonCurrentFrame / comparisonFrameRate)
+      : (comparisonDuration > 0 && comparisonCurrentTime >= comparisonDuration - 0.05 ? 0 : comparisonCurrentTime);
+
+    const readyVideos = (await Promise.all(videos.map(async (video) => ({
+      video,
+      ready: await ensureComparisonVideoReady(video),
+    })))).filter((entry) => entry.ready).map((entry) => entry.video);
+
+    if (readyVideos.length === 0) {
+      setComparisonPlaying(false);
+      setStatus("Comparison media is still loading.");
+      return;
+    }
+
+    const playResults = await Promise.allSettled(readyVideos.map(async (video) => {
+      if (Number.isFinite(video.duration)) {
+        const clamped = Math.max(0, Math.min(targetTime, video.duration || targetTime));
+        if (Math.abs(video.currentTime - clamped) > 0.05) {
+          video.currentTime = clamped;
+        }
+      }
+      await video.play();
+    }));
+
+    const playedCount = playResults.filter((result) => result.status === "fulfilled").length;
+    setComparisonPlaying(playedCount > 0);
+    if (playedCount === 0) {
+      setStatus("Comparison media is still loading.");
+    }
   }
 
   function restartComparisonPlayback(): void {
@@ -2127,6 +3312,18 @@ export default function App() {
     video.currentTime = clamped;
   }
 
+  function captureBlindComparisonStartFromPreview(): void {
+    setBlindComparisonStartOffsetSeconds(normalizePreviewStartOffsetSeconds(source, sourcePreviewCurrentTime));
+  }
+
+  function resetBlindComparisonStartOffset(): void {
+    setBlindComparisonStartOffsetSeconds(0);
+  }
+
+  function jumpPreviewToBlindComparisonStart(): void {
+    seekSourcePreview(normalizedBlindComparisonStartOffsetSeconds);
+  }
+
   async function chooseOutputFile(): Promise<string | null> {
     const selected = await desktopApi.selectOutputFile(defaultOutputPath(source, container, modelId), container);
     if (!selected) {
@@ -2138,10 +3335,20 @@ export default function App() {
     return normalized;
   }
 
-  function buildPipelineRequest(targetModelId: ModelId, targetOutputPath: string, quickPreview: boolean, quickPreviewSeconds: number | null): RealesrganJobRequest {
+  function buildPipelineRequest(
+    targetModelId: ModelId,
+    targetOutputPath: string,
+    quickPreview: boolean,
+    quickPreviewSeconds: number | null,
+    overrides?: Partial<Pick<RealesrganJobRequest, "codec" | "container" | "previewStartOffsetSeconds">>,
+  ): RealesrganJobRequest {
     if (!source) {
       throw new Error("Select a source video before starting a pipeline.");
     }
+
+    const resolvedCodec = overrides?.codec ?? codec;
+    const resolvedContainer = overrides?.container ?? container;
+  const resolvedPreviewStartOffsetSeconds = quickPreview ? (overrides?.previewStartOffsetSeconds ?? null) : null;
 
     return {
       sourcePath: source.path,
@@ -2164,14 +3371,41 @@ export default function App() {
       cropHeight: sizingOptions.cropHeight,
       previewMode: quickPreview,
       previewDurationSeconds: quickPreview ? quickPreviewSeconds : null,
+      previewStartOffsetSeconds: resolvedPreviewStartOffsetSeconds,
       segmentDurationSeconds: quickPreview ? null : segmentDurationSeconds,
       outputPath: targetOutputPath,
-      codec,
-      container,
+      codec: resolvedCodec,
+      container: resolvedContainer,
       tileSize,
       fp16: false,
       crf,
     };
+  }
+
+  async function startPipelineFromRequest(request: RealesrganJobRequest, options?: { ensureRuntime?: boolean; queuedStatus?: string }): Promise<string> {
+    const nextRuntime = options?.ensureRuntime === false
+      ? (runtime ?? await ensureRuntime())
+      : await ensureRuntime();
+
+    const requestModel = getModelDefinition(request.modelId);
+    const launchRequirement = modelLaunchRequirement(requestModel, nextRuntime);
+    if (launchRequirement) {
+      throw new Error(launchRequirement);
+    }
+
+    setActivePipelineRequest(request);
+    setOutputPath(normalizeOutputPath(request.outputPath, request.container));
+    setIsPipelineLaunchPending(true);
+    const jobId = await desktopApi.startPipeline(request);
+    setResult(null);
+    setPipelineProgressEvents([]);
+    setLastPipelineProgressAt(null);
+    pipelineProgressSignatureRef.current = null;
+    setIsPipelineLaunchPending(false);
+    setPipelineJob(createQueuedJob(jobId));
+    setActiveJobId(jobId);
+    setStatus(options?.queuedStatus ?? "Job queued.");
+    return jobId;
   }
 
   async function confirmInterpolationPolicy(): Promise<boolean> {
@@ -2211,7 +3445,7 @@ export default function App() {
       setLastPipelineProgressAt(null);
       pipelineProgressSignatureRef.current = null;
       setIsCropEditing(false);
-      setComparisonSampleId(null);
+      setIsComparisonWorkspaceOpen(false);
       setComparisonCurrentTime(0);
       setComparisonDuration(0);
       setComparisonPlaying(false);
@@ -2296,6 +3530,12 @@ export default function App() {
       return;
     }
 
+    if (!isSelectedModelLaunchable) {
+      setError(selectedModelLaunchRequirement);
+      setStatus("Selected model needs additional runtime setup before it can run.");
+      return;
+    }
+
     try {
       setIsBusy(true);
       setError(null);
@@ -2309,19 +3549,13 @@ export default function App() {
         return;
       }
 
-      await ensureRuntime();
       setStatus("Starting Real-ESRGAN pipeline...");
-      const jobId = await desktopApi.startPipeline(
-        buildPipelineRequest(modelId, selectedOutputPath, previewMode, previewMode ? previewDurationSeconds : null)
+      await startPipelineFromRequest(
+        buildPipelineRequest(modelId, selectedOutputPath, previewMode, previewMode ? previewDurationSeconds : null),
+        { ensureRuntime: true, queuedStatus: "Job queued." }
       );
-      setResult(null);
-      setPipelineProgressEvents([]);
-      setLastPipelineProgressAt(null);
-      pipelineProgressSignatureRef.current = null;
-      setPipelineJob(createQueuedJob(jobId));
-      setActiveJobId(jobId);
-      setStatus("Job queued.");
     } catch (caught) {
+      setIsPipelineLaunchPending(false);
       setError(caught instanceof Error ? caught.message : String(caught));
       setStatus("Pipeline failed.");
     } finally {
@@ -2347,6 +3581,42 @@ export default function App() {
     }
   }
 
+  async function pausePipeline(): Promise<void> {
+    if (!activeJobId) {
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      setError(null);
+      await desktopApi.pausePipelineJob(activeJobId);
+      setStatus("Pausing pipeline...");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setStatus("Failed to pause pipeline.");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function resumePipeline(): Promise<void> {
+    if (!activeJobId) {
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      setError(null);
+      await desktopApi.resumePipelineJob(activeJobId);
+      setStatus("Resuming pipeline...");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setStatus("Failed to resume pipeline.");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
   async function cancelSourceConversion(): Promise<void> {
     if (!sourceConversionJobId) {
       return;
@@ -2362,6 +3632,42 @@ export default function App() {
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
       setStatus("Failed to stop source conversion.");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function pauseSourceConversion(): Promise<void> {
+    if (!sourceConversionJobId) {
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      setError(null);
+      await desktopApi.pauseSourceConversionJob(sourceConversionJobId);
+      setStatus("Pausing source conversion...");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setStatus("Failed to pause source conversion.");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function resumeSourceConversion(): Promise<void> {
+    if (!sourceConversionJobId) {
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      setError(null);
+      await desktopApi.resumeSourceConversionJob(sourceConversionJobId);
+      setStatus("Resuming source conversion...");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setStatus("Failed to resume source conversion.");
     } finally {
       setIsBusy(false);
     }
@@ -2400,13 +3706,19 @@ export default function App() {
     setStatus("Output cleared from the workspace.");
   }
 
-  async function deleteManagedArtifact(path: string, label: string, afterDelete: () => void): Promise<void> {
+  async function deleteManagedArtifact(path: string, label: string, afterDelete: () => void, confirmationDetails: string[] = []): Promise<void> {
+    const confirmed = window.confirm(buildDeleteConfirmation(`Delete ${label}?`, path, confirmationDetails));
+    if (!confirmed) {
+      setStatus(`${label} deletion cancelled.`);
+      return;
+    }
+
     try {
       setIsBusy(true);
       setError(null);
       await desktopApi.deleteManagedPath(path);
       afterDelete();
-      applyManagedArtifacts(await loadManagedArtifacts());
+      await refreshManagedWorkspaceState();
       setStatus(`${label} deleted.`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -2431,7 +3743,7 @@ export default function App() {
       for (const path of paths) {
         await desktopApi.deleteManagedPath(path);
       }
-      applyManagedArtifacts(await loadManagedArtifacts());
+      await refreshManagedWorkspaceState();
       setStatus(`${label} deleted.`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -2489,7 +3801,10 @@ export default function App() {
       if (result?.outputPath === path || outputPath === path) {
         setOutputPathStats(null);
       }
-    });
+    }, [
+      "Removes every managed artifact currently stored in this scratch pool.",
+      "Active jobs must already be stopped before the pool can be cleared.",
+    ]);
   }
 
   async function saveRating(nextRating: number | null): Promise<void> {
@@ -2507,13 +3822,25 @@ export default function App() {
     }
   }
 
+  function toggleBlindComparisonModel(modelId: ModelId): void {
+    setSelectedBlindComparisonModelIds((current) => toggleIncludedModel(current, modelId));
+  }
+
+  function restoreRecommendedBlindComparisonModels(): void {
+    setSelectedBlindComparisonModelIds(blindComparisonDefaultCandidates.map((candidate) => candidate.value));
+  }
+
+  function selectAllBlindComparisonModels(): void {
+    setSelectedBlindComparisonModelIds(blindComparisonAvailableModels.map((candidate) => candidate.value));
+  }
+
   async function runBlindComparison(): Promise<void> {
     if (!source) {
       setError("Select a source video before starting blind comparison.");
       return;
     }
 
-    if (blindComparisonCandidates.length < 2) {
+    if (selectedBlindComparisonModelIds.length < 2) {
       setError("Blind comparison needs at least two runnable models.");
       return;
     }
@@ -2523,7 +3850,8 @@ export default function App() {
       setError(null);
       await ensureRuntime();
       const duration = previewDurationSeconds ?? 8;
-      const shuffledModels = shuffleModels(blindComparisonCandidates.map((candidate) => candidate.value));
+      const startOffsetSeconds = normalizePreviewStartOffsetSeconds(source, blindComparisonStartOffsetSeconds);
+      const shuffledModels = shuffleModels(selectedBlindComparisonModelIds);
       const runToken = Date.now().toString(36);
       const startedEntries = shuffledModels.map((candidateModelId, index) => {
         const anonymousLabel = `Sample ${String.fromCharCode(65 + index)}`;
@@ -2540,19 +3868,29 @@ export default function App() {
         state: "running",
         entries: startedEntries,
         previewDurationSeconds: duration,
+        previewStartOffsetSeconds: startOffsetSeconds,
         selectedSampleId: null,
         winnerModelId: null,
         revealed: false,
         error: null,
       });
+      setIsComparisonWorkspaceOpen(false);
+      comparisonSampleVideoRefs.current = {};
+      setComparisonCurrentTime(0);
+      setComparisonDuration(0);
+      setComparisonPlaying(false);
       setStatus("Blind comparison queued.");
 
       void (async () => {
         for (const entry of startedEntries) {
           try {
-            const outputPath = blindComparisonOutputPath(source, container, entry.modelId, entry.anonymousLabel, runToken);
+            const outputPath = blindComparisonOutputPath(source, BLIND_COMPARISON_PREVIEW_CONTAINER, entry.modelId, entry.anonymousLabel, runToken);
             const jobId = await desktopApi.startPipeline(
-              buildPipelineRequest(entry.modelId, outputPath, true, duration)
+              buildPipelineRequest(entry.modelId, outputPath, true, duration, {
+                codec: BLIND_COMPARISON_PREVIEW_CODEC,
+                container: BLIND_COMPARISON_PREVIEW_CONTAINER,
+                previewStartOffsetSeconds: startOffsetSeconds,
+              })
             );
 
             setBlindComparison((current) => current ? {
@@ -2632,6 +3970,7 @@ export default function App() {
       const config = await desktopApi.recordBlindComparisonSelection({
         sourcePath: source.path,
         previewDurationSeconds: blindComparison.previewDurationSeconds,
+        previewStartOffsetSeconds: blindComparison.previewStartOffsetSeconds,
         winnerModelId: winner.modelId,
         candidateModelIds: blindComparison.entries.map((entry) => entry.modelId),
       });
@@ -2730,6 +4069,8 @@ export default function App() {
 
   return (
     <main className="app-shell">
+      {!isJobsOnlyView ? (
+      <>
       <section className="hero-panel">
         <div className="hero-copy">
           <p className="eyebrow">Windows-first video upgrade workbench</p>
@@ -2740,40 +4081,92 @@ export default function App() {
           </p>
         </div>
         <div className="status-card status-card-compact" data-testid="top-status-panel">
-          <div className="status-card-header">
-            <span className="status-label">{compactStatusTitle}</span>
-            <strong>{isSourceConversionRunning ? "Preparing source preview" : compactPipelineLabel}</strong>
-          </div>
-          <span className="status-primary-text">{progressMessage}</span>
-          <div className="progress-shell" aria-label="Pipeline progress">
-            <div className="progress-bar" style={{ width: `${progressPercent}%` }} />
-          </div>
-          <div className="status-metric-row">
-            <span data-testid="top-status-percent">{progressPercent}% complete</span>
-            <span data-testid="top-status-eta">
-              {activePrimaryJob && (activePrimaryJob.progress.estimatedRemainingSeconds ?? 0) > 0
-                ? `ETA ${formatElapsedSeconds(activePrimaryJob.progress.estimatedRemainingSeconds)}`
-                : isPipelineRunning || isSourceConversionRunning
-                  ? "ETA pending"
-                  : "Not running"}
-            </span>
-          </div>
-          {pipelineJob ? (
-            <div className="status-phase-stack">
-              {compactPhaseBars
-                .filter((entry) => entry.id === "upscale" || interpolationEnabled)
-                .map((entry) => (
-                  <div key={entry.id} className="status-phase-row">
-                    <span>{entry.label}</span>
-                    <div className="progress-shell status-mini-progress" aria-hidden="true">
-                      <div className="progress-bar" style={{ width: `${entry.value * 100}%` }} />
-                    </div>
-                    <span>{entry.summary}</span>
-                  </div>
-                ))}
+          <div className="status-card-content">
+            <div className="status-card-header">
+              <div className="status-card-header-copy">
+                <span className="status-label">{compactStatusTitle}</span>
+                <div className="status-card-headline-row">
+                  <strong>{isSourceConversionRunning ? "Preparing source preview" : activeManagedJob ? managedJobLabel(activeManagedJob.label, activeManagedJob.sourcePath) : compactPipelineLabel}</strong>
+                </div>
+              </div>
             </div>
-          ) : null}
-          <span className="status-secondary-text">{compactStatusDetail}</span>
+            <span className="status-primary-text">{progressMessage}</span>
+            <div className="progress-shell" aria-label="Pipeline progress">
+              <div className="progress-bar" style={{ width: `${progressPercent}%` }} />
+            </div>
+            <div className="status-metric-row">
+              <span data-testid="top-status-percent">{progressPercent}% complete</span>
+              <span data-testid="top-status-eta">
+                {activePrimaryJob && (activePrimaryJob.progress.estimatedRemainingSeconds ?? 0) > 0
+                  ? `ETA ${formatElapsedSeconds(activePrimaryJob.progress.estimatedRemainingSeconds)}`
+                  : isPipelineRunning || isSourceConversionRunning
+                    ? "ETA pending"
+                    : "Not running"}
+              </span>
+            </div>
+            <div className="status-secondary-row">
+              <span className="status-secondary-text" data-testid="pipeline-launch-state" data-state={pipelineLaunchState}>Pipeline launch {pipelineLaunchStateLabel}</span>
+            </div>
+            {pipelineJob ? (
+              <div className="status-phase-stack">
+                {compactPhaseBars
+                  .filter((entry) => entry.id === "upscale" || interpolationEnabled)
+                  .map((entry) => (
+                    <div key={entry.id} className="status-phase-row">
+                      <span>{entry.label}</span>
+                      <div className="progress-shell status-mini-progress" aria-hidden="true">
+                        <div className="progress-bar" style={{ width: `${entry.value * 100}%` }} />
+                      </div>
+                      <span>{entry.summary}</span>
+                    </div>
+                  ))}
+              </div>
+            ) : null}
+            <div className="status-secondary-row">
+              <span className="status-secondary-text">{compactStatusDetail}</span>
+            </div>
+          </div>
+          <div className="status-card-rail">
+            <button
+              type="button"
+              className="action-button secondary-button jobs-launch-button"
+              data-testid="job-cleanup-panel-toggle"
+              onClick={() => void openJobsWindow()}
+              title={canOpenNativeJobsWindow ? `Open jobs in a separate native window. ${cleanupJobs.length} tracked jobs.` : `Show the jobs workspace in this browser session. ${cleanupJobs.length} tracked jobs.`}
+            >
+              {isCleanupPanelOpen && !canOpenNativeJobsWindow ? `Hide Jobs [${cleanupJobs.length}]` : `Jobs [${cleanupJobs.length}]`}
+            </button>
+            {topStatusPauseAction || topStatusStopAction ? (
+              <div className="status-control-row">
+                {topStatusPauseAction ? (
+                  <button
+                    type="button"
+                    className="action-button status-icon-button status-pause-button"
+                    data-testid="top-status-pause-button"
+                    onClick={topStatusPauseAction}
+                    disabled={isBusy}
+                    aria-label={isPipelinePaused || isSourceConversionPaused ? "Resume the active job" : "Pause the active job"}
+                    title={isPipelinePaused || isSourceConversionPaused ? "Resume the active job." : "Pause the active job."}
+                  >
+                    {isPipelinePaused || isSourceConversionPaused ? <span className="status-resume-icon" aria-hidden="true" /> : <span className="status-pause-icon" aria-hidden="true" />}
+                  </button>
+                ) : null}
+                {topStatusStopAction ? (
+                  <button
+                    type="button"
+                    className="action-button status-icon-button status-stop-button"
+                    data-testid="top-status-stop-button"
+                    onClick={topStatusStopAction}
+                    disabled={isBusy}
+                    aria-label={isPipelineRunning ? "Stop the active job" : "Stop the active source conversion"}
+                    title={isPipelineRunning ? "Stop the active job." : "Stop the active source conversion."}
+                  >
+                    <span className="status-stop-icon" aria-hidden="true" />
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
         </div>
       </section>
 
@@ -3021,16 +4414,87 @@ export default function App() {
 
         <ExpandablePanel
           title="Blind Test"
-          subtitle={`${blindComparisonCandidates.length} runnable models`}
+          subtitle={`${blindComparisonAvailableModels.length} available • ${selectedBlindComparisonModelIds.length} selected`}
           isOpen={isBlindPanelOpen}
           onToggle={() => setIsBlindPanelOpen((current) => !current)}
           testId="blind-test-panel"
         >
           <section className="blind-comparison-panel" data-testid="blind-comparison-panel">
             <p className="summary">
-              Runs anonymized {previewDurationSeconds ?? 8}s preview exports for every runnable model,
-              then lets you pick the best sample before the app reveals which model produced it.
+              Pick which visible runnable models to include, run anonymized {previewDurationSeconds ?? 8}s preview exports for that set,
+              then compare the same frame, zoom, and focus point across every sample before the app reveals which model produced which result.
             </p>
+            <div className="blind-start-offset-panel" data-testid="blind-start-offset-panel">
+              <div className="blind-start-offset-summary-row">
+                <strong>Comparison Start</strong>
+                <span data-testid="blind-start-offset-readout">{formatClockTime(normalizedBlindComparisonStartOffsetSeconds)}</span>
+              </div>
+              <p className="summary blind-start-offset-note" data-testid="blind-start-offset-note">
+                Scrub the source preview, then capture that position. The comparison clip begins on the first full frame at or after the selected spot.
+              </p>
+              <div className="blind-start-offset-actions">
+                <button
+                  type="button"
+                  className="action-button secondary-button"
+                  data-testid="blind-capture-current-preview-position"
+                  onClick={captureBlindComparisonStartFromPreview}
+                  disabled={!source || isBlindComparisonRunning || isBusy}
+                >
+                  Use Current Preview Position
+                </button>
+                <button
+                  type="button"
+                  className="action-button secondary-button"
+                  data-testid="blind-jump-preview-to-start-offset"
+                  onClick={jumpPreviewToBlindComparisonStart}
+                  disabled={!source || isBlindComparisonRunning || isBusy}
+                >
+                  Jump Preview To Start
+                </button>
+                <button
+                  type="button"
+                  className="action-button secondary-button"
+                  data-testid="blind-reset-start-offset"
+                  onClick={resetBlindComparisonStartOffset}
+                  disabled={!source || isBlindComparisonRunning || isBusy || normalizedBlindComparisonStartOffsetSeconds <= 0}
+                >
+                  Reset To Start
+                </button>
+              </div>
+            </div>
+            <div className="blind-model-toolbar" data-testid="blind-model-selector">
+              <div className="blind-model-toolbar-actions">
+                <button type="button" className="action-button secondary-button" data-testid="blind-select-all-models" onClick={selectAllBlindComparisonModels} disabled={isBlindComparisonRunning || isBusy}>
+                  Select All Visible Models
+                </button>
+                <button type="button" className="action-button secondary-button" data-testid="blind-restore-recommended-models" onClick={restoreRecommendedBlindComparisonModels} disabled={isBlindComparisonRunning || isBusy}>
+                  Restore Recommended Set
+                </button>
+              </div>
+              <div className="blind-model-selector-grid">
+                {blindComparisonAvailableModels.map((model) => {
+                  const isSelected = selectedBlindComparisonModelIds.includes(model.value);
+                  return (
+                    <label key={model.value} className={`blind-model-option${isSelected ? " blind-model-option-selected" : ""}`} data-testid={`blind-model-option-${model.value}`}>
+                      <input
+                        type="checkbox"
+                        data-testid={`blind-model-toggle-${model.value}`}
+                        checked={isSelected}
+                        disabled={isBlindComparisonRunning || isBusy}
+                        onChange={() => toggleBlindComparisonModel(model.value)}
+                      />
+                      <span className="blind-model-option-copy">
+                        <strong>{model.label}</strong>
+                        <span>{model.summary}</span>
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+              <p className="summary blind-model-toolbar-note" data-testid="blind-model-toolbar-note">
+                The selection list shows real model names before the run. Once the comparison starts, each output stays anonymous until you pick a winner.
+              </p>
+            </div>
             <button
               data-testid="run-blind-comparison-button"
               className="action-button secondary-button"
@@ -3046,6 +4510,8 @@ export default function App() {
                   const actualBackend = getBackendDefinition(actualModel.backendId);
                   const isWinner = blindComparison.selectedSampleId === entry.sampleId;
                   const previewPath = entry.status.result?.outputPath;
+                  const comparisonPreviewSrc = resolvedComparisonPreviewUrls[entry.sampleId] ?? (previewPath ? desktopApi.toPreviewSrc(previewPath) : "");
+                  const comparisonPreviewMimeType = previewMimeType(previewPath);
                   return (
                     <article key={entry.sampleId} className={`blind-sample-card${isWinner ? " blind-sample-card-selected" : ""}`} data-testid={`blind-sample-${entry.sampleId}`}>
                       <div className="blind-sample-header">
@@ -3060,10 +4526,22 @@ export default function App() {
                           type="button"
                           className="preview-launcher"
                           data-testid={`blind-open-${entry.sampleId}`}
-                          onClick={() => void openMediaInDefaultApp(previewPath)}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            openComparisonWorkspace();
+                          }}
                         >
-                          <video className="result-preview clickable-preview" preload="metadata" src={desktopApi.toPreviewSrc(previewPath)} data-testid={`blind-preview-${entry.sampleId}`} muted />
-                          <span className="preview-launch-hint">Click to open in the default video app</span>
+                          {isComparisonWorkspaceOpen ? (
+                            <div className="preview-shell preview-placeholder blind-placeholder" data-testid={`blind-preview-suspended-${entry.sampleId}`}>
+                              <span>Comparison workspace open</span>
+                            </div>
+                          ) : (
+                            <video key={comparisonPreviewSrc || entry.sampleId} className="result-preview clickable-preview" preload="metadata" data-testid={`blind-preview-${entry.sampleId}`} muted>
+                              {comparisonPreviewSrc ? <source src={comparisonPreviewSrc} type={comparisonPreviewMimeType} /> : null}
+                            </video>
+                          )}
+                          <span className="preview-launch-hint">Click to open the synchronized comparison workspace</span>
                         </button>
                       ) : (
                         <div className="preview-shell preview-placeholder blind-placeholder">
@@ -3088,150 +4566,217 @@ export default function App() {
                 })}
               </div>
             ) : null}
-            {selectedComparisonEntry && source ? (
+            {comparisonEntries.length > 0 && source ? (
               <section className="comparison-inspector" data-testid="comparison-inspector">
                 <div className="catalog-card-header">
-                  <strong>Comparison Inspector</strong>
-                  <span className="catalog-chip">Zoomed source vs sample</span>
+                  <strong>Comparison Workspace</strong>
+                  <span className="catalog-chip">Synchronized across every ready sample</span>
                 </div>
                 <p className="summary">
-                  Inspect the source beside one blind sample at larger scale, jump between pixel-focus presets, and open either clip in the default player when you need full controls or a full-size window.
+                  Open the larger workspace to inspect the same frame across the source and every ready blind sample. Timeline, zoom, and focus point stay locked together.
                 </p>
-                <div className="inspector-sample-row">
+                <div className="inspector-sample-row comparison-ready-row">
                   {comparisonEntries.map((entry) => (
-                    <button
-                      key={entry.sampleId}
-                      type="button"
-                      className={`inspector-sample-button${entry.sampleId === selectedComparisonEntry.sampleId ? " inspector-sample-button-active" : ""}`}
-                      data-testid={`comparison-select-${entry.sampleId}`}
-                      onClick={() => setComparisonSampleId(entry.sampleId)}
-                    >
+                    <span key={entry.sampleId} className="inspector-sample-button comparison-ready-pill" data-testid={`comparison-select-${entry.sampleId}`}>
                       {entry.anonymousLabel}
-                    </button>
+                    </span>
                   ))}
                 </div>
                 <div className="inspector-controls-grid">
+                  <button type="button" className="action-button secondary-button" data-testid="open-comparison-workspace-button" onClick={openComparisonWorkspace}>
+                    Open Comparison Workspace
+                  </button>
                   <button type="button" className="action-button secondary-button" data-testid="open-source-external-button" onClick={() => void openMediaInDefaultApp(source.path)}>
                     Open Source Externally
                   </button>
-                  <button type="button" className="action-button secondary-button" data-testid="open-sample-external-button" onClick={() => void openMediaInDefaultApp(selectedComparisonEntry.status.result?.outputPath ?? "") }>
-                    Open Sample Externally
-                  </button>
-                  <button type="button" className="action-button secondary-button" data-testid="comparison-play-toggle" onClick={() => void toggleComparisonPlayback()}>
-                    {comparisonPlaying ? "Pause Comparison" : "Play Comparison"}
-                  </button>
-                  <button type="button" className="action-button secondary-button" data-testid="comparison-restart-button" onClick={restartComparisonPlayback}>
-                    Restart Comparison
-                  </button>
-                </div>
-                <label>
-                  Comparison Timeline
-                  <input
-                    data-testid="comparison-time-slider"
-                    type="range"
-                    min={0}
-                    max={Math.max(comparisonDuration, 0.01)}
-                    step={0.01}
-                    value={Math.min(comparisonCurrentTime, Math.max(comparisonDuration, 0.01))}
-                    onChange={(event) => syncComparisonTime(Number(event.target.value))}
-                  />
-                </label>
-                <div className="comparison-toolbar-grid">
-                  <label>
-                    Zoom
-                    <input data-testid="comparison-zoom-slider" type="range" min={1} max={8} step={0.25} value={comparisonZoom} onChange={(event) => setComparisonZoom(Number(event.target.value))} />
-                  </label>
-                  <label>
-                    Horizontal Focus
-                    <input
-                      data-testid="comparison-focus-x-slider"
-                      type="range"
-                      min={0}
-                      max={100}
-                      step={1}
-                      value={comparisonFocusX}
-                      onChange={(event) => {
-                        setComparisonFocusPresetId("manual");
-                        setComparisonFocusX(Number(event.target.value));
-                      }}
-                    />
-                  </label>
-                  <label>
-                    Vertical Focus
-                    <input
-                      data-testid="comparison-focus-y-slider"
-                      type="range"
-                      min={0}
-                      max={100}
-                      step={1}
-                      value={comparisonFocusY}
-                      onChange={(event) => {
-                        setComparisonFocusPresetId("manual");
-                        setComparisonFocusY(Number(event.target.value));
-                      }}
-                    />
-                  </label>
-                </div>
-                <div className="inspector-focus-row">
-                  {comparisonFocusPresets.map((preset) => (
-                    <button
-                      key={preset.id}
-                      type="button"
-                      className={`inspector-focus-button${preset.id === comparisonFocusPresetId ? " inspector-focus-button-active" : ""}`}
-                      data-testid={`comparison-focus-${preset.id}`}
-                      onClick={() => setComparisonFocusPresetId(preset.id)}
-                    >
-                      {preset.label}
-                    </button>
-                  ))}
-                </div>
-                <p className="summary comparison-hint" data-testid="comparison-focus-hint">
-                  {selectedComparisonPreset?.hint ?? "Move around the frame and inspect the sample against the source."}
-                </p>
-                <div className="comparison-inspector-grid">
-                  <article className="comparison-inspector-card">
-                    <div className="catalog-card-header">
-                      <strong>Source</strong>
-                      <span className="catalog-chip">Reference</span>
-                    </div>
-                    <button type="button" className="inspection-viewport" data-testid="comparison-source-viewport" onClick={() => void openMediaInDefaultApp(source.path)}>
-                      <video
-                        ref={comparisonSourceVideoRef}
-                        className="inspection-video"
-                        src={desktopApi.toPreviewSrc(source.previewPath || source.path)}
-                        muted
-                        playsInline
-                        preload="metadata"
-                        onLoadedMetadata={handleComparisonLoadedMetadata}
-                        onTimeUpdate={handleComparisonSourceTimeUpdate}
-                        onPause={() => setComparisonPlaying(false)}
-                        onPlay={() => setComparisonPlaying(true)}
-                        style={{ transform: `scale(${comparisonZoom})`, transformOrigin: `${comparisonFocusX}% ${comparisonFocusY}%` }}
-                      />
-                      <span className="inspection-crosshair" />
-                    </button>
-                  </article>
-                  <article className="comparison-inspector-card">
-                    <div className="catalog-card-header">
-                      <strong>{selectedComparisonEntry.anonymousLabel}</strong>
-                      <span className="catalog-chip">Blind sample</span>
-                    </div>
-                    <button type="button" className="inspection-viewport" data-testid="comparison-sample-viewport" onClick={() => void openMediaInDefaultApp(selectedComparisonEntry.status.result?.outputPath ?? "") }>
-                      <video
-                        ref={comparisonOutputVideoRef}
-                        className="inspection-video"
-                        src={desktopApi.toPreviewSrc(selectedComparisonEntry.status.result?.outputPath ?? "")}
-                        muted
-                        playsInline
-                        preload="metadata"
-                        onLoadedMetadata={handleComparisonLoadedMetadata}
-                        style={{ transform: `scale(${comparisonZoom})`, transformOrigin: `${comparisonFocusX}% ${comparisonFocusY}%` }}
-                      />
-                      <span className="inspection-crosshair" />
-                    </button>
-                  </article>
+                  <span className="summary comparison-ready-note" data-testid="comparison-ready-note">
+                    {comparisonEntries.length} of {blindComparison?.entries.length ?? comparisonEntries.length} samples are ready for synchronized review.
+                  </span>
                 </div>
               </section>
+            ) : null}
+            {comparisonEntries.length > 0 && source && isComparisonWorkspaceOpen ? (
+              <div className="comparison-workspace-overlay" data-testid="comparison-workspace-modal" aria-label="Comparison workspace" aria-modal="true" role="dialog">
+                <div className="comparison-workspace-shell">
+                  <div className="comparison-workspace-header">
+                    <div className="catalog-card-header">
+                      <strong>Comparison Workspace</strong>
+                      <span className="catalog-chip">Source plus {comparisonEntries.length} blind samples</span>
+                    </div>
+                    <button type="button" className="action-button secondary-button" data-testid="comparison-workspace-close" onClick={closeComparisonWorkspace}>
+                      Close Workspace
+                    </button>
+                  </div>
+                  <div className="inspector-controls-grid comparison-workspace-controls">
+                    <button type="button" className="action-button secondary-button" data-testid="comparison-play-toggle" onClick={() => void toggleComparisonPlayback()}>
+                      {comparisonPlaying ? "Pause Comparison" : "Play Comparison"}
+                    </button>
+                    <button type="button" className="action-button secondary-button" data-testid="comparison-restart-button" onClick={restartComparisonPlayback}>
+                      Restart Comparison
+                    </button>
+                    <button type="button" className="action-button secondary-button" data-testid="open-source-external-button" onClick={() => void openMediaInDefaultApp(source.path)}>
+                      Open Source Externally
+                    </button>
+                  </div>
+                  <label>
+                    Comparison Timeline
+                    <span className="summary comparison-ready-note" data-testid="comparison-timeline-readout">
+                      {comparisonFrameCount > 0
+                        ? `Frame ${comparisonCurrentFrame.toLocaleString()} / ${comparisonTimelineMax.toLocaleString()}`
+                        : `${comparisonCurrentTime.toFixed(2)}s`}
+                    </span>
+                    <input
+                      data-testid="comparison-time-slider"
+                      type="range"
+                      min={0}
+                      max={comparisonFrameCount > 0 ? comparisonTimelineMax : Math.max(comparisonDuration, 0.01)}
+                      step={comparisonFrameCount > 0 ? 1 : 0.01}
+                      value={comparisonFrameCount > 0 ? comparisonCurrentFrame : Math.min(comparisonCurrentTime, Math.max(comparisonDuration, 0.01))}
+                      onPointerDown={seekComparisonTimelineFromPointer}
+                      onInput={(event) => handleComparisonTimelineInput(Number((event.target as HTMLInputElement).value))}
+                      onChange={(event) => handleComparisonTimelineInput(Number(event.target.value))}
+                    />
+                  </label>
+                  <div className="comparison-toolbar-grid">
+                    <label>
+                      Zoom
+                      <input data-testid="comparison-zoom-slider" type="range" min={1} max={16} step={0.25} value={comparisonZoom} onChange={(event) => setComparisonZoom(Number(event.target.value))} />
+                    </label>
+                    <label>
+                      Horizontal Focus
+                      <input
+                        data-testid="comparison-focus-x-slider"
+                        type="range"
+                        min={0}
+                        max={100}
+                        step={1}
+                        value={comparisonFocusX}
+                        onChange={(event) => {
+                          setComparisonFocusPresetId("manual");
+                          setComparisonFocusX(Number(event.target.value));
+                        }}
+                      />
+                    </label>
+                    <label>
+                      Vertical Focus
+                      <input
+                        data-testid="comparison-focus-y-slider"
+                        type="range"
+                        min={0}
+                        max={100}
+                        step={1}
+                        value={comparisonFocusY}
+                        onChange={(event) => {
+                          setComparisonFocusPresetId("manual");
+                          setComparisonFocusY(Number(event.target.value));
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <div className="inspector-focus-row">
+                    {comparisonFocusPresets.map((preset) => (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        className={`inspector-focus-button${preset.id === comparisonFocusPresetId ? " inspector-focus-button-active" : ""}`}
+                        data-testid={`comparison-focus-${preset.id}`}
+                        onClick={() => setComparisonFocusPresetId(preset.id)}
+                      >
+                        {preset.label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="summary comparison-hint" data-testid="comparison-focus-hint">
+                    {selectedComparisonPreset?.hint ?? "Move around the frame and inspect every sample against the source."}
+                  </p>
+                  <div className="comparison-inspector-grid comparison-workspace-grid">
+                    <article className="comparison-inspector-card comparison-workspace-card">
+                      <div className="catalog-card-header">
+                        <strong>Source</strong>
+                        <span className="catalog-chip">Reference</span>
+                      </div>
+                      <div
+                        className="inspection-viewport comparison-workspace-viewport"
+                        data-testid="comparison-source-viewport"
+                        onPointerDown={handleComparisonViewportPointerDown}
+                        onPointerMove={handleComparisonViewportPointerMove}
+                      >
+                        <video
+                          key={comparisonSourcePreviewSrc || comparisonSourcePreviewPath}
+                          ref={setComparisonSourceVideoRef}
+                          className="inspection-video"
+                          muted
+                          playsInline
+                          preload="auto"
+                          onLoadedMetadata={handleComparisonLoadedMetadata}
+                          onLoadedData={handleComparisonLoadedMetadata}
+                          onTimeUpdate={handleComparisonSourceTimeUpdate}
+                          onPause={() => setComparisonPlaying(false)}
+                          onPlay={() => setComparisonPlaying(true)}
+                          style={{ transform: `scale(${comparisonZoom})`, transformOrigin: `${comparisonFocusX}% ${comparisonFocusY}%` }}
+                        >
+                          {comparisonSourcePreviewSrc ? <source src={comparisonSourcePreviewSrc} type={comparisonSourcePreviewMimeType} /> : null}
+                        </video>
+                        <span className="inspection-crosshair" />
+                      </div>
+                    </article>
+                    {comparisonEntries.map((entry) => {
+                      const actualModel = getModelDefinition(entry.modelId);
+                      const actualBackend = getBackendDefinition(actualModel.backendId);
+                      const isWinner = blindComparison?.selectedSampleId === entry.sampleId;
+                      const previewPath = entry.status.result?.outputPath ?? "";
+                      const comparisonPreviewSrc = resolvedComparisonPreviewUrls[entry.sampleId] ?? desktopApi.toPreviewSrc(previewPath);
+                      const comparisonPreviewMimeType = previewMimeType(previewPath);
+                      return (
+                        <article key={entry.sampleId} className="comparison-inspector-card comparison-workspace-card" data-testid={`comparison-workspace-card-${entry.sampleId}`}>
+                          <div className="catalog-card-header">
+                            <strong>{entry.anonymousLabel}</strong>
+                            <span className="catalog-chip">Blind sample</span>
+                          </div>
+                          <div
+                            className="inspection-viewport comparison-workspace-viewport"
+                            data-testid={`comparison-sample-viewport-${entry.sampleId}`}
+                            onPointerDown={handleComparisonViewportPointerDown}
+                            onPointerMove={handleComparisonViewportPointerMove}
+                          >
+                            <video
+                              key={comparisonPreviewSrc || entry.sampleId}
+                              ref={(node) => setComparisonSampleVideoRef(entry.sampleId, node)}
+                              className="inspection-video"
+                              muted
+                              playsInline
+                              preload="auto"
+                              onLoadedMetadata={handleComparisonLoadedMetadata}
+                              onLoadedData={handleComparisonLoadedMetadata}
+                              style={{ transform: `scale(${comparisonZoom})`, transformOrigin: `${comparisonFocusX}% ${comparisonFocusY}%` }}
+                            >
+                              {comparisonPreviewSrc ? <source src={comparisonPreviewSrc} type={comparisonPreviewMimeType} /> : null}
+                            </video>
+                            <span className="inspection-crosshair" />
+                          </div>
+                          <div className="comparison-workspace-card-actions">
+                            <button type="button" className="action-button secondary-button" data-testid={`comparison-open-external-${entry.sampleId}`} onClick={() => void openMediaInDefaultApp(entry.status.result?.outputPath ?? "") }>
+                              Open Externally
+                            </button>
+                            {blindComparison?.state === "ready" && !blindComparison.revealed ? (
+                              <button type="button" className="action-button secondary-button" data-testid={`comparison-pick-${entry.sampleId}`} onClick={() => void chooseBlindWinner(entry.sampleId)}>
+                                Pick {entry.anonymousLabel}
+                              </button>
+                            ) : null}
+                            {blindComparison?.revealed ? (
+                              <div className="blind-reveal-block" data-testid={`comparison-workspace-reveal-${entry.sampleId}`}>
+                                <strong>{actualModel.label}</strong>
+                                <span>{actualBackend.label}</span>
+                                {isWinner ? <span className="winner-pill">Selected winner</span> : null}
+                              </div>
+                            ) : null}
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
             ) : null}
             {blindComparison?.error ? <p className="error-text">{blindComparison.error}</p> : null}
           </section>
@@ -3301,13 +4846,15 @@ export default function App() {
                     <div className="pipeline-detail-body">
                       <div className="catalog-card-header">
                         <strong data-testid="selected-model-label">{selectedModel.label}</strong>
-                        <span className={`catalog-chip execution-${selectedModel.executionStatus}`} data-testid="selected-model-status">
-                          {isSelectedModelImplemented ? selectedModel.executionStatus : "not implemented"}
+                        <span className={`catalog-chip execution-${!isSelectedModelImplemented ? "planned" : isSelectedModelLaunchable ? selectedModel.executionStatus : "setup-required"}`} data-testid="selected-model-status">
+                          {!isSelectedModelImplemented ? "not implemented" : isSelectedModelLaunchable ? selectedModel.executionStatus : "setup required"}
                         </span>
                       </div>
                       <p className="summary" data-testid="selected-model-summary">{selectedModel.summary}</p>
                       {!isSelectedModelImplemented ? (
                         <p className="summary" data-testid="selected-model-availability">This model is visible in the catalog but is not implemented yet, so it cannot be selected for export.</p>
+                      ) : !isSelectedModelLaunchable ? (
+                        <p className="summary" data-testid="selected-model-availability">{selectedModelLaunchRequirement} Configure the external runner, refresh runtime assets by loading a source, and try again.</p>
                       ) : null}
                       <dl className="facts compact-facts">
                         <div><dt>Backend</dt><dd>{selectedBackend.label}</dd></div>
@@ -3396,7 +4943,7 @@ export default function App() {
                   <label>
                     Tile Size
                     <input data-testid="tile-size-input" type="number" min={0} step={32} value={tileSize} onChange={(event) => setTileSize(Number(event.target.value))} />
-                    <span className="summary">Use 0 for auto: PyTorch defaults to 384 on balanced quality, NCNN defaults to 256.</span>
+                    <span className="summary">Use 0 for auto: the selected Quality Preset applies backend-specific tile defaults. PyTorch image SR uses 512/384/256, RVRT uses 256/192/128, and NCNN uses auto/256/128 for Max/Balanced/VRAM Safe.</span>
                   </label>
                   <label>
                     CRF
@@ -3564,9 +5111,9 @@ export default function App() {
                 Enable at least one pipeline step before running.
               </p>
             ) : null}
-            {hasEnabledPipelineStep && isUpscaleStepEnabled && !isSelectedModelImplemented ? (
+            {hasEnabledPipelineStep && isUpscaleStepEnabled && !isSelectedModelLaunchable ? (
               <p className="summary" data-testid="run-disabled-reason">
-                {selectedModel.label} is not implemented yet, so export is disabled.
+                {selectedModelLaunchRequirement}
               </p>
             ) : null}
             <details className="pipeline-detail-disclosure pipeline-runtime-disclosure">
@@ -3624,8 +5171,23 @@ export default function App() {
                     <div><dt>Work Dir</dt><dd>{result.workDir}</dd></div>
                     <div><dt>Scratch Size</dt><dd>{formatBytes(workDirStats?.sizeBytes ?? 0)}</dd></div>
                     <div><dt>Frames</dt><dd>{result.frameCount}</dd></div>
+                    <div><dt>Source Media</dt><dd>{formatMediaSummary(result.sourceMedia ?? null)}</dd></div>
+                    <div><dt>Output Media</dt><dd>{formatMediaSummary(result.outputMedia ?? null)}</dd></div>
                     <div><dt>Codec</dt><dd>{formatMediaLabel(result.codec)}</dd></div>
                     <div><dt>Container</dt><dd>{String(result.container).toUpperCase()}</dd></div>
+                    <div><dt>Quality Preset</dt><dd>{formatQualityPresetLabel(result.effectiveSettings?.qualityPreset)}</dd></div>
+                    <div><dt>Requested Tile Size</dt><dd>{result.effectiveSettings?.requestedTileSize && result.effectiveSettings.requestedTileSize > 0 ? result.effectiveSettings.requestedTileSize : "Auto"}</dd></div>
+                    <div><dt>Effective Tile Size</dt><dd>{result.effectiveSettings?.effectiveTileSize ?? "Unknown"}</dd></div>
+                    <div><dt>Precision</dt><dd>{result.effectiveSettings?.effectivePrecision ?? result.precision ?? "Unknown"}</dd></div>
+                    <div><dt>Precision Source</dt><dd>{formatPrecisionSourceLabel(result.effectiveSettings?.precisionSource)}</dd></div>
+                    <div><dt>Execution Path</dt><dd>{result.executionPath ?? "Unknown"}</dd></div>
+                    <div><dt>Runner</dt><dd>{result.runner ?? "Unknown"}</dd></div>
+                    <div><dt>Video Encoder</dt><dd>{result.videoEncoderLabel ?? result.videoEncoder ?? "Unknown"}</dd></div>
+                    <div><dt>Average Throughput</dt><dd data-testid="result-average-throughput">{formatFramesPerSecond(result.averageThroughputFps)}</dd></div>
+                    <div><dt>Effective Pixels Per Second</dt><dd data-testid="result-effective-pixels-per-second">{formatPixelsPerSecond(computePixelsPerSecond(result.outputMedia ?? null, result.averageThroughputFps))}</dd></div>
+                    <div><dt>Peak Worker RAM</dt><dd>{formatPeakRam(result.resourcePeaks ?? null)}</dd></div>
+                    <div><dt>Peak GPU Memory</dt><dd>{formatPeakGpuMemory(result.resourcePeaks ?? null)}</dd></div>
+                    <div><dt>Stage Times</dt><dd data-testid="result-stage-timings">{formatStageTimingsSummary(result.stageTimings ?? null) ?? "Unavailable"}</dd></div>
                     <div><dt>Audio Sync</dt><dd>{result.hadAudio ? "Original audio remuxed" : "No source audio"}</dd></div>
                   </dl>
                 </details>
@@ -3671,15 +5233,41 @@ export default function App() {
 
         </div>
       </section>
+      </>
+      ) : null}
 
-      <section className="advanced-panel-stack" ref={jobsPanelRef}>
-        <ExpandablePanel
-          title="Jobs"
-          subtitle={`${cleanupJobs.length} tracked and historical jobs`}
-          isOpen={isCleanupPanelOpen}
-          onToggle={toggleCleanupPanel}
-          testId="job-cleanup-panel"
-        >
+      {isJobsOnlyView || isCleanupPanelOpen ? (
+        <section className={`jobs-floating-window-shell${isJobsOnlyView ? " jobs-floating-window-shell-standalone" : ""}`} aria-label={isJobsOnlyView ? "Jobs window" : "Jobs window overlay"}>
+          <article
+            className={`panel jobs-floating-window${jobsWindowDragState ? " jobs-floating-window-dragging" : ""}${isJobsOnlyView ? " jobs-floating-window-standalone" : ""}`}
+            data-testid="job-cleanup-panel"
+            ref={jobsPanelRef}
+            style={isJobsOnlyView ? undefined : {
+              left: `${jobsWindowBounds.left}px`,
+              top: `${jobsWindowBounds.top}px`,
+              width: `${jobsWindowBounds.width}px`,
+              height: `${jobsWindowBounds.height}px`,
+            }}
+          >
+            <div className="jobs-floating-window-header" onMouseDown={beginJobsWindowDrag}>
+              <div className="jobs-floating-window-title-block">
+                <h2>Jobs</h2>
+                <span className="expandable-panel-subtitle">{cleanupJobs.length} tracked and historical jobs</span>
+              </div>
+              <div className="jobs-floating-window-actions">
+                {!isJobsOnlyView ? (
+                  <button type="button" className="action-button secondary-button jobs-window-action" data-testid="jobs-window-reset" onClick={() => setJobsWindowBounds(defaultJobsWindowBounds())}>
+                    Reset Window
+                  </button>
+                ) : null}
+                {!isJobsOnlyView ? (
+                  <button type="button" className="action-button secondary-button jobs-window-action" data-testid="jobs-window-close" onClick={() => void closeJobsWindow()}>
+                    Close
+                  </button>
+                ) : null}
+              </div>
+            </div>
+            <div className="jobs-floating-window-body">
           {sourceConversionJob && !pipelineJob ? (
             <div className="job-progress-panel" data-testid="conversion-progress-panel">
               <div className="catalog-card-header">
@@ -3842,9 +5430,15 @@ export default function App() {
                           </button>
                         </th>
                         <th scope="col">
-                          <button type="button" className={`cleanup-sort-button${cleanupSort.column === "size" ? " cleanup-sort-button-active" : ""}`} data-testid="cleanup-sort-size" onClick={() => setCleanupSort((current) => toggleCleanupSort(current, "size"))}>
-                            <span>Size</span>
-                            <span className="cleanup-sort-arrow">{cleanupSortIndicator(cleanupSort, "size")}</span>
+                          <button type="button" className={`cleanup-sort-button${cleanupSort.column === "scratchSize" ? " cleanup-sort-button-active" : ""}`} data-testid="cleanup-sort-scratch-size" onClick={() => setCleanupSort((current) => toggleCleanupSort(current, "scratchSize"))}>
+                            <span>Temp Size</span>
+                            <span className="cleanup-sort-arrow">{cleanupSortIndicator(cleanupSort, "scratchSize")}</span>
+                          </button>
+                        </th>
+                        <th scope="col">
+                          <button type="button" className={`cleanup-sort-button${cleanupSort.column === "outputSize" ? " cleanup-sort-button-active" : ""}`} data-testid="cleanup-sort-output-size" onClick={() => setCleanupSort((current) => toggleCleanupSort(current, "outputSize"))}>
+                            <span>Output Size</span>
+                            <span className="cleanup-sort-arrow">{cleanupSortIndicator(cleanupSort, "outputSize")}</span>
                           </button>
                         </th>
                         <th scope="col">
@@ -3871,7 +5465,26 @@ export default function App() {
                     <tbody>
                       {filteredCleanupJobs.map((job) => {
                         const isExpanded = expandedCleanupJobIds.includes(job.id);
-                        const combinedSizeBytes = cleanupJobTotalBytes(job);
+                        const runDetails = job.pipelineRunDetails;
+                        const repeatRequest = resolveRepeatRequest(job);
+                        const canRestartJob = job.jobKind === "pipeline" && (job.state === "interrupted" || job.state === "cancelled") && Boolean(repeatRequest);
+                        const canLoadTemplate = Boolean(repeatRequest);
+                        const isRecoverableStoppedJob = job.state === "interrupted" || job.state === "cancelled";
+                        const templateTitle = repeatRequest?.exact
+                          ? (isJobsOnlyView ? "Send this run's settings back to the main window so it is ready to rerun." : "Restore this run's settings into the current workspace so you can rerun or tweak them.")
+                          : (isJobsOnlyView ? "Send this older job's recorded source/output settings to the main window, using current advanced defaults for fields that were not saved." : "Restore this older job's recorded source/output settings, using current advanced defaults for fields that were not saved.");
+                        const detailTemplateLabel = repeatRequest?.exact
+                          ? (isJobsOnlyView ? "Load Template In Main Window" : "Load Template")
+                          : (isJobsOnlyView ? "Load Template In Main Window" : "Load Template From Job");
+                        const restartTitle = isJobsOnlyView
+                          ? "Send this stopped job back to the main window and restart it from the beginning."
+                          : "Reload the recorded settings for this stopped job and start it again from the beginning.";
+                        const outputMedia = runDetails?.outputMedia ?? null;
+                        const averageThroughputFps = job.progress.averageFramesPerSecond ?? runDetails?.averageThroughputFps ?? null;
+                        const averagePixelsPerSecond = computePixelsPerSecond(outputMedia, averageThroughputFps);
+                        const currentPixelsPerSecond = computePixelsPerSecond(outputMedia, job.progress.rollingFramesPerSecond);
+                        const stageTimings = formatStageTimingsSummary(runDetails?.stageTimings ?? null) ?? formatStageTimings(job.progress);
+                        const exactRunMetadata = runDetails ? JSON.stringify(runDetails, null, 2) : null;
                         return (
                           <Fragment key={job.id}>
                             <tr className="cleanup-jobs-row" data-testid={`cleanup-job-${job.id}`}>
@@ -3888,19 +5501,46 @@ export default function App() {
                                   <span className="cleanup-row-message">{job.scratchPath ? `Scratch: ${pathLabel(job.scratchPath, "No scratch")}` : "No scratch"}</span>
                                 </div>
                               </td>
-                              <td data-testid={`cleanup-size-${job.id}`}>{formatBytes(combinedSizeBytes)}</td>
+                              <td data-testid={`cleanup-scratch-size-${job.id}`}>{formatBytes(job.scratchSizeBytes)}</td>
+                              <td data-testid={`cleanup-output-size-${job.id}`}>{formatBytes(job.outputSizeBytes)}</td>
                               <td data-testid={`cleanup-updated-${job.id}`}>{formatRelativeTime(job.updatedAt)}</td>
                               <td data-testid={`cleanup-input-${job.id}`} title={job.sourcePath ?? "No input path"}>{pathLabel(job.sourcePath, "No input")}</td>
                               <td data-testid={`cleanup-output-${job.id}`} title={job.outputPath ?? "No output path"}>{pathLabel(job.outputPath, "No output")}</td>
                               <td>
-                                <button type="button" className="cleanup-expand-button" data-testid={`cleanup-expand-${job.id}`} onClick={() => toggleCleanupJobExpanded(job.id)}>
-                                  {isExpanded ? "Hide Details" : "Show Details"}
-                                </button>
+                                <div className="cleanup-row-actions">
+                                  {canLoadTemplate ? (
+                                    <button
+                                      type="button"
+                                      className="cleanup-expand-button cleanup-repeat-button"
+                                      data-testid={`cleanup-row-repeat-${job.id}`}
+                                      onClick={() => void repeatTrackedJob(job)}
+                                      disabled={isBusy}
+                                      title={templateTitle}
+                                    >
+                                      Load Template
+                                    </button>
+                                  ) : null}
+                                  {canRestartJob ? (
+                                    <button
+                                      type="button"
+                                      className="cleanup-expand-button cleanup-repeat-button"
+                                      data-testid={`cleanup-row-restart-${job.id}`}
+                                      onClick={() => void restartTrackedJob(job)}
+                                      disabled={isBusy}
+                                      title={restartTitle}
+                                    >
+                                      Restart
+                                    </button>
+                                  ) : null}
+                                  <button type="button" className="cleanup-expand-button" data-testid={`cleanup-expand-${job.id}`} onClick={() => toggleCleanupJobExpanded(job.id)}>
+                                    {isExpanded ? "Hide Details" : "Show Details"}
+                                  </button>
+                                </div>
                               </td>
                             </tr>
                             {isExpanded ? (
                               <tr className="cleanup-jobs-detail-row" data-testid={`cleanup-details-row-${job.id}`}>
-                                <td colSpan={7}>
+                                <td colSpan={8}>
                                   <div className="cleanup-details-panel" data-testid={`cleanup-details-${job.id}`}>
                                     <div className="cleanup-details-grid">
                                       <span>Status Message: {job.message}</span>
@@ -3909,17 +5549,74 @@ export default function App() {
                                       <span>Phase: {job.phase}</span>
                                       <span>Recorded Frames: {job.recordedCount}</span>
                                       <span>Model: {job.modelId ?? "Unknown model"}</span>
-                                      <span>Codec / Container: {job.codec ?? "Unknown codec"} / {job.container ?? "Unknown container"}</span>
-                                      <span>Scratch Size / Output Size: {formatBytes(job.scratchSizeBytes)} / {formatBytes(job.outputSizeBytes)}</span>
-                                      <span>Average / Current Throughput: {formatFramesPerSecond(job.progress.averageFramesPerSecond)} / {formatFramesPerSecond(job.progress.rollingFramesPerSecond)}</span>
-                                      <span>Elapsed / ETA: {formatElapsedSeconds(job.progress.elapsedSeconds)} / {formatElapsedSeconds(job.progress.estimatedRemainingSeconds)}</span>
-                                      <span>Worker RAM / GPU Memory: {formatBytes(job.progress.processRssBytes ?? 0)} / {formatGpuMemory(job.progress.gpuMemoryUsedBytes, job.progress.gpuMemoryTotalBytes)}</span>
-                                      <span>Stage Times: {formatStageTimings(job.progress)}</span>
+                                      {isRecoverableStoppedJob ? <span>Recovery: This incomplete job can be restarted immediately or loaded as a template for edits first.</span> : null}
+                                      <span>Codec: {job.codec ?? "Unknown codec"}</span>
+                                      <span>Container: {job.container ?? "Unknown container"}</span>
+                                      <span>Scratch Size: {formatBytes(job.scratchSizeBytes)}</span>
+                                      <span>Output Size: {formatBytes(job.outputSizeBytes)}</span>
+                                      <span>Average Throughput: {formatFramesPerSecond(averageThroughputFps)}</span>
+                                      <span>Current Throughput: {formatFramesPerSecond(job.progress.rollingFramesPerSecond)}</span>
+                                      <span>Effective Pixels Per Second: {formatPixelsPerSecond(averagePixelsPerSecond)}</span>
+                                      <span>Current Pixels Per Second: {formatPixelsPerSecond(currentPixelsPerSecond)}</span>
+                                      <span>Elapsed: {formatElapsedSeconds(job.progress.elapsedSeconds)}</span>
+                                      <span>ETA: {formatElapsedSeconds(job.progress.estimatedRemainingSeconds)}</span>
+                                      <span>Peak Worker RAM: {runDetails?.resourcePeaks ? formatPeakRam(runDetails.resourcePeaks) : formatBytes(job.progress.processRssBytes ?? 0)}</span>
+                                      <span>Peak GPU Memory: {runDetails?.resourcePeaks ? formatPeakGpuMemory(runDetails.resourcePeaks) : formatGpuMemory(job.progress.gpuMemoryUsedBytes, job.progress.gpuMemoryTotalBytes)}</span>
+                                      <span>Stage Times: {stageTimings}</span>
+                                      {runDetails ? <span>Source Media: {formatMediaSummary(runDetails.sourceMedia ?? null)}</span> : null}
+                                      {runDetails ? <span>Output Media: {formatMediaSummary(runDetails.outputMedia ?? null)}</span> : null}
+                                      {runDetails ? <span>Execution Path: {runDetails.executionPath ?? "Unknown"}</span> : null}
+                                      {runDetails ? <span>Precision: {runDetails.effectiveSettings?.effectivePrecision ?? runDetails.precision ?? "Unknown"}</span> : null}
+                                      {runDetails ? <span>Encoder: {runDetails.videoEncoderLabel ?? runDetails.videoEncoder ?? "Unknown"}</span> : null}
+                                      {runDetails ? <span>Runner: {runDetails.runner ?? "Unknown"}</span> : null}
+                                      {runDetails ? <span>Quality Preset: {formatQualityPresetLabel(runDetails.effectiveSettings?.qualityPreset ?? runDetails.request.qualityPreset)}</span> : null}
+                                      {runDetails ? <span>Requested Tile Size: {runDetails.request.tileSize > 0 ? runDetails.request.tileSize : "Auto"}</span> : null}
+                                      {runDetails ? <span>Effective Tile Size: {runDetails.effectiveSettings?.effectiveTileSize ?? "Unknown"}</span> : null}
+                                      {runDetails ? <span>Output Mode: {runDetails.request.outputMode}</span> : null}
+                                      {runDetails ? <span>Resolution Basis: {runDetails.request.resolutionBasis}</span> : null}
+                                      {runDetails ? <span>Interpolation: {runDetails.request.interpolationMode}{runDetails.request.interpolationTargetFps ? ` @ ${runDetails.request.interpolationTargetFps} fps` : ""}</span> : null}
+                                      {runDetails ? <span>Preview Mode: {runDetails.request.previewMode ? "on" : "off"}</span> : null}
+                                      {runDetails ? <span>Segment Duration: {runDetails.request.segmentDurationSeconds ? formatElapsedSeconds(runDetails.request.segmentDurationSeconds) : "auto"}</span> : null}
+                                      {runDetails ? <span>GPU ID: {runDetails.request.gpuId ?? "auto"}</span> : null}
+                                      {runDetails ? <span>PyTorch Runner: {runDetails.request.pytorchRunner}</span> : null}
+                                      {runDetails ? <span>CRF: {runDetails.request.crf}</span> : null}
+                                      {runDetails ? <span>Precision Source: {formatPrecisionSourceLabel(runDetails.effectiveSettings?.precisionSource)}</span> : null}
+                                      {runDetails?.runtime ? <span>Runtime Paths: FFmpeg {runDetails.runtime.ffmpegPath} • Real-ESRGAN {runDetails.runtime.realesrganPath} • Models {runDetails.runtime.modelDir}</span> : null}
                                       <span>Input Path: {job.sourcePath ?? "No input path recorded"}</span>
                                       <span>Scratch Path: {job.scratchPath ?? "No scratch path recorded"}</span>
                                       <span>Output Path: {job.outputPath ?? "No output path recorded"}</span>
                                     </div>
+                                    {exactRunMetadata ? (
+                                      <details className="source-details-shell">
+                                        <summary className="source-detail-summary">Exact Run Metadata</summary>
+                                        <pre className="log-output-shell">{exactRunMetadata}</pre>
+                                      </details>
+                                    ) : null}
                                     <div className="job-progress-actions wrap-actions">
+                                      {canLoadTemplate ? (
+                                        <button
+                                          type="button"
+                                          className="action-button secondary-button"
+                                          data-testid={`cleanup-repeat-${job.id}`}
+                                          onClick={() => void repeatTrackedJob(job)}
+                                          disabled={isBusy}
+                                          title={templateTitle}
+                                        >
+                                          {detailTemplateLabel}
+                                        </button>
+                                      ) : null}
+                                      {canRestartJob ? (
+                                        <button
+                                          type="button"
+                                          className="action-button secondary-button"
+                                          data-testid={`cleanup-restart-${job.id}`}
+                                          onClick={() => void restartTrackedJob(job)}
+                                          disabled={isBusy}
+                                          title={restartTitle}
+                                        >
+                                          {isJobsOnlyView ? "Restart In Main Window" : "Restart Job"}
+                                        </button>
+                                      ) : null}
                                       {job.outputPath ? (
                                         <button type="button" className="action-button secondary-button" data-testid={`cleanup-open-output-${job.id}`} onClick={() => void openMediaInDefaultApp(job.outputPath!)} disabled={isBusy}>
                                           Open Output
@@ -3931,17 +5628,27 @@ export default function App() {
                                         </button>
                                       ) : null}
                                       {job.onStop ? (
-                                        <button type="button" className="action-button secondary-button" data-testid={`cleanup-stop-${job.id}`} onClick={job.onStop} disabled={isBusy}>
-                                          Stop Job
+                                        <button type="button" className="action-button cleanup-stop-button" data-testid={`cleanup-stop-${job.id}`} onClick={job.onStop} disabled={isBusy} title="Stop this active job.">
+                                          Stop
                                         </button>
                                       ) : null}
+                                        {job.onPause ? (
+                                          <button type="button" className="action-button secondary-button" data-testid={`cleanup-pause-${job.id}`} onClick={job.onPause} disabled={isBusy} title="Pause this active job.">
+                                            Pause
+                                          </button>
+                                        ) : null}
+                                        {job.onResume ? (
+                                          <button type="button" className="action-button secondary-button" data-testid={`cleanup-resume-${job.id}`} onClick={job.onResume} disabled={isBusy} title="Resume this paused job.">
+                                            Resume
+                                          </button>
+                                        ) : null}
                                       {job.onClearScratch ? (
-                                        <button type="button" className="action-button secondary-button" data-testid={`cleanup-clear-scratch-${job.id}`} onClick={job.onClearScratch} disabled={isBusy || isPipelineRunning}>
+                                        <button type="button" className="action-button secondary-button" data-testid={`cleanup-clear-scratch-${job.id}`} onClick={job.onClearScratch} disabled={isBusy || isPipelineRunning} title="Delete this job's scratch folder and intermediate working files. The job record stays available.">
                                           Clear Job Scratch
                                         </button>
                                       ) : null}
                                       {job.onDeleteOutput ? (
-                                        <button type="button" className="action-button secondary-button" data-testid={`cleanup-delete-output-${job.id}`} onClick={job.onDeleteOutput} disabled={isBusy || isPipelineRunning || isSourceConversionRunning}>
+                                        <button type="button" className="action-button secondary-button" data-testid={`cleanup-delete-output-${job.id}`} onClick={job.onDeleteOutput} disabled={isBusy || isPipelineRunning || isSourceConversionRunning} title={job.jobKind === "sourceConversion" ? "Delete the converted source file created by the app for compatibility or preview use." : "Delete this job's exported output file while keeping the job history entry."}>
                                           Delete Job Output
                                         </button>
                                       ) : null}
@@ -3983,7 +5690,7 @@ export default function App() {
                     Clear Input
                   </button>
                   {source && isManagedArtifactPath(source.path) ? (
-                    <button type="button" className="action-button secondary-button" data-testid="delete-input-file-button" onClick={() => void deleteManagedArtifact(source.path, "Input file", clearLoadedInput)} disabled={isBusy || isPipelineRunning || isBlindComparisonRunning || isSourceConversionRunning}>
+                    <button type="button" className="action-button secondary-button" data-testid="delete-input-file-button" onClick={() => void deleteManagedArtifact(source.path, "Input file", clearLoadedInput, ["Deletes the currently loaded managed input file.", "Clears it from the workspace immediately after deletion."])} disabled={isBusy || isPipelineRunning || isBlindComparisonRunning || isSourceConversionRunning} title="Delete the managed input file currently loaded into the workspace.">
                       Delete Input File
                     </button>
                   ) : null}
@@ -4002,7 +5709,7 @@ export default function App() {
                     Clear Output
                   </button>
                   {result && isManagedArtifactPath(result.outputPath) ? (
-                    <button type="button" className="action-button secondary-button" data-testid="delete-output-file-button" onClick={() => void deleteManagedArtifact(result.outputPath, "Output file", clearCurrentOutputSelection)} disabled={isBusy || isPipelineRunning}>
+                    <button type="button" className="action-button secondary-button" data-testid="delete-output-file-button" onClick={() => void deleteManagedArtifact(result.outputPath, "Output file", clearCurrentOutputSelection, ["Deletes the currently selected output file.", "Clears the output selection after the file is removed."])} disabled={isBusy || isPipelineRunning} title="Delete the currently selected output file from artifacts or the chosen export path.">
                       Delete Output File
                     </button>
                   ) : null}
@@ -4022,20 +5729,22 @@ export default function App() {
                 <span data-testid="previews-pool-size">Preview Proxies: {formatBytes(scratchSummary.sourcePreviewsRoot.sizeBytes)}</span>
               </div>
               <div className="job-progress-actions wrap-actions">
-                <button type="button" className="action-button secondary-button" data-testid="clear-jobs-pool-button" onClick={() => void clearScratchPool(scratchSummary.jobsRoot.path, "Jobs scratch pool")} disabled={isBusy || isPipelineRunning || isSourceConversionRunning}>
+                <button type="button" className="action-button secondary-button" data-testid="clear-jobs-pool-button" onClick={() => void clearScratchPool(scratchSummary.jobsRoot.path, "Jobs scratch pool")} disabled={isBusy || isPipelineRunning || isSourceConversionRunning} title="Delete every managed job scratch directory under artifacts/jobs. Running jobs must be stopped first.">
                   Clear Jobs Pool
                 </button>
-                <button type="button" className="action-button secondary-button" data-testid="clear-converted-pool-button" onClick={() => void clearScratchPool(scratchSummary.convertedSourcesRoot.path, "Converted inputs pool")} disabled={isBusy || isPipelineRunning || isSourceConversionRunning}>
+                <button type="button" className="action-button secondary-button" data-testid="clear-converted-pool-button" onClick={() => void clearScratchPool(scratchSummary.convertedSourcesRoot.path, "Converted inputs pool")} disabled={isBusy || isPipelineRunning || isSourceConversionRunning} title="Delete converted MP4 compatibility copies stored under artifacts/runtime/converted-sources.">
                   Clear Converted Pool
                 </button>
-                <button type="button" className="action-button secondary-button" data-testid="clear-previews-pool-button" onClick={() => void clearScratchPool(scratchSummary.sourcePreviewsRoot.path, "Preview proxy pool")} disabled={isBusy || isPipelineRunning || isSourceConversionRunning}>
+                <button type="button" className="action-button secondary-button" data-testid="clear-previews-pool-button" onClick={() => void clearScratchPool(scratchSummary.sourcePreviewsRoot.path, "Preview proxy pool")} disabled={isBusy || isPipelineRunning || isSourceConversionRunning} title="Delete generated preview proxy clips used for lightweight playback in the app.">
                   Clear Preview Pool
                 </button>
               </div>
             </section>
           ) : null}
-        </ExpandablePanel>
-      </section>
+            </div>
+          </article>
+        </section>
+      ) : null}
 
       {error ? <p data-testid="error-text" className="error-text">{error}</p> : null}
     </main>

@@ -88,6 +88,32 @@ class BenchmarkHarnessTests(unittest.TestCase):
             self.assertEqual(result["backendId"], "realesrgan-ncnn")
             self.assertEqual(len(result["results"]), 1)
 
+    def test_benchmark_fixture_allows_research_video_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            generate_benchmark_fixture(
+                output_dir=Path(temp_dir),
+                name="fixture_video",
+                frames=2,
+                width=640,
+                height=360,
+                downscale_width=320,
+                downscale_height=180,
+            )
+            with patch("upscaler_worker.benchmark._benchmark_pytorch_video_fixture", return_value={"tileSize": 128, "summary": {}}):
+                result = benchmark_fixture(
+                    manifest_path=Path(temp_dir) / "fixture_video" / "manifest.json",
+                    model_id="rvrt-x4",
+                    tile_sizes=[128],
+                    repeats=1,
+                    gpu_id=None,
+                    fp16=False,
+                )
+
+            self.assertEqual(result["modelId"], "rvrt-x4")
+            self.assertEqual(result["backendId"], "pytorch-video-sr")
+            self.assertEqual(result["runner"], "external-executable")
+            self.assertEqual(len(result["results"]), 1)
+
     def test_compare_frame_pair_reports_identical_images(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             left = Path(temp_dir) / "left.png"

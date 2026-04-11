@@ -24,6 +24,11 @@ export interface ModelRuntimeAssetDefinition {
   downloadUrl: string;
 }
 
+export interface ModelResearchRuntimeDefinition {
+  kind: "external-command";
+  commandEnvVar: string;
+}
+
 export type ModelExecutionStatus = "runnable" | "planned";
 
 export type ModelSupportTier = "production" | "next" | "research" | "compatibility";
@@ -44,6 +49,7 @@ export interface ModelDefinition {
   mediaSuitability: string[];
   nativeScale: number;
   runtimeAsset?: ModelRuntimeAssetDefinition;
+  researchRuntime?: ModelResearchRuntimeDefinition;
   specialHandling: ModelHandlingDefinition;
 }
 
@@ -65,6 +71,7 @@ interface CatalogData {
     mediaSuitability: string[];
     nativeScale: number;
     runtimeAsset?: ModelRuntimeAssetDefinition;
+    researchRuntime?: ModelResearchRuntimeDefinition;
     specialHandling: ModelHandlingDefinition;
   }>;
 }
@@ -89,6 +96,7 @@ export const modelCatalog: ModelDefinition[] = typedCatalogData.models.map((mode
   mediaSuitability: model.mediaSuitability,
   nativeScale: model.nativeScale,
   runtimeAsset: model.runtimeAsset,
+  researchRuntime: model.researchRuntime,
   specialHandling: model.specialHandling,
 }));
 

@@ -40,6 +40,28 @@ The app now supports three distinct video processing modes:
 
 Interpolation targets currently support 30 fps and 60 fps outputs through the Windows RIFE NCNN runtime.
 
+## Job Controls
+
+Active upscale and source-conversion jobs now support in-session pause, resume, and stop controls.
+
+- `Pause` must halt active processing without discarding the current live job record.
+- `Resume` must continue the same in-memory job when the desktop app is still running.
+- `Stop` must cancel the active job and keep its saved settings available for a later restart.
+- `Load Template` must restore any replayable historical run into the form so the user can adjust settings before starting a new run.
+- `Restart` must reload a stopped pipeline job from its saved settings and immediately queue a fresh run from the beginning.
+- Paused jobs are session-local. If the app exits while a job is paused, that run should fall back to the existing historical restart path rather than pretending it can live-resume after restart.
+- Live progress and the Jobs workspace must show `paused` as a first-class state.
+
+In practice, the action model is:
+
+- `Resume` = continue the same in-memory job.
+- `Restart` = rerun the saved request immediately from the beginning.
+- `Load Template` = restore the saved request into the editor without starting it.
+
+For new high-performance backends, the repo policy is CUDA-first on the detected NVIDIA workstation GPU whenever that execution path exists. Backends must either honor the selected GPU explicitly or surface a clear setup/fallback message rather than quietly dropping to a weaker path.
+
+The Python worker pause path depends on `psutil` for suspending active subprocess trees during long ffmpeg or NCNN stages.
+
 ## Available Models
 
 ### Runnable Now
@@ -48,19 +70,19 @@ Interpolation targets currently support 30 fps and 60 fps outputs through the Wi
 - `realesrnet-x4plus`: Real-ESRNet x4 Plus via PyTorch.
 - `bsrgan-x4`: BSRGAN x4 via PyTorch.
 - `swinir-realworld-x4`: SwinIR Real-World x4 via PyTorch.
+- `rvrt-x4`: RVRT x4 via an external video-SR runner configured through `UPSCALER_RVRT_COMMAND`.
 - `realesrgan-x4plus-anime`: compatibility model.
 - `realesr-animevideov3-x4`: compatibility model.
 
 ### Cataloged But Not Yet Runnable In The Current App Build
 
 - `hat-realhat-gan-x4`
-- `rvrt-x4`
 
 ### Backend Types
 
 - `realesrgan-ncnn`: portable NCNN Vulkan backend.
 - `pytorch-image-sr`: PyTorch frame-by-frame image SR backend.
-- `pytorch-video-sr`: planned video-native PyTorch backend.
+- `pytorch-video-sr`: research video-SR backend driven by an external command contract.
 
 ## Desktop Workflow
 
@@ -265,6 +287,18 @@ Benchmark the PyTorch streaming path:
 $env:PYTHONPATH='python'
 & $env:UPSCALER_PYTHON python/upscaler_worker/benchmark_pytorch_pipeline_paths.py --model-id swinir-realworld-x4 --execution-paths streaming --repeats 1 --duration-seconds 10 --width 1280 --height 720 --fps 24 --tile-size 128 --preset qualityBalanced --precision bf16 --output-mode preserveAspect4k --resolution-basis exact --target-width 3840 --target-height 2160
 ```
+
+RVRT now runs through the same external runner contract in both the desktop pipeline and the worker benchmarks. If the official RVRT repo is available at `tmp/RVRT`, the app will default to the built-in `upscaler_worker.rvrt_external_runner` automatically. `UPSCALER_RVRT_COMMAND` remains available as an override and can point to any command template that reads an input PNG sequence and writes an output PNG sequence. The command may use placeholders like `{input_dir}`, `{output_dir}`, `{model_id}`, `{tile_size}`, and `{frame_count}`.
+
+Example:
+
+```powershell
+$env:PYTHONPATH='python'
+$env:UPSCALER_RVRT_COMMAND='python path/to/your_rvrt_runner.py --input {input_dir} --output {output_dir} --model {model_id}'
+& $env:UPSCALER_PYTHON python/upscaler_worker/cli.py benchmark-upscaler --manifest-path artifacts/benchmarks/quick_fixture/manifest.json --model-id rvrt-x4 --tile-sizes 128 --repeats 1 --precision fp32
+```
+
+On this repo, the built-in default is active when `tmp/RVRT` exists, so the desktop app and worker CLI can run RVRT without setting `UPSCALER_RVRT_COMMAND` manually.
 
 ## Runtime Notes
 

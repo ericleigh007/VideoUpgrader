@@ -101,6 +101,21 @@ The first deliverable must support:
 
 - The app must persist workspace state locally.
 - The app must restore recent files, selected settings, comparison state, and known outputs across sessions.
+- The app must persist enough job metadata that historical runs can restore their recorded request as an editable template in the main workspace.
+- The app must persist enough job metadata that cancelled, interrupted, or stale paused runs can be restarted from saved settings.
+- The app must persist effective run metadata for completed and historical outputs so the user can inspect the resolved settings that produced an output file, including the selected quality preset and effective execution settings when available.
+
+### Job Control
+
+- The app must support pausing an active upscale pipeline job from the main status controls and the Jobs workspace.
+- The app must support pausing an active source conversion job from the main status controls and the Jobs workspace.
+- The app must support resuming a paused in-memory job without creating a new job ID while the current app session remains alive.
+- The app must support stopping a running or paused job without deleting its recorded settings or managed artifacts metadata.
+- The app must expose `queued`, `running`, `paused`, `succeeded`, `cancelled`, `failed`, and `interrupted` job-state semantics consistently across the live status card and the Jobs workspace.
+- The app must expose a `Load Template` action for replayable historical runs that restores the recorded request into the editable form without automatically starting a new job.
+- The app must expose a `Restart` action for stopped pipeline jobs when the run can be started again from the beginning using saved settings.
+- The app must expose a `Resume` action only when the current in-memory job state is still resumable within the active desktop session.
+- If the desktop app exits while a job is paused, the recovered historical record must be restartable from saved settings rather than treated as a live-resumable job.
 
 ### Look And Feel
 
@@ -134,9 +149,14 @@ The first deliverable must support:
 
 - The backend must coordinate media probing, decode, job scheduling, caching, export, and diagnostics.
 - The backend may use GPU resources up to approximately 12 GB of VRAM.
+- High-performance backends added to the repository must prefer CUDA-accelerated PyTorch or equivalent discrete-GPU execution on the detected NVIDIA workstation GPU when that path is available.
+- High-performance backends added to the repository must propagate the selected GPU into their runtime layer and must surface an explicit fallback or setup error instead of silently dropping to a slower path.
 - The backend must support memory-safe execution options such as tiling.
 - The backend must expose progress telemetry for extracting, upscaling, interpolating, encoding, and remuxing stages.
 - The backend must expose average fps, rolling fps, elapsed time, ETA, RAM usage, GPU memory usage, scratch growth, and output growth while jobs are running.
+- The backend must implement pause and resume as first-class job-control commands for both pipeline and source-conversion jobs.
+- The backend must suspend long-running subprocess work during pause so ffmpeg and other external stages do not continue processing in the background.
+- The backend must preserve current progress counters when a job is paused and must surface a paused progress message without resetting stage progress.
 
 ### Model Integration
 
@@ -150,8 +170,11 @@ The first deliverable must support:
 - Unit tests must target at least 80 percent coverage in the maintained codebase.
 - Integration tests must cover end-to-end flows including video loading, job preparation, interpolation planning, export, audio remux, and project restore.
 - Automated GUI tests must verify the real desktop workflow for both upscaling and interpolation controls.
+- Automated GUI tests must verify pause, resume, and stop controls for active jobs.
+- Automated GUI tests must verify the distinction between `Resume`, `Restart`, and `Load Template` in the Jobs workspace.
 - Integration tests must include synthetic AV-sync fixtures that validate source-to-output sync across interpolation-only and post-upscale interpolation flows.
 - Unit tests must cover interpolation request validation, target-fps mapping, frame-count planning, and progress telemetry helpers.
+- Unit and integration tests must cover paused-state telemetry and the transition from running to paused to resumed to terminal job states.
 - Integration and GUI tests must assert that interpolation progress, fps throughput, RAM usage, and GPU usage are surfaced correctly to the user.
 - Synthetic benchmark tests must generate known reference content, degrade it deterministically, upscale it, and compare outputs against the original high-resolution master.
 

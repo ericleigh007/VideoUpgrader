@@ -23,6 +23,8 @@ test.beforeEach(async ({ page }) => {
     const openedPaths = [];
     const deletedPaths = [];
     const confirmMessages = [];
+    const pipelineRequests = [];
+    const previewLoadPaths = [];
     const appConfig = {
       modelRatings: {},
       blindComparisons: []
@@ -35,6 +37,8 @@ test.beforeEach(async ({ page }) => {
       openedPaths,
       deletedPaths,
       confirmMessages,
+      pipelineRequests,
+      previewLoadPaths,
       lastRequest: null
     };
     window.__UPSCALER_MOCK__ = {
@@ -55,7 +59,14 @@ test.beforeEach(async ({ page }) => {
             { id: 0, name: "Intel(R) Graphics", kind: "integrated" },
             { id: 1, name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", kind: "discrete" }
           ],
-          defaultGpuId: 1
+          defaultGpuId: 1,
+          externalResearchRuntimes: {
+            "rvrt-x4": {
+              kind: "external-command",
+              commandEnvVar: "UPSCALER_RVRT_COMMAND",
+              configured: false
+            }
+          }
         };
       },
       async probeSourceVideo(sourcePath) {
@@ -199,6 +210,91 @@ test.beforeEach(async ({ page }) => {
               isDirectory: false,
               sizeBytes: 1024 * 1024 * 18
             },
+            pipelineRunDetails: {
+              request: {
+                sourcePath: "C:/workspace/fixtures/historic-input.mov",
+                modelId: "realesrgan-x4plus",
+                outputMode: "cropTo4k",
+                qualityPreset: "qualityMax",
+                interpolationMode: "off",
+                interpolationTargetFps: null,
+                pytorchRunner: "torch",
+                gpuId: 1,
+                aspectRatioPreset: "16:9",
+                customAspectWidth: null,
+                customAspectHeight: null,
+                resolutionBasis: "exact",
+                targetWidth: 3840,
+                targetHeight: 2160,
+                cropLeft: 0,
+                cropTop: 0,
+                cropWidth: 1,
+                cropHeight: 1,
+                previewMode: false,
+                previewDurationSeconds: null,
+                segmentDurationSeconds: 10,
+                outputPath: "C:/workspace/artifacts/outputs/historic-upscale.mkv",
+                codec: "h265",
+                container: "mkv",
+                tileSize: 128,
+                fp16: false,
+                crf: 16
+              },
+              sourceMedia: {
+                width: 1280,
+                height: 720,
+                frameRate: 24,
+                durationSeconds: 50,
+                frameCount: 1200,
+                aspectRatio: 1.7777777778,
+                pixelCount: 921600,
+                hasAudio: true,
+                container: "mov",
+                videoCodec: "prores"
+              },
+              outputMedia: {
+                width: 3840,
+                height: 2160,
+                frameRate: 24,
+                durationSeconds: 50,
+                frameCount: 1200,
+                aspectRatio: 1.7777777778,
+                pixelCount: 8294400,
+                hasAudio: true,
+                container: "mkv",
+                videoCodec: "hevc"
+              },
+              effectiveSettings: {
+                effectiveTileSize: 128,
+                processedDurationSeconds: 50,
+                segmentFrameLimit: 240,
+                previewMode: false,
+                previewDurationSeconds: null,
+                segmentDurationSeconds: 10
+              },
+              executionPath: "file-io",
+              videoEncoder: "libx265",
+              videoEncoderLabel: "HEVC (libx265)",
+              runner: "torch",
+              precision: "fp32",
+              averageThroughputFps: 15,
+              segmentCount: 5,
+              segmentFrameLimit: 240,
+              frameCount: 1200,
+              hadAudio: true,
+              runtime: {
+                ffmpegPath: "C:/tools/ffmpeg.exe",
+                realesrganPath: "C:/tools/realesrgan-ncnn-vulkan.exe",
+                modelDir: "C:/tools/models",
+                rifePath: "C:/tools/rife-ncnn-vulkan.exe",
+                rifeModelRoot: "C:/tools/rife-models",
+                availableGpus: [
+                  { id: 0, name: "Intel(R) Graphics", kind: "integrated" },
+                  { id: 1, name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", kind: "discrete" }
+                ],
+                defaultGpuId: 1
+              }
+            },
             updatedAt: String(nowSeconds - 3600)
           },
           {
@@ -233,6 +329,147 @@ test.beforeEach(async ({ page }) => {
               sizeBytes: 1024 * 1024 * 9
             },
             updatedAt: String(nowSeconds - 86400)
+          },
+          {
+            jobId: "legacy-pipeline-job",
+            jobKind: "pipeline",
+            label: "Legacy Upscale Job",
+            state: "succeeded",
+            sourcePath: "C:/workspace/fixtures/legacy-repeat-source.mp4",
+            modelId: "realesrgan-x4plus",
+            codec: "h264",
+            container: "mp4",
+            progress: {
+              phase: "completed",
+              percent: 100,
+              message: "Legacy pipeline completed",
+              processedFrames: 240,
+              totalFrames: 240,
+              extractedFrames: 240,
+              upscaledFrames: 240,
+              interpolatedFrames: 0,
+              encodedFrames: 240,
+              remuxedFrames: 240,
+              elapsedSeconds: 18,
+              averageFramesPerSecond: 13.3,
+              rollingFramesPerSecond: 0,
+              estimatedRemainingSeconds: 0,
+              processRssBytes: 1024 * 1024 * 384,
+              gpuMemoryUsedBytes: 1024 * 1024 * 2048,
+              gpuMemoryTotalBytes: 1024 * 1024 * 24576,
+              scratchSizeBytes: 1024 * 1024 * 6,
+              outputSizeBytes: 1024 * 1024 * 4,
+              extractStageSeconds: 2,
+              upscaleStageSeconds: 10,
+              interpolateStageSeconds: 0,
+              encodeStageSeconds: 5,
+              remuxStageSeconds: 1
+            },
+            recordedCount: 240,
+            scratchPath: "C:/workspace/artifacts/jobs/job_legacy-pipeline-job",
+            scratchStats: {
+              path: "C:/workspace/artifacts/jobs/job_legacy-pipeline-job",
+              exists: true,
+              isDirectory: true,
+              sizeBytes: 1024 * 1024 * 6
+            },
+            outputPath: "C:/workspace/artifacts/outputs/legacy-repeat-output.mp4",
+            outputStats: {
+              path: "C:/workspace/artifacts/outputs/legacy-repeat-output.mp4",
+              exists: true,
+              isDirectory: false,
+              sizeBytes: 1024 * 1024 * 4
+            },
+            updatedAt: String(nowSeconds - 7200)
+          },
+          {
+            jobId: "interrupted-pipeline-job",
+            jobKind: "pipeline",
+            label: "Interrupted Upscale Job",
+            state: "interrupted",
+            sourcePath: "C:/workspace/fixtures/interrupted-source.mp4",
+            modelId: "realesrgan-x4plus",
+            codec: "h265",
+            container: "mkv",
+            progress: {
+              phase: "upscaling",
+              percent: 41,
+              message: "Worker stopped before the current segment completed",
+              processedFrames: 168,
+              totalFrames: 400,
+              extractedFrames: 200,
+              upscaledFrames: 168,
+              interpolatedFrames: 0,
+              encodedFrames: 0,
+              remuxedFrames: 0,
+              segmentIndex: 2,
+              segmentCount: 4,
+              segmentProcessedFrames: 68,
+              segmentTotalFrames: 100,
+              batchIndex: 3,
+              batchCount: 5,
+              elapsedSeconds: 22,
+              averageFramesPerSecond: 7.6,
+              rollingFramesPerSecond: 0,
+              estimatedRemainingSeconds: 31,
+              processRssBytes: 1024 * 1024 * 448,
+              gpuMemoryUsedBytes: 1024 * 1024 * 4096,
+              gpuMemoryTotalBytes: 1024 * 1024 * 24576,
+              scratchSizeBytes: 1024 * 1024 * 14,
+              outputSizeBytes: 1024 * 1024 * 1,
+              extractStageSeconds: 4,
+              upscaleStageSeconds: 18,
+              interpolateStageSeconds: 0,
+              encodeStageSeconds: 0,
+              remuxStageSeconds: 0
+            },
+            recordedCount: 400,
+            scratchPath: "C:/workspace/artifacts/jobs/job_interrupted-pipeline-job",
+            scratchStats: {
+              path: "C:/workspace/artifacts/jobs/job_interrupted-pipeline-job",
+              exists: true,
+              isDirectory: true,
+              sizeBytes: 1024 * 1024 * 14
+            },
+            outputPath: "C:/workspace/artifacts/outputs/interrupted-output.mkv",
+            outputStats: {
+              path: "C:/workspace/artifacts/outputs/interrupted-output.mkv",
+              exists: true,
+              isDirectory: false,
+              sizeBytes: 1024 * 1024 * 1
+            },
+            pipelineRunDetails: {
+              request: {
+                sourcePath: "C:/workspace/fixtures/interrupted-source.mp4",
+                modelId: "realesrgan-x4plus",
+                outputMode: "preserveAspect4k",
+                qualityPreset: "qualityBalanced",
+                interpolationMode: "off",
+                interpolationTargetFps: null,
+                pytorchRunner: "torch",
+                gpuId: 1,
+                aspectRatioPreset: "16:9",
+                customAspectWidth: null,
+                customAspectHeight: null,
+                resolutionBasis: "exact",
+                targetWidth: 3840,
+                targetHeight: 2160,
+                cropLeft: null,
+                cropTop: null,
+                cropWidth: null,
+                cropHeight: null,
+                previewMode: false,
+                previewDurationSeconds: null,
+                segmentDurationSeconds: 10,
+                outputPath: "C:/workspace/artifacts/outputs/interrupted-output.mkv",
+                codec: "h265",
+                container: "mkv",
+                tileSize: 128,
+                fp16: false,
+                crf: 18
+              }
+            },
+            updatedAt: String(nowSeconds - 1800)
           }
         ];
       },
@@ -263,6 +500,7 @@ test.beforeEach(async ({ page }) => {
       },
       async startPipeline(request) {
         lastRequest = request;
+        pipelineRequests.push(request);
         window.__UPSCALER_TEST_STATE__.lastRequest = request;
         if (request.gpuId !== 0) {
           throw new Error(`Expected selected GPU 0, received ${request.gpuId}`);
@@ -283,7 +521,8 @@ test.beforeEach(async ({ page }) => {
           "realesrgan-x4plus",
           "realesrnet-x4plus",
           "bsrgan-x4",
-          "swinir-realworld-x4"
+          "swinir-realworld-x4",
+          "rvrt-x4"
         ].includes(request.modelId)) {
           throw new Error(`Expected selected model realesrgan-x4plus, received ${request.modelId}`);
         }
@@ -331,6 +570,67 @@ test.beforeEach(async ({ page }) => {
             hadAudio: true,
             codec: request.codec,
             container: request.container,
+            sourceMedia: {
+              width: 1280,
+              height: 720,
+              frameRate: 24,
+              durationSeconds: 12.5,
+              frameCount: 300,
+              aspectRatio: 16 / 9,
+              pixelCount: 1280 * 720,
+              hasAudio: true,
+              container: "webm",
+              videoCodec: "vp9"
+            },
+            outputMedia: {
+              width: 3840,
+              height: 2160,
+              frameRate: interpolationEnabled ? 60 : 24,
+              durationSeconds: 12.5,
+              frameCount: interpolationEnabled ? 750 : 300,
+              aspectRatio: 16 / 9,
+              pixelCount: 3840 * 2160,
+              hasAudio: true,
+              container: request.container,
+              videoCodec: request.codec
+            },
+            effectiveSettings: {
+              backendId: request.modelId === "rvrt-x4" ? "pytorch-video-sr" : "pytorch-image-sr",
+              qualityPreset: request.qualityPreset,
+              requestedTileSize: request.tileSize,
+              effectiveTileSize: request.tileSize,
+              requestedPrecision: "fp16",
+              selectedPrecision: "fp16",
+              effectivePrecision: "fp16",
+              precisionSource: "backend-default",
+              processedDurationSeconds: request.previewDurationSeconds ?? 12.5,
+              segmentFrameLimit: interpolationEnabled ? 48 : 0,
+              previewMode: request.previewMode,
+              previewDurationSeconds: request.previewDurationSeconds,
+              segmentDurationSeconds: request.segmentDurationSeconds
+            },
+            executionPath: interpolationEnabled ? "streaming" : "file-io",
+            videoEncoder: request.codec === "h265" ? "hevc_nvenc" : "h264_nvenc",
+            videoEncoderLabel: request.codec === "h265" ? "NVIDIA NVENC H.265" : "NVIDIA NVENC H.264",
+            runner: request.modelId === "rvrt-x4" ? "torch" : request.pytorchRunner,
+            precision: "fp16",
+            stageTimings: {
+              extractSeconds: 4,
+              upscaleSeconds: 18,
+              interpolateSeconds: interpolationEnabled ? 11 : 0,
+              encodeSeconds: 5,
+              remuxSeconds: 3
+            },
+            resourcePeaks: {
+              processRssBytes: 1024 * 1024 * 512,
+              gpuMemoryUsedBytes: 1024 * 1024 * 6144,
+              gpuMemoryTotalBytes: 1024 * 1024 * 24576,
+              scratchSizeBytes: 1024 * 1024 * 12,
+              outputSizeBytes: 1024 * 1024 * 3
+            },
+            averageThroughputFps: interpolationEnabled ? 14.5 : 6,
+            segmentCount: interpolationEnabled ? 2 : null,
+            segmentFrameLimit: interpolationEnabled ? 48 : null,
             runtime: {
               ffmpegPath: "C:/tools/ffmpeg.exe",
               realesrganPath: "C:/tools/realesrgan-ncnn-vulkan.exe",
@@ -369,6 +669,10 @@ test.beforeEach(async ({ page }) => {
           throw new Error("No mock job available");
         }
 
+        if (activeJob.state === "paused" || activeJob.state === "cancelled") {
+          return activeJob;
+        }
+
         return {
           ...activeJob,
           state: "succeeded",
@@ -384,6 +688,36 @@ test.beforeEach(async ({ page }) => {
             interpolatedFrames: activeJob.progress.interpolatedFrames === 0 ? 0 : activeJob.progress.totalFrames,
             encodedFrames: activeJob.progress.totalFrames,
             remuxedFrames: activeJob.progress.totalFrames
+          }
+        };
+      },
+      async pausePipelineJob() {
+        if (!activeJob) {
+          return;
+        }
+
+        activeJob = {
+          ...activeJob,
+          state: "paused",
+          progress: {
+            ...activeJob.progress,
+            phase: "paused",
+            message: `Paused: ${activeJob.progress.message}`,
+          }
+        };
+      },
+      async resumePipelineJob() {
+        if (!activeJob) {
+          return;
+        }
+
+        activeJob = {
+          ...activeJob,
+          state: "running",
+          progress: {
+            ...activeJob.progress,
+            phase: activeJob.progress.interpolatedFrames > 0 ? "interpolating" : "upscaling",
+            message: activeJob.progress.interpolatedFrames > 0 ? "Resumed: interpolating additional frames" : "Resumed: upscaling extracted frames",
           }
         };
       },
@@ -407,6 +741,10 @@ test.beforeEach(async ({ page }) => {
       },
       async openPathInDefaultApp(path) {
         openedPaths.push(path);
+      },
+      async loadPreviewUrl(path) {
+        previewLoadPaths.push(path);
+        return `mock-preview://${encodeURIComponent(path)}`;
       },
       toPreviewSrc() {
         return "https://example.com/mock-preview.mp4";
@@ -549,9 +887,9 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
   await page.getByTestId("source-preview-play-toggle").click();
   await expect(page.getByTestId("source-preview")).toHaveJSProperty("paused", true);
   await openUpscaleControls(page);
-  await expect(page.locator('[data-testid="model-select"] optgroup[label="Available Now"] option')).toHaveCount(4);
-  await expect(page.locator('[data-testid="model-select"] optgroup[label="Planned"] option')).toHaveCount(2);
-  await expect(page.locator('[data-testid="model-select"] option[disabled]')).toHaveCount(2);
+  await expect(page.locator('[data-testid="model-select"] optgroup[label="Available Now"] option')).toHaveCount(5);
+  await expect(page.locator('[data-testid="model-select"] optgroup[label="Planned"] option')).toHaveCount(1);
+  await expect(page.locator('[data-testid="model-select"] option[disabled]')).toHaveCount(1);
   await expect(page.locator('[data-testid="model-select"] option[value="hat-realhat-gan-x4"]')).toContainText("not implemented");
   await expect(page.locator('[data-testid="model-select"] option[value="rife-v4.6"]')).toHaveCount(0);
   await expect(page.getByTestId("target-model-set-card")).toHaveCount(0);
@@ -653,24 +991,70 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
   await page.getByTestId("frame-rate-target-select").selectOption("60");
   await expect(page.getByTestId("interpolation-workspace-summary")).toContainText("Post-upscale interpolation");
   await page.getByTestId("preview-mode-checkbox").check();
-  await page.getByTestId("preview-duration-input").fill("8");
+  await page.getByTestId("preview-duration-input").fill("3");
   await page.getByTestId("save-output-button").click();
   await expect(page.getByTestId("output-path-input")).toHaveValue("C:/exports/upscaled-result.mkv");
 
+  await page.evaluate(() => {
+    const video = document.querySelector('[data-testid="source-preview"]');
+    if (!(video instanceof HTMLVideoElement)) {
+      throw new Error("Source preview video is unavailable for blind offset setup");
+    }
+
+    Object.defineProperty(video, "duration", {
+      configurable: true,
+      value: 12.5,
+    });
+    video.currentTime = 0;
+    video.dispatchEvent(new Event("timeupdate", { bubbles: true }));
+  });
+
   await page.getByTestId("blind-test-panel-toggle").click();
+  await expect(page.getByTestId("blind-test-panel")).toContainText("5 available");
+  await expect(page.getByTestId("blind-test-panel")).toContainText("4 selected");
+  await expect(page.getByTestId("blind-model-option-rvrt-x4")).toContainText("RVRT x4");
+  await page.getByTestId("source-preview-seek").evaluate((element) => {
+    if (!(element instanceof HTMLInputElement)) {
+      throw new Error("Source preview seek slider is unavailable");
+    }
+    element.value = "2.2";
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await page.getByTestId("blind-capture-current-preview-position").click();
+  await expect(page.getByTestId("blind-start-offset-readout")).toContainText("0:02");
   await page.getByTestId("run-blind-comparison-button").click();
   await expect(page.getByTestId("blind-preview-sample-1")).toBeVisible();
   await expect(page.getByTestId("blind-preview-sample-2")).toBeVisible();
   await expect(page.getByTestId("blind-preview-sample-3")).toBeVisible();
   await expect(page.getByTestId("blind-preview-sample-4")).toBeVisible();
   await expect(page.getByTestId("comparison-inspector")).toBeVisible();
-  await page.getByTestId("blind-open-sample-1").click();
+  const blindPreviewLoadsBeforeWorkspace = await page.evaluate(() => {
+    const testState = window.__UPSCALER_TEST_STATE__;
+    return testState.previewLoadPaths.filter((path) => String(path).includes("/blind/")).length;
+  });
+  await page.getByTestId("open-comparison-workspace-button").click();
+  await expect(page.getByTestId("comparison-workspace-modal")).toBeVisible();
+  await expect.poll(async () => {
+    const { previewLoadPaths } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+    return previewLoadPaths.filter((path) => String(path).includes("/blind/")).length;
+  }).toBeGreaterThan(blindPreviewLoadsBeforeWorkspace);
+  await expect(page.getByTestId("comparison-workspace-modal")).toContainText("Source plus 4 blind samples");
   await page.getByTestId("comparison-focus-diagonals").click();
   await page.getByTestId("comparison-zoom-slider").fill("4");
   await expect(page.locator("[data-testid^='blind-reveal-']")).toHaveCount(0);
-  await page.getByTestId("pick-sample-1").click();
+  await page.getByTestId("comparison-pick-sample-1").click();
   await expect(page.locator("[data-testid^='blind-reveal-']")).toHaveCount(4);
-  await expect(page.getByText("Selected winner")).toBeVisible();
+  await expect(page.getByTestId("comparison-workspace-reveal-sample-1")).toContainText("Selected winner");
+  await page.getByTestId("comparison-workspace-close").click();
+
+  const { pipelineRequests } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+  const blindPreviewRequests = pipelineRequests.filter((request) => request.previewMode === true);
+  expect(blindPreviewRequests).toHaveLength(4);
+  expect(blindPreviewRequests.every((request) => request.container === "mp4")).toBe(true);
+  expect(blindPreviewRequests.every((request) => request.codec === "h264")).toBe(true);
+  expect(blindPreviewRequests.every((request) => request.outputPath.endsWith(".mp4"))).toBe(true);
+  expect(blindPreviewRequests.every((request) => Number(request.previewStartOffsetSeconds) > 2)).toBe(true);
 
   await page.getByTestId("run-upscale-button").click();
   await page.getByTestId("job-cleanup-panel-toggle").click();
@@ -702,6 +1086,14 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
   await expect(page.getByTestId("pipeline-log")).toContainText("Stage timings: extract 4s, upscale 18s, interpolate 11s, encode 5s, remux 3s");
   await page.getByTestId("result-output-details").locator("summary").click();
   await expect(page.getByTestId("result-output-details")).toContainText("Original audio remuxed");
+  await expect(page.getByTestId("result-average-throughput")).toContainText("14.5 fps");
+  await expect(page.getByTestId("result-effective-pixels-per-second")).toContainText("MP/s");
+  await expect(page.getByTestId("result-stage-timings")).toContainText("extract 4s");
+  await expect(page.getByTestId("result-stage-timings")).toContainText("interpolate 11s");
+  await expect(page.getByTestId("result-output-details")).toContainText("Video Encoder");
+  await expect(page.getByTestId("result-output-details")).toContainText("NVIDIA NVENC H.265");
+  await expect(page.getByTestId("result-output-details")).toContainText("Requested Tile Size");
+  await expect(page.getByTestId("result-output-details")).toContainText("Effective Tile Size");
   await expect(page.getByTestId("result-preview")).toBeVisible();
   await page.locator(".pipeline-runtime-disclosure").locator("summary").click();
   await expect(page.locator(".pipeline-runtime-disclosure")).toContainText("Blind Picks Logged");
@@ -709,6 +1101,98 @@ test("selects a source, previews it, chooses output, and runs the workflow", asy
   const { lastRequest: workflowRequest } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
   expect(workflowRequest?.interpolationMode).toBe("afterUpscale");
   expect(workflowRequest?.interpolationTargetFps).toBe(60);
+});
+
+test("captures a blind comparison start offset and forwards it through preview runs", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    Object.defineProperty(HTMLMediaElement.prototype, "paused", {
+      configurable: true,
+      get() {
+        return this.dataset.mockPaused !== "false";
+      }
+    });
+
+    Object.defineProperty(HTMLMediaElement.prototype, "currentTime", {
+      configurable: true,
+      get() {
+        return Number(this.dataset.mockCurrentTime ?? "0");
+      },
+      set(value: number) {
+        this.dataset.mockCurrentTime = String(value);
+      }
+    });
+
+    Object.defineProperty(HTMLMediaElement.prototype, "duration", {
+      configurable: true,
+      get() {
+        return Number(this.dataset.mockDuration ?? "12.5");
+      }
+    });
+
+    HTMLMediaElement.prototype.play = async function playMock() {
+      this.dataset.mockPaused = "false";
+      this.dispatchEvent(new Event("play"));
+    };
+
+    HTMLMediaElement.prototype.pause = function pauseMock() {
+      this.dataset.mockPaused = "true";
+      this.dispatchEvent(new Event("pause"));
+    };
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await expect(page.getByTestId("source-preview")).toBeVisible();
+  await openUpscaleControls(page);
+  await page.getByTestId("gpu-select").selectOption("0");
+  await page.getByTestId("preview-mode-checkbox").check();
+  await page.getByTestId("preview-duration-input").fill("3");
+  await page.getByTestId("blind-test-panel-toggle").click();
+  await expect(page.getByTestId("blind-test-panel")).toContainText("4 selected");
+
+  await page.evaluate(() => {
+    const video = document.querySelector('[data-testid="source-preview"]');
+    if (!(video instanceof HTMLVideoElement)) {
+      throw new Error("Source preview video is unavailable for blind offset setup");
+    }
+
+    video.dataset.mockDuration = "12.5";
+    video.currentTime = 0;
+    video.dispatchEvent(new Event("timeupdate", { bubbles: true }));
+  });
+
+  await page.getByTestId("source-preview-seek").evaluate((element) => {
+    if (!(element instanceof HTMLInputElement)) {
+      throw new Error("Source preview seek slider is unavailable");
+    }
+    element.value = "2.2";
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+
+  await page.getByTestId("blind-capture-current-preview-position").click();
+  await expect(page.getByTestId("blind-start-offset-readout")).toContainText("0:02");
+
+  await page.getByTestId("run-blind-comparison-button").click();
+  await expect(page.getByTestId("blind-preview-sample-1")).toBeVisible();
+  await expect(page.getByTestId("blind-preview-sample-2")).toBeVisible();
+  await expect(page.getByTestId("blind-preview-sample-3")).toBeVisible();
+  await expect(page.getByTestId("blind-preview-sample-4")).toBeVisible();
+  await expect(page.getByTestId("comparison-inspector")).toBeVisible();
+
+  const { pipelineRequests } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+  const blindPreviewRequests = pipelineRequests.filter((request) => request.previewMode === true);
+  expect(blindPreviewRequests).toHaveLength(4);
+  expect(blindPreviewRequests.every((request) => Number(request.previewStartOffsetSeconds) > 2)).toBe(true);
+
+  await page.getByTestId("open-comparison-workspace-button").click();
+  await expect(page.getByTestId("comparison-workspace-modal")).toBeVisible();
+  await page.getByTestId("comparison-pick-sample-1").click();
+
+  const appConfig = await page.evaluate(() => window.__UPSCALER_MOCK__.getAppConfig());
+  expect(appConfig.blindComparisons).toHaveLength(1);
+  expect(Number(appConfig.blindComparisons[0]?.previewStartOffsetSeconds)).toBeGreaterThan(2);
 });
 
 test("shows the PyTorch runner selector only for PyTorch image SR models and passes the selection through", async ({ page }) => {
@@ -898,27 +1382,457 @@ test("shows overlapped interpolation and encoding progress in the job panel", as
   expect(lastRequest?.interpolationTargetFps).toBe(60);
 });
 
-test("shows not-implemented models in the selector and blocks export when one becomes current", async ({ page }) => {
+test("refreshes detailed live job progress inside a running segment", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    if (!window.__UPSCALER_MOCK__) {
+      return;
+    }
+
+    let pollCount = 0;
+    window.__UPSCALER_MOCK__.startPipeline = async (request) => {
+      window.__UPSCALER_TEST_STATE__.lastRequest = request;
+      return "mock-live-progress-job";
+    };
+
+    window.__UPSCALER_MOCK__.getPipelineJob = async () => {
+      pollCount += 1;
+      const progressed = pollCount >= 3;
+      return {
+        jobId: "mock-live-progress-job",
+        state: "running",
+        progress: {
+          phase: "upscaling",
+          percent: progressed ? 44 : 31,
+          message: progressed ? "Upscaling segment 2/4 batch 4/8 (96/300 frames)" : "Upscaling segment 2/4 batch 2/8 (32/300 frames)",
+          processedFrames: progressed ? 196 : 132,
+          totalFrames: 900,
+          extractedFrames: 300,
+          upscaledFrames: progressed ? 196 : 132,
+          interpolatedFrames: 0,
+          encodedFrames: 0,
+          remuxedFrames: 0,
+          segmentIndex: 2,
+          segmentCount: 4,
+          segmentProcessedFrames: progressed ? 96 : 32,
+          segmentTotalFrames: 300,
+          batchIndex: progressed ? 4 : 2,
+          batchCount: 8,
+          elapsedSeconds: progressed ? 21 : 14,
+          averageFramesPerSecond: progressed ? 9.7 : 8.1,
+          rollingFramesPerSecond: progressed ? 12.4 : 8.8,
+          estimatedRemainingSeconds: progressed ? 28 : 45,
+          processRssBytes: 1024 * 1024 * 700,
+          gpuMemoryUsedBytes: 1024 * 1024 * 6144,
+          gpuMemoryTotalBytes: 1024 * 1024 * 24576,
+          scratchSizeBytes: 1024 * 1024 * 18,
+          outputSizeBytes: 1024 * 1024 * 2,
+          extractStageSeconds: 4,
+          upscaleStageSeconds: progressed ? 17 : 10,
+          interpolateStageSeconds: 0,
+          encodeStageSeconds: 0,
+          remuxStageSeconds: 0,
+        },
+        result: null,
+        error: null,
+      };
+    };
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await page.getByTestId("run-upscale-button").click();
+  await page.getByTestId("job-cleanup-panel-toggle").click();
+
+  await expect(page.getByTestId("job-progress-panel")).toBeVisible();
+  await expect(page.getByTestId("progress-segment-frames")).toContainText("32/300");
+  await expect(page.getByTestId("progress-batch-counter")).toContainText("2/8");
+  await expect(page.getByTestId("progress-eta")).toContainText("45s");
+
+  await expect(page.getByTestId("progress-segment-frames")).toContainText("96/300");
+  await expect(page.getByTestId("progress-batch-counter")).toContainText("4/8");
+  await expect(page.getByTestId("progress-rolling-fps")).toContainText("12.4 fps");
+  await expect(page.getByTestId("progress-average-fps")).toContainText("9.70 fps");
+  await expect(page.getByTestId("progress-eta")).toContainText("28s");
+});
+
+test("surfaces active pipeline status before the jobs panel is opened", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    if (!window.__UPSCALER_MOCK__) {
+      return;
+    }
+
+    window.__UPSCALER_MOCK__.startPipeline = async (request) => {
+      window.__UPSCALER_TEST_STATE__.lastRequest = request;
+      return "mock-status-first-job";
+    };
+
+    window.__UPSCALER_MOCK__.getPipelineJob = async () => ({
+      jobId: "mock-status-first-job",
+      state: "running",
+      progress: {
+        phase: "upscaling",
+        percent: 37,
+        message: "Upscaling segment 1/1 (144/390 frames)",
+        processedFrames: 144,
+        totalFrames: 390,
+        extractedFrames: 390,
+        upscaledFrames: 144,
+        interpolatedFrames: 0,
+        encodedFrames: 0,
+        remuxedFrames: 0,
+        segmentIndex: 1,
+        segmentCount: 1,
+        segmentProcessedFrames: 144,
+        segmentTotalFrames: 390,
+        batchIndex: 3,
+        batchCount: 8,
+        elapsedSeconds: 19,
+        averageFramesPerSecond: 7.6,
+        rollingFramesPerSecond: 8.4,
+        estimatedRemainingSeconds: 32,
+        processRssBytes: 1024 * 1024 * 688,
+        gpuMemoryUsedBytes: 1024 * 1024 * 6144,
+        gpuMemoryTotalBytes: 1024 * 1024 * 24576,
+        scratchSizeBytes: 1024 * 1024 * 14,
+        outputSizeBytes: 0,
+        extractStageSeconds: 3,
+        upscaleStageSeconds: 16,
+        interpolateStageSeconds: 0,
+        encodeStageSeconds: 0,
+        remuxStageSeconds: 0,
+      },
+      result: null,
+      error: null,
+    });
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await page.getByTestId("run-upscale-button").click();
+
+  await expect(page.getByTestId("pipeline-launch-state")).toHaveAttribute("data-state", /starting|queued|running/);
+  await expect(page.getByTestId("top-status-panel")).toContainText("Pipeline Running");
+  await expect(page.getByTestId("top-status-panel")).toContainText("37% complete");
+  await expect(page.getByTestId("top-status-panel")).toContainText("ETA 32s");
+  await expect(page.getByTestId("top-status-panel")).toContainText("Upscaling segment 1/1 (144/390 frames)");
+  await expect(page.getByTestId("job-progress-panel")).toHaveCount(0);
+
+  await page.getByTestId("job-cleanup-panel-toggle").click();
+  await expect(page.getByTestId("job-progress-panel")).toBeVisible();
+  await expect(page.getByTestId("progress-message")).toContainText("Upscaling segment 1/1 (144/390 frames)");
+  await expect(page.getByTestId("progress-segment-frames")).toContainText("144/390");
+});
+
+test("shows a starting marker before the first worker poll resolves", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    if (!window.__UPSCALER_MOCK__) {
+      return;
+    }
+
+    window.__UPSCALER_MOCK__.startPipeline = async (request) => {
+      window.__UPSCALER_TEST_STATE__.lastRequest = request;
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
+      return "mock-launch-delay-job";
+    };
+
+    window.__UPSCALER_MOCK__.getPipelineJob = async () => ({
+      jobId: "mock-launch-delay-job",
+      state: "running",
+      progress: {
+        phase: "upscaling",
+        percent: 12,
+        message: "Upscaling segment 1/1 (48/390 frames)",
+        processedFrames: 48,
+        totalFrames: 390,
+        extractedFrames: 390,
+        upscaledFrames: 48,
+        interpolatedFrames: 0,
+        encodedFrames: 0,
+        remuxedFrames: 0,
+        segmentIndex: 1,
+        segmentCount: 1,
+        segmentProcessedFrames: 48,
+        segmentTotalFrames: 390,
+        batchIndex: 1,
+        batchCount: 8,
+        elapsedSeconds: 6,
+        averageFramesPerSecond: 8.0,
+        rollingFramesPerSecond: 8.6,
+        estimatedRemainingSeconds: 42,
+        processRssBytes: 1024 * 1024 * 640,
+        gpuMemoryUsedBytes: 1024 * 1024 * 4096,
+        gpuMemoryTotalBytes: 1024 * 1024 * 24576,
+        scratchSizeBytes: 1024 * 1024 * 10,
+        outputSizeBytes: 0,
+        extractStageSeconds: 2,
+        upscaleStageSeconds: 4,
+        interpolateStageSeconds: 0,
+        encodeStageSeconds: 0,
+        remuxStageSeconds: 0,
+      },
+      result: null,
+      error: null,
+    });
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await page.getByTestId("run-upscale-button").click();
+
+  await expect(page.getByTestId("pipeline-launch-state")).toHaveAttribute("data-state", "starting");
+  await expect(page.getByTestId("top-status-panel")).toContainText("Pipeline Starting");
+  await expect(page.getByTestId("pipeline-launch-state")).toContainText("Pipeline launch launching");
+  await expect(page.getByTestId("pipeline-launch-state")).toHaveAttribute("data-state", /queued|running/);
+});
+
+test("surfaces recovered running managed jobs in the main status panel when no live in-memory job exists", async ({ page }) => {
+  await page.addInitScript(() => {
+    const recoveredManagedJobs = [{
+      jobId: "recovered-managed-job",
+      jobKind: "pipeline",
+      label: "Recovered Running Job",
+      state: "running",
+      sourcePath: "C:/workspace/fixtures/recovered-input.mov",
+      modelId: "rvrt-x4",
+      codec: "h265",
+      container: "mp4",
+      progress: {
+        phase: "upscaling",
+        percent: 41,
+        message: "Recovered running worker process detected outside the app state.",
+        processedFrames: 0,
+        totalFrames: 0,
+        extractedFrames: 0,
+        upscaledFrames: 0,
+        interpolatedFrames: 0,
+        encodedFrames: 0,
+        remuxedFrames: 0,
+        elapsedSeconds: 52,
+        averageFramesPerSecond: 0,
+        rollingFramesPerSecond: 0,
+        estimatedRemainingSeconds: 18,
+        processRssBytes: 1024 * 1024 * 512,
+        gpuMemoryUsedBytes: 1024 * 1024 * 4096,
+        gpuMemoryTotalBytes: 1024 * 1024 * 24576,
+        scratchSizeBytes: 1024 * 1024 * 12,
+        outputSizeBytes: 0,
+        extractStageSeconds: 0,
+        upscaleStageSeconds: 44,
+        interpolateStageSeconds: 0,
+        encodeStageSeconds: 0,
+        remuxStageSeconds: 0,
+      },
+      recordedCount: 0,
+      scratchPath: "C:/workspace/artifacts/jobs/job_recovered-managed-job",
+      scratchStats: {
+        path: "C:/workspace/artifacts/jobs/job_recovered-managed-job",
+        exists: true,
+        isDirectory: true,
+        sizeBytes: 1024 * 1024 * 12,
+      },
+      outputPath: "C:/workspace/artifacts/outputs/recovered-output.mp4",
+      outputStats: {
+        path: "C:/workspace/artifacts/outputs/recovered-output.mp4",
+        exists: false,
+        isDirectory: false,
+        sizeBytes: 0,
+      },
+      updatedAt: String(Math.floor(Date.now() / 1000)),
+    }];
+
+    const installRecoveredJobsMock = () => {
+      if (!window.__UPSCALER_MOCK__) {
+        return;
+      }
+      window.__UPSCALER_MOCK__.listManagedJobs = async () => recoveredManagedJobs;
+    };
+
+    installRecoveredJobsMock();
+    window.addEventListener("load", installRecoveredJobsMock, { once: true });
+  });
+
+  await page.goto("/");
+
+  await expect(page.getByTestId("top-status-panel")).toContainText("Recovered Running Job");
+  await expect(page.getByTestId("top-status-panel")).toContainText("41% complete");
+  await expect(page.getByTestId("top-status-panel")).toContainText("ETA 18s");
+  await expect(page.getByTestId("top-status-panel")).toContainText("Recovered running worker process detected outside the app state.");
+
+  await page.getByTestId("job-cleanup-panel-toggle").click();
+  await expect(page.getByTestId("cleanup-job-recovered-managed-job")).toContainText("Recovered Running Job");
+  await expect(page.getByTestId("cleanup-job-recovered-managed-job")).toContainText("running");
+});
+
+test("keeps live job polling fast without hammering managed inventory during an active run", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    if (!window.__UPSCALER_MOCK__ || !window.__UPSCALER_TEST_STATE__) {
+      return;
+    }
+
+    const pollingState = {
+      pipelineCalls: 0,
+      managedJobCalls: 0,
+      scratchSummaryCalls: 0,
+      pathStatsCalls: 0,
+    };
+    window.__UPSCALER_TEST_STATE__.pollingState = pollingState;
+
+    const originalGetPathStats = window.__UPSCALER_MOCK__.getPathStats?.bind(window.__UPSCALER_MOCK__);
+    const originalGetScratchStorageSummary = window.__UPSCALER_MOCK__.getScratchStorageSummary?.bind(window.__UPSCALER_MOCK__);
+    const originalListManagedJobs = window.__UPSCALER_MOCK__.listManagedJobs?.bind(window.__UPSCALER_MOCK__);
+
+    window.__UPSCALER_MOCK__.startPipeline = async (request) => {
+      window.__UPSCALER_TEST_STATE__.lastRequest = request;
+      return "managed-poll-pressure-job";
+    };
+
+    window.__UPSCALER_MOCK__.getPipelineJob = async () => {
+      pollingState.pipelineCalls += 1;
+      const processedFrames = Math.min(300, 60 + pollingState.pipelineCalls * 18);
+      return {
+        jobId: "managed-poll-pressure-job",
+        state: "running",
+        progress: {
+          phase: "upscaling",
+          percent: Math.min(95, 20 + pollingState.pipelineCalls * 4),
+          message: `Upscaling active batch ${pollingState.pipelineCalls}`,
+          processedFrames,
+          totalFrames: 300,
+          extractedFrames: 300,
+          upscaledFrames: processedFrames,
+          interpolatedFrames: 0,
+          encodedFrames: 0,
+          remuxedFrames: 0,
+          segmentIndex: 1,
+          segmentCount: 1,
+          segmentProcessedFrames: processedFrames,
+          segmentTotalFrames: 300,
+          batchIndex: Math.min(25, pollingState.pipelineCalls),
+          batchCount: 25,
+          elapsedSeconds: pollingState.pipelineCalls,
+          averageFramesPerSecond: 11.2,
+          rollingFramesPerSecond: 12.8,
+          estimatedRemainingSeconds: 18,
+          processRssBytes: 1024 * 1024 * 640,
+          gpuMemoryUsedBytes: 1024 * 1024 * 4096,
+          gpuMemoryTotalBytes: 1024 * 1024 * 24576,
+          scratchSizeBytes: 1024 * 1024 * 10,
+          outputSizeBytes: 1024 * 1024 * 2,
+          extractStageSeconds: 3,
+          upscaleStageSeconds: pollingState.pipelineCalls,
+          interpolateStageSeconds: 0,
+          encodeStageSeconds: 0,
+          remuxStageSeconds: 0,
+        },
+        result: null,
+        error: null,
+      };
+    };
+
+    window.__UPSCALER_MOCK__.listManagedJobs = async () => {
+      pollingState.managedJobCalls += 1;
+      return originalListManagedJobs ? originalListManagedJobs() : [];
+    };
+
+    window.__UPSCALER_MOCK__.getScratchStorageSummary = async () => {
+      pollingState.scratchSummaryCalls += 1;
+      return originalGetScratchStorageSummary
+        ? originalGetScratchStorageSummary()
+        : {
+            jobsRoot: { path: "C:/workspace/artifacts/jobs", exists: true, isDirectory: true, sizeBytes: 0 },
+            convertedSourcesRoot: { path: "C:/workspace/artifacts/runtime/converted-sources", exists: true, isDirectory: true, sizeBytes: 0 },
+            sourcePreviewsRoot: { path: "C:/workspace/artifacts/runtime/source-previews", exists: true, isDirectory: true, sizeBytes: 0 },
+          };
+    };
+
+    window.__UPSCALER_MOCK__.getPathStats = async (path) => {
+      pollingState.pathStatsCalls += 1;
+      return originalGetPathStats
+        ? originalGetPathStats(path)
+        : {
+            path,
+            exists: true,
+            isDirectory: false,
+            sizeBytes: 1024,
+          };
+    };
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await page.getByTestId("run-upscale-button").click();
+  await page.getByTestId("job-cleanup-panel-toggle").click();
+
+  await expect(page.getByTestId("job-progress-panel")).toBeVisible();
+  await page.waitForTimeout(1600);
+
+  const pollingState = await page.evaluate(() => window.__UPSCALER_TEST_STATE__.pollingState);
+  expect(pollingState.pipelineCalls).toBeGreaterThanOrEqual(5);
+  expect(pollingState.managedJobCalls).toBeLessThanOrEqual(2);
+  expect(pollingState.scratchSummaryCalls).toBeLessThanOrEqual(1);
+  expect(pollingState.pathStatsCalls).toBeLessThanOrEqual(3);
+});
+
+test("surfaces RVRT as setup-required when its external runner is not configured", async ({ page }) => {
   await page.goto("/");
 
   await page.getByTestId("select-video-button").click();
   await openUpscaleControls(page);
-  await expect(page.locator('[data-testid="model-select"] option[value="rvrt-x4"]')).toHaveJSProperty("disabled", true);
+  await expect(page.locator('[data-testid="model-select"] option[value="rvrt-x4"]')).toHaveJSProperty("disabled", false);
 
-  await page.evaluate(() => {
-    const select = document.querySelector('[data-testid="model-select"]') as HTMLSelectElement | null;
-    if (!select) {
-      return;
-    }
-    select.value = "rvrt-x4";
-    select.dispatchEvent(new Event("change", { bubbles: true }));
-  });
+  await page.getByTestId("model-select").selectOption("rvrt-x4");
 
   await expect(page.getByTestId("selected-model-label")).toContainText("RVRT x4");
-  await expect(page.getByTestId("selected-model-status")).toContainText("not implemented");
-  await expect(page.getByTestId("selected-model-availability")).toContainText("not implemented yet");
-  await expect(page.getByTestId("run-disabled-reason")).toContainText("export is disabled");
+  await expect(page.getByTestId("selected-model-status")).toContainText("setup required");
+  await expect(page.getByTestId("model-details-card")).toContainText("research");
+  await expect(page.getByTestId("selected-model-availability")).toContainText("UPSCALER_RVRT_COMMAND");
   await expect(page.getByTestId("run-upscale-button")).toBeDisabled();
+  await expect(page.getByTestId("run-disabled-reason")).toContainText("UPSCALER_RVRT_COMMAND");
+});
+
+test("allows launching RVRT when its external runner is configured", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    if (!window.__UPSCALER_MOCK__) {
+      return;
+    }
+
+    window.__UPSCALER_MOCK__.ensureRuntimeAssets = async () => ({
+      ffmpegPath: "C:/tools/ffmpeg.exe",
+      realesrganPath: "C:/tools/realesrgan-ncnn-vulkan.exe",
+      modelDir: "C:/tools/models",
+      rifePath: "C:/tools/rife-ncnn-vulkan.exe",
+      rifeModelRoot: "C:/tools/rife-models",
+      availableGpus: [
+        { id: 0, name: "Intel(R) Graphics", kind: "integrated" },
+        { id: 1, name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", kind: "discrete" }
+      ],
+      defaultGpuId: 1,
+      externalResearchRuntimes: {
+        "rvrt-x4": {
+          kind: "external-command",
+          commandEnvVar: "UPSCALER_RVRT_COMMAND",
+          configured: true
+        }
+      }
+    });
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await openUpscaleControls(page);
+  await page.getByTestId("model-select").selectOption("rvrt-x4");
+
+  await expect(page.getByTestId("selected-model-label")).toContainText("RVRT x4");
+  await expect(page.getByTestId("selected-model-status")).toContainText("runnable");
+  await expect(page.getByTestId("run-upscale-button")).toBeEnabled();
+
+  await page.getByTestId("run-upscale-button").click();
+  await expect.poll(async () => page.evaluate(() => window.__UPSCALER_TEST_STATE__.lastRequest?.modelId ?? null)).toBe("rvrt-x4");
 });
 
 test("upgrades an avi preview in the background and still supports manual conversion", async ({ page }) => {
@@ -991,12 +1905,16 @@ test("shows historical cleanup jobs and runs cleanup actions", async ({ page }) 
   await page.goto("/");
 
   await page.getByTestId("job-cleanup-panel-toggle").click();
-  await expect(page.getByTestId("cleanup-sort-size")).toContainText("↓");
-  await expect(page.getByTestId("cleanup-sort-size")).toHaveClass(/cleanup-sort-button-active/);
+  await expect(page.getByTestId("cleanup-sort-scratch-size")).toContainText("↓");
+  await expect(page.getByTestId("cleanup-sort-scratch-size")).toHaveClass(/cleanup-sort-button-active/);
   await expect(page.getByTestId("cleanup-jobs-table")).toBeVisible();
   await expect(page.getByTestId("cleanup-job-historic-pipeline-job")).toContainText("Historical Upscale Job");
+  await expect(page.getByTestId("cleanup-job-legacy-pipeline-job")).toContainText("Legacy Upscale Job");
   await expect(page.getByTestId("cleanup-job-conv_historic-source-job")).toContainText("Historical Conversion");
   await expect(page.getByTestId("cleanup-directory-historic-pipeline-job")).toContainText("job_historic-pipeline-job");
+  await expect(page.getByTestId("cleanup-scratch-size-historic-pipeline-job")).toContainText("32 MB");
+  await expect(page.getByTestId("cleanup-output-size-historic-pipeline-job")).toContainText("18 MB");
+  await expect(page.getByTestId("cleanup-row-repeat-legacy-pipeline-job")).toBeVisible();
   await expect(page.getByTestId("cleanup-input-historic-pipeline-job")).toContainText("historic-input.mov");
   await expect(page.getByTestId("cleanup-output-historic-pipeline-job")).toContainText("historic-upscale.mkv");
   await expect(page.getByTestId("cleanup-updated-historic-pipeline-job")).toContainText("ago");
@@ -1013,9 +1931,12 @@ test("shows historical cleanup jobs and runs cleanup actions", async ({ page }) 
 
   await page.getByTestId("cleanup-expand-historic-pipeline-job").click();
   await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Model: realesrgan-x4plus");
-  await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Codec / Container: h265 / mkv");
-  await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Average / Current Throughput: 15.0 fps / calculating");
+  await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Codec: h265");
+  await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Container: mkv");
+  await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Average Throughput: 15.0 fps");
+  await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Current Throughput: calculating");
   await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Stage Times: extract 6s, upscale 52s, encode 15s, remux 7s");
+  await expect(page.getByTestId("cleanup-clear-scratch-historic-pipeline-job")).toHaveAttribute("title", /intermediate working files/i);
 
   await page.getByTestId("cleanup-open-output-historic-pipeline-job").click();
   await page.getByTestId("cleanup-open-scratch-historic-pipeline-job").click();
@@ -1023,19 +1944,428 @@ test("shows historical cleanup jobs and runs cleanup actions", async ({ page }) 
 
   await page.getByTestId("cleanup-clear-scratch-historic-pipeline-job").click();
   await page.getByTestId("cleanup-expand-conv_historic-source-job").click();
+  await expect(page.getByTestId("cleanup-delete-output-conv_historic-source-job")).toHaveAttribute("title", /converted source file created by the app/i);
   await page.getByTestId("cleanup-delete-output-conv_historic-source-job").click();
+  await page.getByTestId("clear-jobs-pool-button").click();
 
   const { deletedPaths, openedPaths, confirmMessages } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
   expect(openedPaths).toEqual([
     "C:/workspace/artifacts/outputs/historic-upscale.mkv",
     "C:/workspace/artifacts/jobs/job_historic-pipeline-job"
   ]);
-  expect(confirmMessages).toHaveLength(1);
+  expect(confirmMessages).toHaveLength(4);
   expect(confirmMessages[0]).toContain("Impacted size");
+  expect(confirmMessages[1]).toContain("C:/workspace/artifacts/jobs/job_historic-pipeline-job");
+  expect(confirmMessages[1]).toContain("intermediate artifacts");
+  expect(confirmMessages[2]).toContain("C:/workspace/artifacts/runtime/converted-sources/historic-source.mp4");
+  expect(confirmMessages[2]).toContain("compatibility");
+  expect(confirmMessages[3]).toContain("C:/workspace/artifacts/jobs");
+  expect(confirmMessages[3]).toContain("scratch pool");
   expect(deletedPaths).toEqual([
     "C:/workspace/artifacts/outputs/historic-upscale.mkv",
+    "C:/workspace/artifacts/outputs/legacy-repeat-output.mp4",
     "C:/workspace/artifacts/runtime/converted-sources/historic-source.mp4",
     "C:/workspace/artifacts/jobs/job_historic-pipeline-job",
-    "C:/workspace/artifacts/runtime/converted-sources/historic-source.mp4"
+    "C:/workspace/artifacts/runtime/converted-sources/historic-source.mp4",
+    "C:/workspace/artifacts/jobs"
   ]);
+});
+
+test("restores a historical pipeline request for repeat runs", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByTestId("job-cleanup-panel-toggle").click();
+  await page.getByTestId("cleanup-row-repeat-historic-pipeline-job").click();
+
+  await expect(page.getByTestId("input-panel")).toContainText("C:/workspace/fixtures/historic-input.mov");
+  await expect(page.getByTestId("selected-model-label")).toContainText("Real-ESRGAN x4 Plus");
+  await expect(page.getByTestId("output-path-input")).toHaveValue("C:/workspace/artifacts/outputs/historic-upscale.mkv");
+  await expect(page.getByTestId("codec-select")).toHaveValue("h265");
+  await expect(page.getByTestId("container-select")).toHaveValue("mkv");
+  await expect(page.getByTestId("encoding-quality-preset-select")).toHaveValue("qualityMax");
+  await expect(page.getByTestId("preview-mode-checkbox")).not.toBeChecked();
+  await expect(page.getByTestId("segment-duration-input")).toHaveValue("10");
+});
+
+test("restores legacy pipeline jobs with recorded source/output settings and current advanced defaults", async ({ page }) => {
+  await page.goto("/");
+
+  await openUpscaleControls(page);
+  await page.getByTestId("quality-preset-select").selectOption("vramSafe");
+  await page.getByTestId("job-cleanup-panel-toggle").click();
+  await page.getByTestId("cleanup-row-repeat-legacy-pipeline-job").click();
+
+  await expect(page.getByTestId("input-panel")).toContainText("C:/workspace/fixtures/legacy-repeat-source.mp4");
+  await expect(page.getByTestId("output-path-input")).toHaveValue("C:/workspace/artifacts/outputs/legacy-repeat-output.mp4");
+  await expect(page.getByTestId("codec-select")).toHaveValue("h264");
+  await expect(page.getByTestId("container-select")).toHaveValue("mp4");
+  await expect(page.getByTestId("quality-preset-select")).toHaveValue("vramSafe");
+});
+
+test("restarts interrupted jobs from the jobs table using saved settings", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByTestId("job-cleanup-panel-toggle").click();
+  await expect(page.getByTestId("cleanup-job-interrupted-pipeline-job")).toContainText("Interrupted Upscale Job");
+  await expect(page.getByTestId("cleanup-row-restart-interrupted-pipeline-job")).toBeVisible();
+  await expect(page.getByTestId("cleanup-row-repeat-interrupted-pipeline-job")).toBeVisible();
+  await expect(page.getByTestId("cleanup-row-repeat-interrupted-pipeline-job")).toContainText("Load Template");
+  await page.getByTestId("cleanup-expand-interrupted-pipeline-job").click();
+  await expect(page.getByTestId("cleanup-details-interrupted-pipeline-job")).toContainText("Input Path: C:/workspace/fixtures/interrupted-source.mp4");
+  await expect(page.getByTestId("cleanup-details-interrupted-pipeline-job")).toContainText("Output Path: C:/workspace/artifacts/outputs/interrupted-output.mkv");
+  await expect(page.getByTestId("cleanup-details-interrupted-pipeline-job")).toContainText("loaded as a template for edits first");
+  await page.getByTestId("cleanup-row-restart-interrupted-pipeline-job").click();
+
+  await expect(page.getByTestId("input-panel")).toContainText("C:/workspace/fixtures/interrupted-source.mp4");
+  await expect(page.getByTestId("output-path-input")).toHaveValue("C:/workspace/artifacts/outputs/interrupted-output.mkv");
+  await expect(page.getByTestId("codec-select")).toHaveValue("h265");
+  await expect(page.getByTestId("container-select")).toHaveValue("mkv");
+
+  const { lastRequest } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+  expect(lastRequest?.sourcePath).toBe("C:/workspace/fixtures/interrupted-source.mp4");
+  expect(lastRequest?.outputPath).toBe("C:/workspace/artifacts/outputs/interrupted-output.mkv");
+  expect(lastRequest?.qualityPreset).toBe("qualityBalanced");
+});
+
+test("restarts cancelled jobs from the jobs table using saved settings", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    if (!window.__UPSCALER_MOCK__) {
+      return;
+    }
+
+    window.__UPSCALER_MOCK__.startPipeline = async (request) => {
+      window.__UPSCALER_TEST_STATE__.lastRequest = request;
+      return "mock-job-realesrgan-x4plus";
+    };
+    window.__UPSCALER_MOCK__.getPipelineJob = async () => ({
+      jobId: "mock-job-realesrgan-x4plus",
+      state: "running",
+      progress: {
+        phase: "upscaling",
+        percent: 35,
+        message: "Upscaling extracted frames",
+        processedFrames: 105,
+        totalFrames: 300,
+        extractedFrames: 300,
+        upscaledFrames: 105,
+        interpolatedFrames: 0,
+        encodedFrames: 0,
+        remuxedFrames: 0,
+      },
+      result: null,
+      error: null,
+    });
+    window.__UPSCALER_MOCK__.cancelPipelineJob = async () => {
+      window.__UPSCALER_MOCK__.getPipelineJob = async () => ({
+        jobId: "mock-job-realesrgan-x4plus",
+        state: "cancelled",
+        progress: {
+          phase: "failed",
+          percent: 100,
+          message: "Job cancelled by user",
+          processedFrames: 105,
+          totalFrames: 300,
+          extractedFrames: 300,
+          upscaledFrames: 105,
+          interpolatedFrames: 0,
+          encodedFrames: 0,
+          remuxedFrames: 0,
+        },
+        result: null,
+        error: "Job cancelled by user",
+      });
+    };
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await page.getByTestId("run-upscale-button").click();
+  await page.getByTestId("job-cleanup-panel-toggle").click();
+  await page.getByTestId("cleanup-expand-mock-job-realesrgan-x4plus").click();
+  await expect(page.getByTestId("cleanup-stop-mock-job-realesrgan-x4plus")).toBeVisible();
+  await page.getByTestId("cleanup-stop-mock-job-realesrgan-x4plus").click();
+
+  await expect(page.getByTestId("cleanup-job-mock-job-realesrgan-x4plus")).toContainText("cancelled");
+  await expect(page.getByTestId("cleanup-row-restart-mock-job-realesrgan-x4plus")).toBeVisible();
+  await expect(page.getByTestId("cleanup-row-repeat-mock-job-realesrgan-x4plus")).toBeVisible();
+  await expect(page.getByTestId("cleanup-row-repeat-mock-job-realesrgan-x4plus")).toContainText("Load Template");
+
+  await expect(page.getByTestId("cleanup-details-mock-job-realesrgan-x4plus")).toContainText("Recovery: This incomplete job can be restarted immediately or loaded as a template for edits first.");
+  await page.getByTestId("cleanup-row-restart-mock-job-realesrgan-x4plus").click();
+
+  await expect(page.getByTestId("input-panel")).toContainText("C:/fixtures/sample-input.mp4");
+  await expect(page.getByTestId("output-path-input")).toHaveValue("artifacts/video-upgrader/outputs/sample-input_realesrgan_x4plus.mp4");
+
+  const { lastRequest } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+  expect(lastRequest?.sourcePath).toBe("C:/fixtures/sample-input.mp4");
+  expect(lastRequest?.outputPath).toBe("artifacts/video-upgrader/outputs/sample-input_realesrgan_x4plus.mp4");
+});
+
+test("pauses and resumes an active pipeline job", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    if (!window.__UPSCALER_MOCK__ || !window.__UPSCALER_TEST_STATE__) {
+      return;
+    }
+
+    const pauseState = {
+      state: "running",
+      progress: {
+        phase: "upscaling",
+        percent: 41,
+        message: "Upscaling extracted frames",
+        processedFrames: 123,
+        totalFrames: 300,
+        extractedFrames: 300,
+        upscaledFrames: 123,
+        interpolatedFrames: 0,
+        encodedFrames: 0,
+        remuxedFrames: 0,
+      },
+    };
+    window.__UPSCALER_TEST_STATE__.pauseState = pauseState;
+
+    window.__UPSCALER_MOCK__.startPipeline = async (request) => {
+      window.__UPSCALER_TEST_STATE__.lastRequest = request;
+      return "pauseable-live-job";
+    };
+    window.__UPSCALER_MOCK__.getPipelineJob = async () => ({
+      jobId: "pauseable-live-job",
+      state: pauseState.state,
+      progress: {
+        ...pauseState.progress,
+      },
+      result: null,
+      error: null,
+    });
+    window.__UPSCALER_MOCK__.pausePipelineJob = async () => {
+      pauseState.state = "paused";
+      pauseState.progress = {
+        ...pauseState.progress,
+        phase: "paused",
+        message: "Paused: upscaling extracted frames",
+      };
+    };
+    window.__UPSCALER_MOCK__.resumePipelineJob = async () => {
+      pauseState.state = "running";
+      pauseState.progress = {
+        ...pauseState.progress,
+        phase: "upscaling",
+        message: "Resumed: upscaling extracted frames",
+      };
+    };
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await page.getByTestId("run-upscale-button").click();
+  await page.getByTestId("job-cleanup-panel-toggle").click();
+  await page.getByTestId("cleanup-expand-pauseable-live-job").click();
+
+  await expect(page.getByTestId("cleanup-pause-pauseable-live-job")).toBeVisible();
+  await page.getByTestId("cleanup-pause-pauseable-live-job").click();
+  await expect(page.getByTestId("cleanup-job-pauseable-live-job")).toContainText("paused");
+  await expect(page.getByTestId("cleanup-resume-pauseable-live-job")).toBeVisible();
+
+  await page.getByTestId("top-status-pause-button").click();
+  await expect(page.getByTestId("cleanup-job-pauseable-live-job")).toContainText("running");
+  await expect(page.getByTestId("cleanup-pause-pauseable-live-job")).toBeVisible();
+});
+
+test("shows a running pipeline job in the standalone jobs window", async ({ page }) => {
+  await page.addInitScript(() => {
+    if (!window.__UPSCALER_MOCK__) {
+      return;
+    }
+
+    window.__UPSCALER_MOCK__.listManagedJobs = async () => ([
+      {
+        jobId: "running-window-job",
+        jobKind: "pipeline",
+        label: "Detached Running Job",
+        state: "running",
+        sourcePath: "C:/workspace/fixtures/running-input.mov",
+        modelId: "realesrgan-x4plus",
+        codec: "h265",
+        container: "mkv",
+        progress: {
+          phase: "upscaling",
+          percent: 47,
+          message: "Upscaling segment 3/6 batch 2/4 (244/520 frames)",
+          processedFrames: 1184,
+          totalFrames: 2520,
+          extractedFrames: 1560,
+          upscaledFrames: 1184,
+          interpolatedFrames: 0,
+          encodedFrames: 320,
+          remuxedFrames: 0,
+          segmentIndex: 3,
+          segmentCount: 6,
+          segmentProcessedFrames: 244,
+          segmentTotalFrames: 520,
+          batchIndex: 2,
+          batchCount: 4,
+          elapsedSeconds: 152,
+          averageFramesPerSecond: 7.8,
+          rollingFramesPerSecond: 8.4,
+          estimatedRemainingSeconds: 171,
+          processRssBytes: 1024 * 1024 * 896,
+          gpuMemoryUsedBytes: 1024 * 1024 * 6144,
+          gpuMemoryTotalBytes: 1024 * 1024 * 24576,
+          scratchSizeBytes: 1024 * 1024 * 22,
+          outputSizeBytes: 1024 * 1024 * 7,
+          extractStageSeconds: 12,
+          upscaleStageSeconds: 140,
+          interpolateStageSeconds: 0,
+          encodeStageSeconds: 18,
+          remuxStageSeconds: 0,
+        },
+        recordedCount: 2520,
+        scratchPath: "C:/workspace/artifacts/jobs/job_running-window-job",
+        scratchStats: {
+          path: "C:/workspace/artifacts/jobs/job_running-window-job",
+          exists: true,
+          isDirectory: true,
+          sizeBytes: 1024 * 1024 * 22,
+        },
+        outputPath: "C:/workspace/artifacts/outputs/running-window-job.mkv",
+        outputStats: {
+          path: "C:/workspace/artifacts/outputs/running-window-job.mkv",
+          exists: true,
+          isDirectory: false,
+          sizeBytes: 1024 * 1024 * 7,
+        },
+        pipelineRunDetails: {
+          request: {
+            sourcePath: "C:/workspace/fixtures/running-input.mov",
+            modelId: "realesrgan-x4plus",
+            outputMode: "preserveAspect4k",
+            qualityPreset: "qualityBalanced",
+            interpolationMode: "off",
+            interpolationTargetFps: null,
+            pytorchRunner: "torch",
+            gpuId: 1,
+            aspectRatioPreset: "16:9",
+            customAspectWidth: null,
+            customAspectHeight: null,
+            resolutionBasis: "exact",
+            targetWidth: 3840,
+            targetHeight: 2160,
+            cropLeft: null,
+            cropTop: null,
+            cropWidth: null,
+            cropHeight: null,
+            previewMode: false,
+            previewDurationSeconds: null,
+            segmentDurationSeconds: 10,
+            outputPath: "C:/workspace/artifacts/outputs/running-window-job.mkv",
+            codec: "h265",
+            container: "mkv",
+            tileSize: 128,
+            fp16: false,
+            crf: 18,
+          },
+          sourceMedia: {
+            width: 1280,
+            height: 720,
+            frameRate: 24,
+            durationSeconds: 105,
+            frameCount: 2520,
+            aspectRatio: 1.7777777778,
+            pixelCount: 921600,
+            hasAudio: true,
+            container: "mov",
+            videoCodec: "prores",
+          },
+          outputMedia: {
+            width: 3840,
+            height: 2160,
+            frameRate: 24,
+            durationSeconds: 105,
+            frameCount: 2520,
+            aspectRatio: 1.7777777778,
+            pixelCount: 8294400,
+            hasAudio: true,
+            container: "mkv",
+            videoCodec: "hevc",
+          },
+          effectiveSettings: {
+            effectiveTileSize: 128,
+            processedDurationSeconds: 105,
+            segmentFrameLimit: 520,
+            previewMode: false,
+            previewDurationSeconds: null,
+            segmentDurationSeconds: 10,
+          },
+          executionPath: "file-io",
+          videoEncoder: "libx265",
+          videoEncoderLabel: "HEVC (libx265)",
+          runner: "torch",
+          precision: "fp32",
+          averageThroughputFps: 7.8,
+          segmentCount: 6,
+          segmentFrameLimit: 520,
+          frameCount: 2520,
+          hadAudio: true,
+          runtime: {
+            ffmpegPath: "C:/tools/ffmpeg.exe",
+            realesrganPath: "C:/tools/realesrgan-ncnn-vulkan.exe",
+            modelDir: "C:/tools/models",
+            rifePath: "C:/tools/rife-ncnn-vulkan.exe",
+            rifeModelRoot: "C:/tools/rife-models",
+            availableGpus: [
+              { id: 0, name: "Intel(R) Graphics", kind: "integrated" },
+              { id: 1, name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", kind: "discrete" },
+            ],
+            defaultGpuId: 1,
+          },
+        },
+        updatedAt: String(Math.floor(Date.now() / 1000) - 15),
+      },
+    ]);
+  });
+
+  await page.goto("/?view=jobs");
+
+  await expect(page.getByTestId("job-cleanup-panel")).toBeVisible();
+  await expect(page.getByTestId("cleanup-job-running-window-job")).toContainText("Detached Running Job");
+  await expect(page.getByTestId("cleanup-job-running-window-job")).toContainText("running");
+  await expect(page.getByTestId("cleanup-input-running-window-job")).toContainText("running-input.mov");
+  await expect(page.getByTestId("cleanup-output-running-window-job")).toContainText("running-window-job.mkv");
+  await expect(page.getByTestId("cleanup-scratch-size-running-window-job")).toContainText("22 MB");
+  await expect(page.getByTestId("cleanup-output-size-running-window-job")).toContainText("7.0 MB");
+
+  await page.getByTestId("cleanup-expand-running-window-job").click();
+  await expect(page.getByTestId("cleanup-details-running-window-job")).toContainText("Phase: upscaling");
+  await expect(page.getByTestId("cleanup-details-running-window-job")).toContainText("Input Path: C:/workspace/fixtures/running-input.mov");
+  await expect(page.getByTestId("cleanup-details-running-window-job")).toContainText("Scratch Path: C:/workspace/artifacts/jobs/job_running-window-job");
+  await expect(page.getByTestId("cleanup-details-running-window-job")).toContainText("Output Path: C:/workspace/artifacts/outputs/running-window-job.mkv");
+  await expect(page.getByTestId("cleanup-details-running-window-job")).toContainText("Average Throughput: 7.80 fps");
+  await expect(page.getByTestId("cleanup-details-running-window-job")).toContainText("Current Throughput: 8.40 fps");
+  await expect(page.getByTestId("cleanup-details-running-window-job")).toContainText("Elapsed: 2m 32s");
+  await expect(page.getByTestId("cleanup-details-running-window-job")).toContainText("ETA: 2m 51s");
+  await expect(page.getByTestId("cleanup-details-running-window-job")).toContainText("Execution Path: file-io");
+  await expect(page.getByTestId("cleanup-details-running-window-job")).toContainText("Precision: fp32");
+});
+
+test("renders the standalone jobs view without a close button and keeps the jobs table horizontally scrollable", async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 900 });
+  await page.goto("/?view=jobs");
+
+  await expect(page.getByTestId("job-cleanup-panel")).toBeVisible();
+  await expect(page.getByTestId("jobs-window-close")).toHaveCount(0);
+  await expect(page.getByTestId("top-status-panel")).toHaveCount(0);
+  await expect(page.getByTestId("cleanup-row-repeat-historic-pipeline-job")).toBeVisible();
+  await expect(page.getByTestId("cleanup-row-repeat-historic-pipeline-job")).toContainText("Load Template");
+  await expect(page.getByTestId("cleanup-row-repeat-legacy-pipeline-job")).toBeVisible();
+  await expect(page.getByTestId("cleanup-scratch-size-historic-pipeline-job")).toContainText("32 MB");
+  await expect(page.getByTestId("cleanup-output-size-historic-pipeline-job")).toContainText("18 MB");
+
+  const tableMetrics = await page.getByTestId("cleanup-jobs-table-shell").evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+  }));
+
+  expect(tableMetrics.scrollWidth).toBeGreaterThan(tableMetrics.clientWidth);
 });

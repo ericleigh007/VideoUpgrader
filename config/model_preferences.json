@@ -12,6 +12,90 @@
         "swinir-realworld-x4"
       ],
       "createdAt": "1775076243"
+    },
+    {
+      "sourcePath": "C:\\eric\\Audrey Hepburn Makes Her First Appearance and Johnny Is Nervous ｜ Carson Tonight Show [nXdrhKrdvGc].webm",
+      "previewDurationSeconds": 1,
+      "winnerModelId": "swinir-realworld-x4",
+      "candidateModelIds": [
+        "swinir-realworld-x4",
+        "realesrgan-x4plus",
+        "realesrnet-x4plus",
+        "bsrgan-x4"
+      ],
+      "createdAt": "1775751813"
+    },
+    {
+      "sourcePath": "C:\\eric\\Audrey Hepburn Makes Her First Appearance and Johnny Is Nervous ｜ Carson Tonight Show [nXdrhKrdvGc].webm",
+      "previewDurationSeconds": 1,
+      "winnerModelId": "swinir-realworld-x4",
+      "candidateModelIds": [
+        "swinir-realworld-x4",
+        "realesrgan-x4plus",
+        "realesrnet-x4plus",
+        "bsrgan-x4"
+      ],
+      "createdAt": "1775761090"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 1,
+      "winnerModelId": "realesrnet-x4plus",
+      "candidateModelIds": [
+        "realesrnet-x4plus",
+        "bsrgan-x4",
+        "realesrgan-x4plus",
+        "swinir-realworld-x4"
+      ],
+      "createdAt": "1775856261"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 1,
+      "winnerModelId": "realesrnet-x4plus",
+      "candidateModelIds": [
+        "realesrnet-x4plus",
+        "bsrgan-x4",
+        "realesrgan-x4plus",
+        "swinir-realworld-x4"
+      ],
+      "createdAt": "1775867079"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 1,
+      "winnerModelId": "bsrgan-x4",
+      "candidateModelIds": [
+        "bsrgan-x4",
+        "realesrnet-x4plus",
+        "realesrgan-x4plus",
+        "swinir-realworld-x4"
+      ],
+      "createdAt": "1775867837"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 1,
+      "winnerModelId": "swinir-realworld-x4",
+      "candidateModelIds": [
+        "swinir-realworld-x4",
+        "realesrnet-x4plus",
+        "bsrgan-x4",
+        "realesrgan-x4plus"
+      ],
+      "createdAt": "1775868379"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 1,
+      "winnerModelId": "realesrgan-x4plus",
+      "candidateModelIds": [
+        "realesrgan-x4plus",
+        "swinir-realworld-x4",
+        "realesrnet-x4plus",
+        "bsrgan-x4"
+      ],
+      "createdAt": "1775869810"
     }
   ]
 }

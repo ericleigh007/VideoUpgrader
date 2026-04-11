@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from upscaler_worker.cancellation import JobCancelledError, cancellation_requested, ensure_not_cancelled, terminate_process
+from upscaler_worker.cancellation import JobCancelledError, cancellation_requested, ensure_not_cancelled, terminate_process, terminate_process_tree, wait_if_paused
 from upscaler_worker.interpolation import (
     build_rife_command,
     resolve_output_fps,
@@ -24,9 +24,11 @@ from upscaler_worker.interpolation import (
 )
 from upscaler_worker.media import probe_video
 from upscaler_worker.model_catalog import ensure_runnable_model, model_backend_id
+from upscaler_worker.models.pytorch_video_sr import build_external_video_sr_command, validate_external_video_sr_outputs
 from upscaler_worker.precision import resolve_precision_mode
 from upscaler_worker.models.realesrgan import model_label
 from upscaler_worker.runtime import ensure_rife_runtime, ensure_runtime_assets, repo_root
+from upscaler_worker.video_encoding import VideoEncoderConfig, probe_video_encoder, resolve_video_encoder_config
 
 
 BATCH_FRAME_COUNT = 12
@@ -102,6 +104,18 @@ class PipelineProgressState:
     remuxed_frames: int = 0
 
 
+def _should_publish_stage_progress(phase: str, progress_state: PipelineProgressState) -> bool:
+    if phase != "extracting":
+        return True
+
+    return (
+        progress_state.upscaled_frames <= 0
+        and progress_state.interpolated_frames <= 0
+        and progress_state.encoded_frames <= 0
+        and progress_state.remuxed_frames <= 0
+    )
+
+
 @dataclass
 class PipelineTelemetryResources:
     sampled_at: float = 0.0
@@ -121,8 +135,10 @@ class PipelineTelemetryResources:
 @dataclass
 class PipelineTelemetryState:
     started_at: float
+    source_path: str
     scratch_path: Path
     output_path: Path
+    job_id: str | None = None
     resources: PipelineTelemetryResources = field(default_factory=PipelineTelemetryResources)
     segment_index: int | None = None
     segment_count: int | None = None
@@ -137,103 +153,13 @@ class PipelineTelemetryState:
     remux_stage_seconds: float = 0.0
 
 
-@dataclass(frozen=True)
-class VideoEncoderConfig:
-    encoder: str
-    quality_args: tuple[str, ...]
-    label: str
-    hardware_accelerated: bool
-
-
 def _round_dimension(value: float) -> int:
     rounded = max(2, int(round(value)))
     return rounded if rounded % 2 == 0 else rounded + 1
 
 
-def _software_video_encoder_config(codec: str, crf: int) -> VideoEncoderConfig:
-    return VideoEncoderConfig(
-        encoder="libx265" if codec == "h265" else "libx264",
-        quality_args=("-preset", "medium", "-crf", str(crf)),
-        label="software-cpu",
-        hardware_accelerated=False,
-    )
-
-
-def _select_runtime_gpu(runtime: dict[str, object], gpu_id: int | None) -> dict[str, object] | None:
-    available_gpus = runtime.get("availableGpus", [])
-    if not isinstance(available_gpus, list) or not available_gpus:
-        return None
-
-    if gpu_id is not None:
-        selected = next(
-            (
-                device
-                for device in available_gpus
-                if isinstance(device, dict) and device.get("id") == gpu_id
-            ),
-            None,
-        )
-        if selected is not None:
-            return selected
-
-    discrete = next(
-        (
-            device
-            for device in available_gpus
-            if isinstance(device, dict) and device.get("kind") == "discrete"
-        ),
-        None,
-    )
-    if discrete is not None:
-        return discrete
-
-    return next((device for device in available_gpus if isinstance(device, dict)), None)
-
-
-def _hardware_video_encoder_config(codec: str, crf: int, gpu_name: str) -> VideoEncoderConfig | None:
-    normalized_name = gpu_name.lower()
-    if any(token in normalized_name for token in ["nvidia", "geforce", "rtx", "quadro"]):
-        return VideoEncoderConfig(
-            encoder="hevc_nvenc" if codec == "h265" else "h264_nvenc",
-            quality_args=("-preset", "p5", "-cq", str(crf), "-b:v", "0"),
-            label=f"nvidia-nvenc ({gpu_name})",
-            hardware_accelerated=True,
-        )
-    return None
-
-
 def _probe_video_encoder(ffmpeg: str, config: VideoEncoderConfig) -> bool:
-    probe_command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        "color=c=black:s=16x16:d=0.1:r=1",
-        "-frames:v",
-        "1",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:v",
-        config.encoder,
-        *config.quality_args,
-        "-f",
-        "null",
-        "-",
-    ]
-    try:
-        completed = subprocess.run(
-            probe_command,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=20,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return completed.returncode == 0
+    return probe_video_encoder(ffmpeg, config)
 
 
 def _resolve_video_encoder_config(
@@ -245,27 +171,15 @@ def _resolve_video_encoder_config(
     crf: int,
     log: list[str],
 ) -> VideoEncoderConfig:
-    software_config = _software_video_encoder_config(codec, crf)
-    selected_gpu = _select_runtime_gpu(runtime, gpu_id)
-    if selected_gpu is None:
-        log.append(f"Video encoder: {software_config.encoder} ({software_config.label})")
-        return software_config
-
-    gpu_name = str(selected_gpu.get("name", "")).strip()
-    hardware_config = _hardware_video_encoder_config(codec, crf, gpu_name)
-    if hardware_config is None:
-        log.append(f"Video encoder: {software_config.encoder} ({software_config.label})")
-        return software_config
-
-    if _probe_video_encoder(ffmpeg, hardware_config):
-        log.append(f"Video encoder: {hardware_config.encoder} ({hardware_config.label})")
-        return hardware_config
-
-    log.append(
-        f"Hardware encoder probe failed for {hardware_config.encoder} on {gpu_name}; falling back to {software_config.encoder}."
+    return resolve_video_encoder_config(
+        ffmpeg=ffmpeg,
+        runtime=runtime,
+        gpu_id=gpu_id,
+        codec=codec,
+        crf=crf,
+        log=log,
+        probe_encoder=_probe_video_encoder,
     )
-    log.append(f"Video encoder: {software_config.encoder} ({software_config.label})")
-    return software_config
 
 
 def _clamp_ratio_position(value: float) -> float:
@@ -361,9 +275,17 @@ def _resolve_output_dimensions(
     return _round_dimension(2160 * aspect_ratio), 2160, aspect_ratio
 
 
-def _run(command: list[str], log: list[str], cancel_path: str | None = None) -> None:
+def _run(
+    command: list[str],
+    log: list[str],
+    cancel_path: str | None = None,
+    pause_path: str | None = None,
+    on_pause=None,
+    on_resume=None,
+    env: dict[str, str] | None = None,
+) -> None:
     log.append("$ " + " ".join(command))
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, env=env)
     output_lines: list[str] = []
     output_lock = threading.Lock()
 
@@ -389,10 +311,20 @@ def _run(command: list[str], log: list[str], cancel_path: str | None = None) -> 
 
     try:
         while process.poll() is None:
+            wait_if_paused(
+                pause_path,
+                cancel_path=cancel_path,
+                process=process,
+                on_pause=on_pause,
+                on_resume=on_resume,
+            )
             if cancellation_requested(cancel_path):
                 terminate_process(process)
                 raise JobCancelledError("Job cancelled by user")
             time.sleep(0.1)
+    except BaseException:
+        terminate_process_tree(process)
+        raise
     finally:
         stdout_thread.join(timeout=5)
         stderr_thread.join(timeout=5)
@@ -659,6 +591,14 @@ def _write_progress(
         "remuxedFrames": remuxed_frames,
     }
     if telemetry_state is not None:
+        payload.update(
+            {
+                "jobId": telemetry_state.job_id,
+                "sourcePath": telemetry_state.source_path,
+                "scratchPath": str(telemetry_state.scratch_path),
+                "outputPath": str(telemetry_state.output_path),
+            }
+        )
         payload.update(_sample_progress_telemetry(telemetry_state, processed_frames=processed_frames, total_frames=total_frames))
     target.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -668,6 +608,7 @@ def _run_ffmpeg_with_frame_progress(
     log: list[str],
     progress_path: str | None,
     cancel_path: str | None,
+    pause_path: str | None,
     *,
     phase: str,
     percent_base: int,
@@ -732,11 +673,47 @@ def _run_ffmpeg_with_frame_progress(
 
     try:
         while process.poll() is None:
+            wait_if_paused(
+                pause_path,
+                cancel_path=cancel_path,
+                process=process,
+                on_pause=lambda: _write_progress(
+                    progress_path,
+                    phase="paused",
+                    percent=percent_base if total_frames <= 0 else min(percent_base + percent_span, percent_base + int((min(total_frames, stage_frame_offset + state["current_frame"]) / max(total_frames, 1)) * percent_span)),
+                    message=f"Paused: {message_prefix} ({min(total_frames, stage_frame_offset + state['current_frame'])}/{total_frames})",
+                    processed_frames=min(total_frames, stage_frame_offset + state["current_frame"]),
+                    total_frames=total_frames,
+                    extracted_frames=extracted_frames,
+                    upscaled_frames=upscaled_frames,
+                    interpolated_frames=interpolated_frames,
+                    encoded_frames=min(total_frames, stage_frame_offset + state["current_frame"]) if phase == "encoding" else encoded_frames,
+                    remuxed_frames=min(total_frames, stage_frame_offset + state["current_frame"]) if phase == "remuxing" else remuxed_frames,
+                    telemetry_state=telemetry_state,
+                ),
+                on_resume=lambda: _write_progress(
+                    progress_path,
+                    phase=phase,
+                    percent=percent_base if total_frames <= 0 else min(percent_base + percent_span, percent_base + int((min(total_frames, stage_frame_offset + state["current_frame"]) / max(total_frames, 1)) * percent_span)),
+                    message=f"Resumed: {message_prefix} ({min(total_frames, stage_frame_offset + state['current_frame'])}/{total_frames})",
+                    processed_frames=min(total_frames, stage_frame_offset + state["current_frame"]),
+                    total_frames=total_frames,
+                    extracted_frames=extracted_frames,
+                    upscaled_frames=upscaled_frames,
+                    interpolated_frames=interpolated_frames,
+                    encoded_frames=min(total_frames, stage_frame_offset + state["current_frame"]) if phase == "encoding" else encoded_frames,
+                    remuxed_frames=min(total_frames, stage_frame_offset + state["current_frame"]) if phase == "remuxing" else remuxed_frames,
+                    telemetry_state=telemetry_state,
+                ),
+            )
             if cancellation_requested(cancel_path):
                 terminate_process(process)
                 raise JobCancelledError("Job cancelled by user")
             reader_thread.join(timeout=0.1)
         reader_thread.join(timeout=1)
+    except BaseException:
+        terminate_process_tree(process)
+        raise
     finally:
         if process.stdout:
             process.stdout.close()
@@ -754,8 +731,74 @@ def _run_realesrgan_batch(
     command: list[str],
     log: list[str],
     cancel_path: str | None = None,
+    pause_path: str | None = None,
 ) -> None:
-    _run(command, log, cancel_path)
+    _run(command, log, cancel_path, pause_path)
+
+
+def _run_command_with_output_frame_progress(
+    *,
+    command: list[str],
+    output_dir: Path,
+    target_frame_count: int,
+    log: list[str],
+    cancel_path: str | None,
+    pause_path: str | None,
+    progress_callback=None,
+    env: dict[str, str] | None = None,
+) -> int:
+    log.append("$ " + " ".join(command))
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, env=env)
+    output_lines: list[str] = []
+    output_lock = threading.Lock()
+
+    def drain_stream(stream: object) -> None:
+        if stream is None:
+            return
+        try:
+            for line in stream:
+                text = line.rstrip()
+                if text:
+                    with output_lock:
+                        output_lines.append(text)
+        finally:
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    stdout_thread = threading.Thread(target=drain_stream, args=(process.stdout,), daemon=True)
+    stderr_thread = threading.Thread(target=drain_stream, args=(process.stderr,), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    last_reported_count = -1
+    try:
+        while process.poll() is None:
+            wait_if_paused(pause_path, cancel_path=cancel_path, process=process)
+            if cancellation_requested(cancel_path):
+                terminate_process(process)
+                raise JobCancelledError("Job cancelled by user")
+            current_count = len(list(output_dir.glob("frame_*.png")))
+            if progress_callback is not None and current_count != last_reported_count:
+                progress_callback(current_count, target_frame_count)
+                last_reported_count = current_count
+            time.sleep(0.25)
+    except BaseException:
+        terminate_process_tree(process)
+        raise
+    finally:
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+
+    final_count = len(list(output_dir.glob("frame_*.png")))
+    if progress_callback is not None and final_count != last_reported_count:
+        progress_callback(final_count, target_frame_count)
+    if output_lines:
+        log.append("\n".join(output_lines))
+    if process.returncode != 0:
+        raise RuntimeError(f"Command failed with exit code {process.returncode}: {' '.join(command)}")
+    return final_count
 
 
 def _run_rife_segment(
@@ -1098,25 +1141,27 @@ def _extract_segment_frames(
     ffmpeg: str,
     source_path: str,
     segment: PipelineSegment,
+    source_start_seconds: float,
     input_dir: Path,
     log: list[str],
     cancel_path: str | None,
+    pause_path: str | None,
 ) -> int:
     input_dir.mkdir(parents=True, exist_ok=True)
     extract_command = [
         ffmpeg,
         "-y",
-        "-ss",
-        f"{segment.start_seconds:.6f}",
         "-i",
         source_path,
+        "-ss",
+        f"{source_start_seconds + segment.start_seconds:.6f}",
         "-map",
         "0:v:0",
         "-frames:v",
         str(segment.frame_count),
         str(input_dir / "frame_%08d.png"),
     ]
-    _run(extract_command, log, cancel_path)
+    _run(extract_command, log, cancel_path, pause_path)
     return len(list(input_dir.glob("frame_*.png")))
 
 
@@ -1130,6 +1175,8 @@ def _upscale_ncnn_segment(
     effective_tile: int,
     log: list[str],
     cancel_path: str | None,
+    pause_path: str | None,
+    progress_callback=None,
 ) -> int:
     extracted_frames = sorted(input_dir.glob("frame_*.png"))
     if not extracted_frames:
@@ -1153,8 +1200,18 @@ def _upscale_ncnn_segment(
         realesrgan_command.extend(["-g", str(gpu_id)])
     if effective_tile >= 0:
         realesrgan_command.extend(["-t", str(effective_tile)])
-    _run_realesrgan_batch(realesrgan_command, log, cancel_path)
-    return len(extracted_frames)
+    output_count = _run_command_with_output_frame_progress(
+        command=realesrgan_command,
+        output_dir=output_dir,
+        target_frame_count=len(extracted_frames),
+        log=log,
+        cancel_path=cancel_path,
+        pause_path=pause_path,
+        progress_callback=progress_callback,
+    )
+    if output_count <= 0:
+        raise RuntimeError("NCNN upscaling completed without producing output frames")
+    return output_count
 
 
 def _upscale_pytorch_segment(
@@ -1164,6 +1221,7 @@ def _upscale_pytorch_segment(
     output_dir: Path,
     effective_tile: int,
     cancel_path: str | None,
+    pause_path: str | None,
     progress_callback=None,
 ) -> int:
     from upscaler_worker.models.pytorch_sr import upscale_frames
@@ -1178,6 +1236,7 @@ def _upscale_pytorch_segment(
     batch_count = max(1, math.ceil(len(extracted_frames) / batch_size))
     for batch_index, batch_start in enumerate(range(0, len(extracted_frames), batch_size), start=1):
         ensure_not_cancelled(cancel_path)
+        wait_if_paused(pause_path, cancel_path=cancel_path)
         frame_batch = extracted_frames[batch_start:batch_start + batch_size]
         output_batch = [output_dir / frame.name for frame in frame_batch]
         processed_frames += upscale_frames(
@@ -1191,6 +1250,48 @@ def _upscale_pytorch_segment(
     return processed_frames
 
 
+def _upscale_external_video_segment(
+    *,
+    input_dir: Path,
+    output_dir: Path,
+    model_id: str,
+    effective_tile: int,
+    gpu_id: int | None,
+    precision_mode: str,
+    log: list[str],
+    cancel_path: str | None,
+    pause_path: str | None,
+    progress_callback=None,
+) -> tuple[int, dict[str, object]]:
+    command_info = build_external_video_sr_command(
+        model_id=model_id,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        tile_size=effective_tile,
+        gpu_id=gpu_id,
+        precision=precision_mode,
+    )
+    log.append(f"Using external video SR runner via {command_info.command_env_var}")
+    _run_command_with_output_frame_progress(
+        command=command_info.command,
+        output_dir=output_dir,
+        target_frame_count=len(sorted(input_dir.glob("frame_*.png"))),
+        log=log,
+        cancel_path=cancel_path,
+        pause_path=pause_path,
+        progress_callback=progress_callback,
+        env=command_info.environment,
+    )
+    output_count = validate_external_video_sr_outputs(input_dir=input_dir, output_dir=output_dir)
+    return output_count, {
+        "runner": "external-command",
+        "commandEnvVar": command_info.command_env_var,
+        "launchCommand": command_info.command,
+        "gpuId": gpu_id,
+        "precision": precision_mode,
+    }
+
+
 def _run_streaming_pytorch_pipeline(
     *,
     ffmpeg: str,
@@ -1200,6 +1301,7 @@ def _run_streaming_pytorch_pipeline(
     fps: str,
     total_frames: int,
     effective_duration: float,
+    source_start_seconds: float,
     silent_video: Path,
     codec: str,
     crf: int,
@@ -1210,6 +1312,7 @@ def _run_streaming_pytorch_pipeline(
     log: list[str],
     progress_path: str | None,
     cancel_path: str | None,
+    pause_path: str | None,
     progress_state: PipelineProgressState,
     telemetry_state: PipelineTelemetryState,
 ) -> int:
@@ -1226,6 +1329,8 @@ def _run_streaming_pytorch_pipeline(
         "error",
         "-i",
         source_path,
+        *( ["-ss", f"{source_start_seconds:.6f}"] if source_start_seconds > 0 else [] ),
+        *( ["-t", f"{effective_duration:.6f}"] if effective_duration > 0 else [] ),
         "-map",
         "0:v:0",
         "-frames:v",
@@ -1236,8 +1341,6 @@ def _run_streaming_pytorch_pipeline(
         "rgb24",
         "pipe:1",
     ]
-    if effective_duration > 0:
-        decode_command[6:6] = ["-t", f"{effective_duration:.6f}"]
 
     encode_command = [
         ffmpeg,
@@ -1329,6 +1432,12 @@ def _run_streaming_pytorch_pipeline(
         try:
             batch_index = 0
             while counters["decoded_frames"] < total_frames and not stop_event.is_set():
+                wait_if_paused(
+                    pause_path,
+                    cancel_path=cancel_path,
+                    on_pause=lambda: _publish_progress("paused", f"Paused: streaming decode {counters['decoded_frames']}/{total_frames} frames"),
+                    on_resume=lambda: _publish_progress("extracting", f"Resumed: streaming decode {counters['decoded_frames']}/{total_frames} frames"),
+                )
                 ensure_not_cancelled(cancel_path)
                 batch_arrays: list[np.ndarray] = []
                 batch_extract_started_at = time.time()
@@ -1386,6 +1495,12 @@ def _run_streaming_pytorch_pipeline(
                 if not isinstance(item, StreamingFrameBatch):
                     continue
 
+                wait_if_paused(
+                    pause_path,
+                    cancel_path=cancel_path,
+                    on_pause=lambda: _publish_progress("paused", f"Paused: streaming upscale {progress_state.upscaled_frames}/{total_frames} frames"),
+                    on_resume=lambda: _publish_progress("upscaling", f"Resumed: streaming upscale {progress_state.upscaled_frames}/{total_frames} frames"),
+                )
                 ensure_not_cancelled(cancel_path)
                 batch_upscale_started_at = time.time()
                 pixel_batch = upscale_arrays(
@@ -1425,6 +1540,12 @@ def _run_streaming_pytorch_pipeline(
                 if not isinstance(item, StreamingPixelBatch):
                     continue
 
+                wait_if_paused(
+                    pause_path,
+                    cancel_path=cancel_path,
+                    on_pause=lambda: _publish_progress("paused", f"Paused: streaming encode {progress_state.encoded_frames}/{total_frames} frames"),
+                    on_resume=lambda: _publish_progress("encoding", f"Resumed: streaming encode {progress_state.encoded_frames}/{total_frames} frames"),
+                )
                 ensure_not_cancelled(cancel_path)
                 batch_encode_started_at = time.time()
                 if encode_process.stdin is None:
@@ -1520,6 +1641,7 @@ def _encode_segment_video(
     log: list[str],
     progress_path: str | None,
     cancel_path: str | None,
+    pause_path: str | None,
     total_frames: int,
     extracted_frames: int,
     upscaled_frames: int,
@@ -1582,6 +1704,7 @@ def _encode_segment_video(
         log,
         progress_path,
         cancel_path,
+        pause_path,
         phase="encoding",
         percent_base=80,
         percent_span=15,
@@ -1606,6 +1729,7 @@ def _concat_segment_videos(
     output_file: Path,
     progress_path: str | None,
     cancel_path: str | None,
+    pause_path: str | None,
     total_frames: int,
     extracted_frames: int,
     upscaled_frames: int,
@@ -1637,6 +1761,7 @@ def _concat_segment_videos(
         log,
         progress_path,
         cancel_path,
+        pause_path,
         phase="remuxing",
         percent_base=95,
         percent_span=2,
@@ -1869,6 +1994,29 @@ def _upscale_frames(
             pytorch_runner="torch",
             preloaded_pytorch_model=preloaded_pytorch_model,
         )
+    if backend_id == "pytorch-video-sr":
+        output_count, _ = _upscale_external_video_segment(
+            input_dir=input_frames,
+            output_dir=output_frames,
+            model_id=model_id,
+            effective_tile=effective_tile,
+            gpu_id=gpu_id,
+            precision_mode="fp16" if fp16 else "bf16" if bf16 else "fp32",
+            log=log,
+            cancel_path=None,
+            pause_path=None,
+        )
+        _write_progress(
+            progress_path,
+            phase="upscaling",
+            percent=15 if total_frames <= 0 else min(85, 15 + int((output_count / max(total_frames, 1)) * 70)),
+            message=f"Upscaling frames with external video SR ({output_count}/{total_frames})",
+            processed_frames=output_count,
+            total_frames=total_frames,
+            extracted_frames=total_frames,
+            upscaled_frames=output_count,
+        )
+        return output_count
 
     raise RuntimeError(f"Backend '{backend_id}' is cataloged but not runnable in the current app build")
 
@@ -1915,11 +2063,165 @@ def _effective_tile_size(model_id: str, preset: str, tile_size: int) -> int:
         if preset == "qualityBalanced":
             return 384
         return 256
+    if backend_id == "pytorch-video-sr":
+        if preset == "qualityMax":
+            return 256
+        if preset == "qualityBalanced":
+            return 192
+        return 128
     if preset == "qualityMax":
         return 0
     if preset == "qualityBalanced":
         return 256
     return 128
+
+
+def _has_explicit_precision_request(*, fp16: bool, bf16: bool, precision: str | None) -> bool:
+    return bool(fp16 or bf16 or (precision is not None and precision.strip()))
+
+
+def _default_precision_mode_for_backend(model_id: str, preset: str) -> tuple[str, str]:
+    backend_id = model_backend_id(model_id)
+    if backend_id in {"pytorch-image-sr", "pytorch-video-sr"}:
+        if preset == "qualityMax":
+            return "fp32", "preset-default"
+        if preset == "qualityBalanced":
+            return "bf16", "preset-default"
+        return "fp16", "preset-default"
+    return "fp32", "backend-fixed"
+
+
+def _resolve_quality_policy(
+    model_id: str,
+    preset: str,
+    tile_size: int,
+    *,
+    fp16: bool,
+    bf16: bool,
+    precision: str | None,
+) -> dict[str, object]:
+    explicit_precision = _has_explicit_precision_request(fp16=fp16, bf16=bf16, precision=precision)
+    requested_precision_mode = resolve_precision_mode(fp16=fp16, bf16=bf16, precision=precision)
+    if explicit_precision:
+        selected_precision_mode = requested_precision_mode
+        precision_source = "explicit-request"
+    else:
+        selected_precision_mode, precision_source = _default_precision_mode_for_backend(model_id, preset)
+    return {
+        "backendId": model_backend_id(model_id),
+        "qualityPreset": preset,
+        "requestedTileSize": int(tile_size),
+        "effectiveTileSize": int(_effective_tile_size(model_id, preset, tile_size)),
+        "requestedPrecision": requested_precision_mode if explicit_precision else None,
+        "selectedPrecision": selected_precision_mode,
+        "precisionSource": precision_source,
+    }
+
+
+def _resolve_preview_start_offset_seconds(
+    requested_offset_seconds: float | None,
+    *,
+    source_duration_seconds: float,
+    frame_rate: float,
+) -> tuple[float, int]:
+    if requested_offset_seconds is None or requested_offset_seconds <= 0 or frame_rate <= 0 or source_duration_seconds <= 0:
+        return 0.0, 0
+
+    total_source_frames = max(1, int(round(frame_rate * source_duration_seconds)))
+    clamped_offset = max(0.0, min(float(requested_offset_seconds), source_duration_seconds))
+    start_frame_index = min(total_source_frames - 1, max(0, int(math.ceil((clamped_offset * frame_rate) - 1e-9))))
+    return start_frame_index / frame_rate, start_frame_index
+
+
+def _resolve_preview_window(
+    *,
+    preview_mode: bool,
+    preview_duration_seconds: float | None,
+    preview_start_offset_seconds: float | None,
+    source_duration_seconds: float,
+    frame_rate: float,
+) -> tuple[float, float, int]:
+    if frame_rate <= 0 or source_duration_seconds <= 0:
+        return 0.0, 0.0, 1
+
+    if not preview_mode:
+        total_frames = max(1, int(round(frame_rate * source_duration_seconds)))
+        return 0.0, source_duration_seconds, total_frames
+
+    start_offset_seconds, start_frame_index = _resolve_preview_start_offset_seconds(
+        preview_start_offset_seconds,
+        source_duration_seconds=source_duration_seconds,
+        frame_rate=frame_rate,
+    )
+    total_source_frames = max(1, int(round(frame_rate * source_duration_seconds)))
+    available_frames = max(1, total_source_frames - start_frame_index)
+    requested_preview_duration = preview_duration_seconds if preview_duration_seconds and preview_duration_seconds > 0 else 8.0
+    requested_frames = max(1, int(round(frame_rate * requested_preview_duration)))
+    total_frames = min(available_frames, requested_frames)
+    effective_duration = total_frames / frame_rate
+    return start_offset_seconds, effective_duration, total_frames
+
+
+def _build_pipeline_media_summary(
+    *,
+    width: int,
+    height: int,
+    frame_rate: float,
+    duration_seconds: float,
+    frame_count: int,
+    has_audio: bool | None = None,
+    container: str | None = None,
+    video_codec: str | None = None,
+) -> dict[str, object]:
+    pixel_count = max(0, int(width) * int(height))
+    aspect_ratio = (float(width) / float(height)) if height else 0.0
+    return {
+        "width": int(width),
+        "height": int(height),
+        "frameRate": float(frame_rate),
+        "durationSeconds": float(duration_seconds),
+        "frameCount": int(frame_count),
+        "aspectRatio": aspect_ratio,
+        "pixelCount": pixel_count,
+        "hasAudio": has_audio,
+        "container": container,
+        "videoCodec": video_codec,
+    }
+
+
+def _build_pipeline_effective_settings(
+    *,
+    backend_id: str,
+    quality_preset: str,
+    requested_tile_size: int,
+    effective_tile_size: int,
+    requested_precision: str | None,
+    selected_precision: str,
+    effective_precision: str,
+    precision_source: str,
+    processed_duration_seconds: float,
+    preview_start_offset_seconds: float | None,
+    segment_frame_limit: int,
+    preview_mode: bool,
+    preview_duration_seconds: float | None,
+    segment_duration_seconds: float | None,
+) -> dict[str, object]:
+    return {
+        "backendId": backend_id,
+        "qualityPreset": quality_preset,
+        "requestedTileSize": int(requested_tile_size),
+        "effectiveTileSize": int(effective_tile_size),
+        "requestedPrecision": requested_precision,
+        "selectedPrecision": selected_precision,
+        "effectivePrecision": effective_precision,
+        "precisionSource": precision_source,
+        "processedDurationSeconds": float(processed_duration_seconds),
+        "previewStartOffsetSeconds": preview_start_offset_seconds,
+        "segmentFrameLimit": int(segment_frame_limit),
+        "previewMode": bool(preview_mode),
+        "previewDurationSeconds": preview_duration_seconds,
+        "segmentDurationSeconds": segment_duration_seconds,
+    }
 
 
 def run_realesrgan_pipeline(
@@ -1941,10 +2243,13 @@ def run_realesrgan_pipeline(
     crop_top: float | None,
     crop_width: float | None,
     crop_height: float | None,
+    job_id: str | None = None,
     progress_path: str | None,
     cancel_path: str | None,
+    pause_path: str | None = None,
     preview_mode: bool,
     preview_duration_seconds: float | None,
+    preview_start_offset_seconds: float | None = None,
     segment_duration_seconds: float | None,
     output_path: str,
     codec: str,
@@ -1962,13 +2267,24 @@ def run_realesrgan_pipeline(
     channels_last: bool = False,
     preloaded_pytorch_model=None,
 ) -> dict[str, object]:
-    precision_mode = resolve_precision_mode(fp16=fp16, bf16=bf16, precision=precision)
-    fp16_enabled = precision_mode == "fp16"
-    bf16_enabled = precision_mode == "bf16"
-
     ensure_not_cancelled(cancel_path)
+    wait_if_paused(pause_path, cancel_path=cancel_path)
     ensure_runnable_model(model_id)
     backend_id = model_backend_id(model_id)
+    quality_policy = _resolve_quality_policy(
+        model_id,
+        preset,
+        tile_size,
+        fp16=fp16,
+        bf16=bf16,
+        precision=precision,
+    )
+    requested_precision_mode = quality_policy["requestedPrecision"]
+    selected_precision_mode = str(quality_policy["selectedPrecision"])
+    precision_source = str(quality_policy["precisionSource"])
+    effective_precision_mode = selected_precision_mode
+    fp16_enabled = selected_precision_mode == "fp16"
+    bf16_enabled = selected_precision_mode == "bf16"
     resolved_pytorch_execution_path = _resolve_pytorch_execution_path(model_id, pytorch_execution_path)
     runtime = ensure_runtime_assets()
     metadata = probe_video(source_path)
@@ -1982,7 +2298,7 @@ def run_realesrgan_pipeline(
     jobs_root = repo_root() / "artifacts" / "jobs"
     jobs_root.mkdir(parents=True, exist_ok=True)
 
-    cache_key = hashlib.sha256(
+    cache_key = job_id or hashlib.sha256(
         "|".join(
             [
                 source_path,
@@ -2006,7 +2322,7 @@ def run_realesrgan_pipeline(
                 codec,
                 container,
                 str(tile_size),
-                precision_mode,
+                selected_precision_mode,
                 str(segment_duration_seconds or 0),
                 str(crf),
                 resolved_pytorch_execution_path or "external-executable",
@@ -2039,17 +2355,21 @@ def run_realesrgan_pipeline(
         crf=crf,
         log=log,
     )
-    fps = f"{metadata['frameRate']:.6f}".rstrip("0").rstrip(".")
-    effective_duration = float(metadata["durationSeconds"])
-    if preview_mode:
-        requested_preview_duration = preview_duration_seconds if preview_duration_seconds and preview_duration_seconds > 0 else 8.0
-        effective_duration = min(effective_duration, requested_preview_duration)
-    total_frames = max(1, int(round(float(metadata["frameRate"]) * effective_duration)))
+    source_duration_seconds = float(metadata["durationSeconds"])
+    source_frame_rate = float(metadata["frameRate"])
+    fps = f"{source_frame_rate:.6f}".rstrip("0").rstrip(".")
+    preview_window_start_seconds, effective_duration, total_frames = _resolve_preview_window(
+        preview_mode=preview_mode,
+        preview_duration_seconds=preview_duration_seconds,
+        preview_start_offset_seconds=preview_start_offset_seconds,
+        source_duration_seconds=source_duration_seconds,
+        frame_rate=source_frame_rate,
+    )
     force_single_stream_segment = backend_id == "pytorch-image-sr" and resolved_pytorch_execution_path == PYTORCH_EXECUTION_PATH_STREAMING
-    segment_frame_limit = total_frames if preview_mode or force_single_stream_segment else _segment_frame_limit(float(metadata["frameRate"]), segment_duration_seconds)
+    segment_frame_limit = total_frames if preview_mode or force_single_stream_segment else _segment_frame_limit(source_frame_rate, segment_duration_seconds)
     segments = _plan_pipeline_segments(
         total_frames,
-        float(metadata["frameRate"]),
+        source_frame_rate,
         force_single_segment=preview_mode or force_single_stream_segment,
         segment_duration_seconds=segment_duration_seconds,
     )
@@ -2065,7 +2385,20 @@ def run_realesrgan_pipeline(
         target_height=target_height,
     )
 
-    effective_tile = _effective_tile_size(model_id, preset, tile_size)
+    effective_tile = int(quality_policy["effectiveTileSize"])
+    log.append(
+        f"Quality preset policy: {preset} -> tile {effective_tile} and precision {selected_precision_mode} ({precision_source})."
+    )
+    source_media = _build_pipeline_media_summary(
+        width=int(metadata["width"]),
+        height=int(metadata["height"]),
+        frame_rate=float(metadata["frameRate"]),
+        duration_seconds=float(metadata["durationSeconds"]),
+        frame_count=total_frames,
+        has_audio=bool(metadata["hasAudio"]),
+        container=str(metadata.get("container") or ""),
+        video_codec=str(metadata.get("videoCodec") or ""),
+    )
 
     filter_chain = _output_filter(
         output_mode,
@@ -2115,7 +2448,13 @@ def run_realesrgan_pipeline(
             )
 
         progress_state = PipelineProgressState()
-        telemetry_state = PipelineTelemetryState(started_at=time.time(), scratch_path=work_dir, output_path=output_file)
+        telemetry_state = PipelineTelemetryState(
+            started_at=time.time(),
+            source_path=source_path,
+            scratch_path=work_dir,
+            output_path=output_file,
+            job_id=cache_key,
+        )
         _write_progress(
             progress_path,
             phase="queued",
@@ -2160,6 +2499,8 @@ def run_realesrgan_pipeline(
 
         def _publish_progress(phase: str, message: str) -> None:
             with progress_lock:
+                if not _should_publish_stage_progress(phase, progress_state):
+                    return
                 _emit_pipeline_progress(
                     progress_path,
                     phase=phase,
@@ -2180,22 +2521,23 @@ def run_realesrgan_pipeline(
                     loaded_model = load_runtime_model(
                         model_id,
                         gpu_id,
-                        fp16_enabled,
+                        False,
                         effective_tile,
                         log,
                         preset=preset,
                         torch_compile_enabled=torch_compile_enabled,
                         torch_compile_mode=torch_compile_mode,
                         torch_compile_cudagraphs=torch_compile_cudagraphs,
-                        bf16=bf16_enabled,
-                        precision=precision_mode,
+                        bf16=False,
+                        precision=selected_precision_mode,
                         pytorch_runner=pytorch_runner,
                         channels_last_enabled=channels_last,
                     )
                     log.append(f"Loaded PyTorch model checkpoint: {loaded_model.checkpoint_path}")
+                    effective_precision_mode = loaded_model.precision_mode
                     model_runtime = {
                         "runner": loaded_model.runner,
-                        "precision": precision_mode,
+                        "precision": loaded_model.precision_mode,
                         "dtype": str(loaded_model.dtype).replace("torch.", ""),
                         "frameBatchSize": loaded_model.frame_batch_size,
                         "channelsLast": loaded_model.channels_last,
@@ -2243,9 +2585,11 @@ def run_realesrgan_pipeline(
                         ffmpeg=str(ffmpeg),
                         source_path=source_path,
                         segment=expanded_segment,
+                        source_start_seconds=preview_window_start_seconds,
                         input_dir=segment_input_dir,
                         log=log,
                         cancel_path=cancel_path,
+                        pause_path=pause_path,
                     )
                     if extracted_count != active_segment_plan.expanded_frame_count:
                         if (
@@ -2293,7 +2637,7 @@ def run_realesrgan_pipeline(
                         with progress_lock:
                             upscaled_before_segment = progress_state.upscaled_frames
 
-                        def report_upscale_batch(batch_index: int, batch_count: int, processed_in_segment: int, _total_in_segment: int) -> None:
+                        def report_upscale_progress(processed_in_segment: int, total_in_segment: int, batch_index: int | None = None, batch_count: int | None = None) -> None:
                             processed_without_overlap = max(0, processed_in_segment - active_segment_plan.overlap_before_frames)
                             unique_processed = min(active_segment_plan.source_frame_count, processed_without_overlap)
                             with progress_lock:
@@ -2307,10 +2651,14 @@ def run_realesrgan_pipeline(
                                     batch_index=batch_index,
                                     batch_count=batch_count,
                                 )
+                            batch_label = f" batch {batch_index}/{batch_count}" if batch_index is not None and batch_count is not None else ""
                             _publish_progress(
                                 "upscaling",
-                                f"Upscaling segment {active_segment_plan.index + 1}/{len(interpolation_segments)} batch {batch_index}/{batch_count} ({unique_processed}/{active_segment_plan.source_frame_count} frames)",
+                                f"Upscaling segment {active_segment_plan.index + 1}/{len(interpolation_segments)}{batch_label} ({unique_processed}/{active_segment_plan.source_frame_count} frames)",
                             )
+
+                        def report_upscale_batch(batch_index: int, batch_count: int, processed_in_segment: int, total_in_segment: int) -> None:
+                            report_upscale_progress(processed_in_segment, total_in_segment, batch_index, batch_count)
 
                         upscale_stage_started_at = time.time()
                         if backend_id == "realesrgan-ncnn":
@@ -2323,6 +2671,8 @@ def run_realesrgan_pipeline(
                                 effective_tile=effective_tile,
                                 log=log,
                                 cancel_path=cancel_path,
+                                pause_path=pause_path,
+                                progress_callback=report_upscale_progress,
                             )
                         elif backend_id == "pytorch-image-sr":
                             upscaled_count = _upscale_pytorch_segment(
@@ -2331,8 +2681,24 @@ def run_realesrgan_pipeline(
                                 output_dir=segment_upscaled_dir,
                                 effective_tile=effective_tile,
                                 cancel_path=cancel_path,
+                                pause_path=pause_path,
                                 progress_callback=report_upscale_batch,
                             )
+                        elif backend_id == "pytorch-video-sr":
+                            upscaled_count, external_runtime = _upscale_external_video_segment(
+                                input_dir=segment_input_dir,
+                                output_dir=segment_upscaled_dir,
+                                model_id=model_id,
+                                effective_tile=effective_tile,
+                                gpu_id=gpu_id,
+                                precision_mode=selected_precision_mode,
+                                log=log,
+                                cancel_path=cancel_path,
+                                pause_path=pause_path,
+                                progress_callback=report_upscale_progress,
+                            )
+                            model_runtime = external_runtime
+                            effective_precision_mode = str(external_runtime.get("precision", selected_precision_mode))
                         else:
                             raise RuntimeError(f"Backend '{backend_id}' is cataloged but not runnable in the current app build")
                         if upscaled_count != active_segment_plan.expanded_frame_count:
@@ -2495,6 +2861,7 @@ def run_realesrgan_pipeline(
                         log=log,
                         progress_path=progress_path,
                         cancel_path=cancel_path,
+                        pause_path=pause_path,
                         total_frames=total_output_frames,
                         extracted_frames=item.extracted_frames,
                         upscaled_frames=item.upscaled_frames,
@@ -2603,6 +2970,7 @@ def run_realesrgan_pipeline(
                 log,
                 progress_path,
                 cancel_path,
+                pause_path,
                 phase="remuxing",
                 percent_base=97,
                 percent_span=3,
@@ -2632,6 +3000,7 @@ def run_realesrgan_pipeline(
                 log,
                 progress_path,
                 cancel_path,
+                pause_path,
                 phase="remuxing",
                 percent_base=97,
                 percent_span=3,
@@ -2672,14 +3041,40 @@ def run_realesrgan_pipeline(
             progress_state.remuxed_frames or progress_state.encoded_frames or progress_state.interpolated_frames or total_output_frames,
         )
         average_throughput = resolved_frame_count / max(0.001, total_elapsed_seconds)
+        output_media = _build_pipeline_media_summary(
+            width=encode_width,
+            height=encode_height,
+            frame_rate=output_fps,
+            duration_seconds=effective_duration,
+            frame_count=resolved_frame_count,
+            has_audio=bool(metadata["hasAudio"]),
+            container=container,
+            video_codec=codec,
+        )
+        effective_settings = _build_pipeline_effective_settings(
+            backend_id=backend_id,
+            quality_preset=preset,
+            requested_tile_size=tile_size,
+            effective_tile_size=effective_tile,
+            requested_precision=requested_precision_mode,
+            selected_precision=selected_precision_mode,
+            effective_precision=effective_precision_mode,
+            precision_source=precision_source,
+            processed_duration_seconds=effective_duration,
+            preview_start_offset_seconds=preview_window_start_seconds if preview_mode else None,
+            segment_frame_limit=segment_frame_limit,
+            preview_mode=preview_mode,
+            preview_duration_seconds=preview_duration_seconds,
+            segment_duration_seconds=segment_duration_seconds,
+        )
         return {
             "outputPath": str(output_file),
             "workDir": str(work_dir),
             "executionPath": "rife-ncnn-vulkan",
             "videoEncoder": video_encoder_config.encoder,
             "videoEncoderLabel": video_encoder_config.label,
-            "runner": pytorch_runner or "torch",
-            "precision": precision_mode,
+            "runner": str(model_runtime.get("runner")) if isinstance(model_runtime, dict) and model_runtime.get("runner") else ("ncnn-vulkan" if backend_id == "realesrgan-ncnn" else pytorch_runner or "torch"),
+            "precision": effective_precision_mode,
             "torchCompileEnabled": torch_compile_enabled,
             "torchCompileMode": torch_compile_mode,
             "torchCompileCudagraphs": torch_compile_cudagraphs,
@@ -2687,6 +3082,9 @@ def run_realesrgan_pipeline(
             "hadAudio": bool(metadata["hasAudio"]),
             "codec": codec,
             "container": container,
+            "sourceMedia": source_media,
+            "outputMedia": output_media,
+            "effectiveSettings": effective_settings,
             "interpolationDiagnostics": {
                 "mode": interpolation_mode,
                 "sourceFps": source_fps,
@@ -2722,6 +3120,7 @@ def run_realesrgan_pipeline(
                 f"Resolved output fps: {encode_fps}",
                 f"Resolved output canvas: {encode_width}x{encode_height}",
                 f"Chunked interpolation segments: {len(interpolation_segments)} at up to {segment_frame_limit} source frames each with one-frame boundary overlap",
+                f"Preview start offset: {preview_window_start_seconds:.2f}s",
                 f"Processed duration: {effective_duration:.2f}s",
                 f"Average throughput: {average_throughput:.2f} fps",
                 f"Rolling throughput: {(telemetry_state.resources.rolling_frames_per_second or 0.0):.2f} fps",
@@ -2730,7 +3129,13 @@ def run_realesrgan_pipeline(
         }
 
     progress_state = PipelineProgressState()
-    telemetry_state = PipelineTelemetryState(started_at=time.time(), scratch_path=work_dir, output_path=output_file)
+    telemetry_state = PipelineTelemetryState(
+        started_at=time.time(),
+        source_path=source_path,
+        scratch_path=work_dir,
+        output_path=output_file,
+        job_id=cache_key,
+    )
     progress_lock = threading.Lock()
     _write_progress(
         progress_path,
@@ -2774,6 +3179,8 @@ def run_realesrgan_pipeline(
 
     def _publish_progress(phase: str, message: str) -> None:
         with progress_lock:
+            if not _should_publish_stage_progress(phase, progress_state):
+                return
             _emit_pipeline_progress(
                 progress_path,
                 phase=phase,
@@ -2806,9 +3213,11 @@ def run_realesrgan_pipeline(
                     ffmpeg=str(ffmpeg),
                     source_path=source_path,
                     segment=segment,
+                    source_start_seconds=preview_window_start_seconds,
                     input_dir=segment_input_dir,
                     log=log,
                     cancel_path=cancel_path,
+                    pause_path=pause_path,
                 )
                 with progress_lock:
                     _record_stage_duration(telemetry_state, "extract", time.time() - stage_started_at)
@@ -2843,22 +3252,23 @@ def run_realesrgan_pipeline(
                 loaded_model = load_runtime_model(
                     model_id,
                     gpu_id,
-                    fp16_enabled,
+                    False,
                     effective_tile,
                     log,
                     preset=preset,
                     torch_compile_enabled=torch_compile_enabled,
                     torch_compile_mode=torch_compile_mode,
                     torch_compile_cudagraphs=torch_compile_cudagraphs,
-                    bf16=bf16_enabled,
-                    precision=precision_mode,
+                    bf16=False,
+                    precision=selected_precision_mode,
                     pytorch_runner=pytorch_runner,
                     channels_last_enabled=channels_last,
                 )
                 log.append(f"Loaded PyTorch model checkpoint: {loaded_model.checkpoint_path}")
+                effective_precision_mode = loaded_model.precision_mode
                 model_runtime = {
                     "runner": loaded_model.runner,
-                    "precision": precision_mode,
+                    "precision": loaded_model.precision_mode,
                     "dtype": str(loaded_model.dtype).replace("torch.", ""),
                     "frameBatchSize": loaded_model.frame_batch_size,
                     "channelsLast": loaded_model.channels_last,
@@ -2867,6 +3277,12 @@ def run_realesrgan_pipeline(
                     "torchCompileMode": loaded_model.torch_compile_mode,
                     "torchCompileCudagraphs": loaded_model.torch_compile_cudagraphs,
                 }
+            elif backend_id == "pytorch-video-sr":
+                model_runtime = {
+                    "runner": "external-command",
+                    "precision": selected_precision_mode,
+                }
+                effective_precision_mode = selected_precision_mode
 
             while True:
                 item = _queue_get(extract_queue)
@@ -2896,27 +3312,7 @@ def run_realesrgan_pipeline(
                 )
 
                 if backend_id == "realesrgan-ncnn":
-                    upscaled_count = _upscale_ncnn_segment(
-                        runtime=runtime,
-                        input_dir=segment_input_dir,
-                        output_dir=segment_output_dir,
-                        model_id=model_id,
-                        gpu_id=gpu_id,
-                        effective_tile=effective_tile,
-                        log=log,
-                        cancel_path=cancel_path,
-                    )
-                    with progress_lock:
-                        progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + upscaled_count)
-                        _set_segment_progress(
-                            telemetry_state,
-                            segment_index=segment.index + 1,
-                            segment_count=len(segments),
-                            segment_processed_frames=upscaled_count,
-                            segment_total_frames=segment.frame_count,
-                        )
-                elif backend_id == "pytorch-image-sr":
-                    def report_upscale_batch(batch_index: int, batch_count: int, processed_in_segment: int, total_in_segment: int) -> None:
+                    def report_upscale_progress(processed_in_segment: int, total_in_segment: int, batch_index: int | None = None, batch_count: int | None = None) -> None:
                         with progress_lock:
                             progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + processed_in_segment)
                             _set_segment_progress(
@@ -2928,10 +3324,54 @@ def run_realesrgan_pipeline(
                                 batch_index=batch_index,
                                 batch_count=batch_count,
                             )
+                        batch_label = f" batch {batch_index}/{batch_count}" if batch_index is not None and batch_count is not None else ""
                         _publish_progress(
                             "upscaling",
-                            f"Upscaling segment {segment.index + 1}/{len(segments)} batch {batch_index}/{batch_count} ({processed_in_segment}/{total_in_segment} frames)",
+                            f"Upscaling segment {segment.index + 1}/{len(segments)}{batch_label} ({processed_in_segment}/{total_in_segment} frames)",
                         )
+
+                    upscaled_count = _upscale_ncnn_segment(
+                        runtime=runtime,
+                        input_dir=segment_input_dir,
+                        output_dir=segment_output_dir,
+                        model_id=model_id,
+                        gpu_id=gpu_id,
+                        effective_tile=effective_tile,
+                        log=log,
+                        cancel_path=cancel_path,
+                        pause_path=pause_path,
+                        progress_callback=report_upscale_progress,
+                    )
+                    with progress_lock:
+                        progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + upscaled_count)
+                        _set_segment_progress(
+                            telemetry_state,
+                            segment_index=segment.index + 1,
+                            segment_count=len(segments),
+                            segment_processed_frames=upscaled_count,
+                            segment_total_frames=segment.frame_count,
+                        )
+                elif backend_id == "pytorch-image-sr":
+                    def report_upscale_progress(processed_in_segment: int, total_in_segment: int, batch_index: int | None = None, batch_count: int | None = None) -> None:
+                        with progress_lock:
+                            progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + processed_in_segment)
+                            _set_segment_progress(
+                                telemetry_state,
+                                segment_index=segment.index + 1,
+                                segment_count=len(segments),
+                                segment_processed_frames=processed_in_segment,
+                                segment_total_frames=total_in_segment,
+                                batch_index=batch_index,
+                                batch_count=batch_count,
+                            )
+                        batch_label = f" batch {batch_index}/{batch_count}" if batch_index is not None and batch_count is not None else ""
+                        _publish_progress(
+                            "upscaling",
+                            f"Upscaling segment {segment.index + 1}/{len(segments)}{batch_label} ({processed_in_segment}/{total_in_segment} frames)",
+                        )
+
+                    def report_upscale_batch(batch_index: int, batch_count: int, processed_in_segment: int, total_in_segment: int) -> None:
+                        report_upscale_progress(processed_in_segment, total_in_segment, batch_index, batch_count)
 
                     upscaled_count = _upscale_pytorch_segment(
                         loaded_model=loaded_model,
@@ -2939,8 +3379,42 @@ def run_realesrgan_pipeline(
                         output_dir=segment_output_dir,
                         effective_tile=effective_tile,
                         cancel_path=cancel_path,
+                        pause_path=pause_path,
                         progress_callback=report_upscale_batch,
                     )
+                elif backend_id == "pytorch-video-sr":
+                    def report_upscale_progress(processed_in_segment: int, total_in_segment: int, batch_index: int | None = None, batch_count: int | None = None) -> None:
+                        with progress_lock:
+                            progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + processed_in_segment)
+                            _set_segment_progress(
+                                telemetry_state,
+                                segment_index=segment.index + 1,
+                                segment_count=len(segments),
+                                segment_processed_frames=processed_in_segment,
+                                segment_total_frames=total_in_segment,
+                                batch_index=batch_index,
+                                batch_count=batch_count,
+                            )
+                        batch_label = f" batch {batch_index}/{batch_count}" if batch_index is not None and batch_count is not None else ""
+                        _publish_progress(
+                            "upscaling",
+                            f"Upscaling segment {segment.index + 1}/{len(segments)}{batch_label} ({processed_in_segment}/{total_in_segment} frames)",
+                        )
+
+                    upscaled_count, external_runtime = _upscale_external_video_segment(
+                        input_dir=segment_input_dir,
+                        output_dir=segment_output_dir,
+                        model_id=model_id,
+                        effective_tile=effective_tile,
+                        gpu_id=gpu_id,
+                        precision_mode=selected_precision_mode,
+                        log=log,
+                        cancel_path=cancel_path,
+                        pause_path=pause_path,
+                        progress_callback=report_upscale_progress,
+                    )
+                    model_runtime = external_runtime
+                    effective_precision_mode = str(external_runtime.get("precision", selected_precision_mode))
                 else:
                     raise RuntimeError(f"Backend '{backend_id}' is cataloged but not runnable in the current app build")
 
@@ -3013,6 +3487,7 @@ def run_realesrgan_pipeline(
                     log=log,
                     progress_path=progress_path,
                     cancel_path=cancel_path,
+                        pause_path=pause_path,
                     total_frames=total_frames,
                     extracted_frames=progress_state.extracted_frames,
                     upscaled_frames=progress_state.upscaled_frames,
@@ -3050,22 +3525,23 @@ def run_realesrgan_pipeline(
             loaded_model = load_runtime_model(
                 model_id,
                 gpu_id,
-                fp16_enabled,
+                False,
                 effective_tile,
                 log,
                 preset=preset,
                 torch_compile_enabled=torch_compile_enabled,
                 torch_compile_mode=torch_compile_mode,
                 torch_compile_cudagraphs=torch_compile_cudagraphs,
-                bf16=bf16_enabled,
-                precision=precision_mode,
+                bf16=False,
+                precision=selected_precision_mode,
                 pytorch_runner=pytorch_runner,
                 channels_last_enabled=channels_last,
             )
             log.append(f"Loaded PyTorch model checkpoint: {loaded_model.checkpoint_path}")
+        effective_precision_mode = loaded_model.precision_mode
         model_runtime = {
             "runner": loaded_model.runner,
-            "precision": precision_mode,
+            "precision": loaded_model.precision_mode,
             "dtype": str(loaded_model.dtype).replace("torch.", ""),
             "frameBatchSize": loaded_model.frame_batch_size,
             "channelsLast": loaded_model.channels_last,
@@ -3090,6 +3566,7 @@ def run_realesrgan_pipeline(
             fps=fps,
             total_frames=total_frames,
             effective_duration=effective_duration,
+            source_start_seconds=preview_window_start_seconds,
             silent_video=silent_video,
             codec=codec,
             crf=crf,
@@ -3100,6 +3577,7 @@ def run_realesrgan_pipeline(
             log=log,
             progress_path=progress_path,
             cancel_path=cancel_path,
+            pause_path=pause_path,
             progress_state=progress_state,
             telemetry_state=telemetry_state,
         )
@@ -3137,6 +3615,7 @@ def run_realesrgan_pipeline(
             output_file=silent_video,
             progress_path=progress_path,
             cancel_path=cancel_path,
+            pause_path=pause_path,
             total_frames=total_frames,
             extracted_frames=progress_state.extracted_frames,
             upscaled_frames=progress_state.upscaled_frames,
@@ -3157,6 +3636,8 @@ def run_realesrgan_pipeline(
                 "-y",
                 "-i",
                 str(silent_video),
+            *( ["-ss", f"{preview_window_start_seconds:.6f}"] if preview_mode and preview_window_start_seconds > 0 else [] ),
+            *( ["-ss", f"{preview_window_start_seconds:.6f}"] if preview_mode and preview_window_start_seconds > 0 else [] ),
                 "-i",
                 source_path,
                 *( ["-t", f"{effective_duration:.3f}"] if preview_mode else [] ),
@@ -3185,6 +3666,7 @@ def run_realesrgan_pipeline(
             log,
             progress_path,
             cancel_path,
+            pause_path,
             phase="remuxing",
             percent_base=97,
             percent_span=3,
@@ -3215,6 +3697,7 @@ def run_realesrgan_pipeline(
             log,
             progress_path,
             cancel_path,
+            pause_path,
             phase="remuxing",
             percent_base=97,
             percent_span=3,
@@ -3254,15 +3737,41 @@ def run_realesrgan_pipeline(
     total_elapsed_seconds = max(0.0, time.time() - telemetry_state.started_at)
     resolved_frame_count = max(1, progress_state.remuxed_frames or progress_state.encoded_frames or total_frames)
     average_throughput = resolved_frame_count / max(0.001, total_elapsed_seconds)
+    output_media = _build_pipeline_media_summary(
+        width=resolved_width,
+        height=resolved_height,
+        frame_rate=float(metadata["frameRate"]),
+        duration_seconds=effective_duration,
+        frame_count=resolved_frame_count,
+        has_audio=bool(metadata["hasAudio"]),
+        container=container,
+        video_codec=codec,
+    )
+    effective_settings = _build_pipeline_effective_settings(
+        backend_id=backend_id,
+        quality_preset=preset,
+        requested_tile_size=tile_size,
+        effective_tile_size=effective_tile,
+        requested_precision=requested_precision_mode,
+        selected_precision=selected_precision_mode,
+        effective_precision=effective_precision_mode,
+        precision_source=precision_source,
+        processed_duration_seconds=effective_duration,
+        preview_start_offset_seconds=preview_window_start_seconds if preview_mode else None,
+        segment_frame_limit=segment_frame_limit,
+        preview_mode=preview_mode,
+        preview_duration_seconds=preview_duration_seconds,
+        segment_duration_seconds=segment_duration_seconds,
+    )
 
     return {
         "outputPath": str(output_file),
         "workDir": str(work_dir),
-        "executionPath": resolved_pytorch_execution_path or "external-executable",
+        "executionPath": resolved_pytorch_execution_path or ("realesrgan-ncnn-vulkan" if backend_id == "realesrgan-ncnn" else "external-command"),
         "videoEncoder": video_encoder_config.encoder,
         "videoEncoderLabel": video_encoder_config.label,
-        "runner": pytorch_runner or "torch",
-        "precision": precision_mode,
+        "runner": str(model_runtime.get("runner")) if isinstance(model_runtime, dict) and model_runtime.get("runner") else ("ncnn-vulkan" if backend_id == "realesrgan-ncnn" else pytorch_runner or "torch"),
+        "precision": effective_precision_mode,
         "torchCompileEnabled": torch_compile_enabled,
         "torchCompileMode": torch_compile_mode,
         "torchCompileCudagraphs": torch_compile_cudagraphs,
@@ -3270,6 +3779,9 @@ def run_realesrgan_pipeline(
         "hadAudio": bool(metadata["hasAudio"]),
         "codec": codec,
         "container": container,
+        "sourceMedia": source_media,
+        "outputMedia": output_media,
+        "effectiveSettings": effective_settings,
         "runtime": runtime,
         "stageTimings": {
             "extractSeconds": telemetry_state.extract_stage_seconds,
@@ -3291,12 +3803,14 @@ def run_realesrgan_pipeline(
         "segmentFrameLimit": segment_frame_limit,
         "log": log + [
             f"Model: {model_name} ({model_id})",
-            f"Execution path: {resolved_pytorch_execution_path or 'external-executable'}",
-            f"Runner: {pytorch_runner or 'torch'}",
-            f"Precision: {precision_mode}",
+            f"Execution path: {resolved_pytorch_execution_path or ('realesrgan-ncnn-vulkan' if backend_id == 'realesrgan-ncnn' else 'external-command')}",
+            f"Runner: {str(model_runtime.get('runner')) if isinstance(model_runtime, dict) and model_runtime.get('runner') else ('ncnn-vulkan' if backend_id == 'realesrgan-ncnn' else pytorch_runner or 'torch')}",
+            f"Precision: {effective_precision_mode}",
+            f"Quality policy: tile {effective_tile}, precision {effective_precision_mode} ({precision_source})",
             f"Resolved output canvas: {resolved_width}x{resolved_height} ({resolved_aspect_ratio:.4f}:1)",
             f"Chunked pipeline segments: {len(segments)} at up to {segment_frame_limit} frames each",
             f"Preview mode: {'on' if preview_mode else 'off'}",
+            f"Preview start offset: {preview_window_start_seconds:.2f}s",
             f"Segment duration target: {'single preview segment' if preview_mode else f'{segment_duration_seconds or PIPELINE_SEGMENT_TARGET_SECONDS:.2f}s'}",
             f"Processed duration: {effective_duration:.2f}s",
             f"Average throughput: {average_throughput:.2f} fps",
