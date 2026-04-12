@@ -47,9 +47,12 @@ async function main() {
   const browser = await chromium.connectOverCDP('http://127.0.0.1:9223', { timeout: cdpConnectTimeoutMs });
   try {
     const context = browser.contexts()[0];
-    const existingJobsPages = context?.pages().filter((candidate) => candidate.url().includes('view=jobs')) ?? [];
-    for (const jobsPage of existingJobsPages) {
-      await jobsPage.close().catch(() => {});
+    const detachedPages = context?.pages().filter((candidate) => {
+      const url = candidate.url();
+      return url.includes('view=jobs') || url.includes('view=comparison');
+    }) ?? [];
+    for (const detachedPage of detachedPages) {
+      await detachedPage.close().catch(() => {});
     }
 
     await expect.poll(
@@ -57,7 +60,7 @@ async function main() {
       { timeout: 10000 },
     ).toContainEqual(expect.stringContaining('localhost:1420'));
 
-    const page = context?.pages().find((candidate) => candidate.url().includes('localhost:1420') && !candidate.url().includes('view=jobs'));
+    const page = context?.pages().find((candidate) => candidate.url().includes('localhost:1420') && !candidate.url().includes('view='));
     if (!page) {
       throw new Error('Could not find the Upscaler desktop webview target');
     }
@@ -303,14 +306,29 @@ async function main() {
       await expect(jobsPage.getByTestId('job-cleanup-panel')).toBeVisible();
       await expect(jobsPage.getByTestId('jobs-window-close')).toHaveCount(0);
       await expect(jobsPage.getByTestId('top-status-panel')).toHaveCount(0);
-      const tableMetrics = await jobsPage.getByTestId('cleanup-jobs-table-shell').evaluate((element) => ({
-        clientWidth: element.clientWidth,
-        scrollWidth: element.scrollWidth,
-      }));
+      const cleanupTableShell = jobsPage.getByTestId('cleanup-jobs-table-shell');
+      const cleanupEmptyState = jobsPage.getByText('No tracked or historical managed jobs found yet.', { exact: true });
+      await expect.poll(async () => {
+        if (await cleanupTableShell.count()) {
+          return 'table';
+        }
+        if (await cleanupEmptyState.count()) {
+          return 'empty';
+        }
+        return null;
+      }, {
+        timeout: 30000,
+      }).not.toBeNull();
       jobsWindowSummary = {
         url: jobsPage.url(),
-        tableMetrics,
+        state: await cleanupTableShell.count() ? 'table' : 'empty',
       };
+      if (jobsWindowSummary.state === 'table') {
+        jobsWindowSummary.tableMetrics = await cleanupTableShell.evaluate((element) => ({
+          clientWidth: element.clientWidth,
+          scrollWidth: element.scrollWidth,
+        }));
+      }
       await page.bringToFront();
     }
 
