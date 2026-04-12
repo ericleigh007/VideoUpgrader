@@ -95,7 +95,13 @@ Run the desktop smoke test:
 ./scripts/desktop-test.ps1
 ```
 
-This launches the Tauri app with WebView remote debugging enabled and verifies the desktop workflow in both `afterUpscale` and `interpolateOnly` modes.
+This launches the Tauri app with WebView remote debugging enabled and runs the aggregate desktop smoke flow, including playback, Jobs-window recovery, detached blind comparison, and both `afterUpscale` and `interpolateOnly` playback coverage.
+
+Current note:
+
+- The component desktop smokes are the most reliable source of truth during investigation.
+- In recent clean-clone validation, the direct sub-smokes passed end to end, while `scripts/desktop-test.ps1` could still linger under some terminal runners after those sub-smokes completed successfully.
+- Treat that as wrapper orchestration drift until proven otherwise.
 
 ## Current Product State
 
@@ -125,7 +131,10 @@ VideoUpgrader is no longer just a scaffold. The current repository includes:
 - `scripts/test.ps1`: frontend tests plus Python `unittest` discovery
 - `scripts/build.ps1`: optional tests, frontend build, and Cargo build
 - `scripts/run.ps1`: Tauri desktop launch with bootstrap fallback when `torch` is missing
-- `scripts/desktop-test.ps1`: automated desktop smoke test through WebView remote debugging
+- `scripts/desktop-test.ps1`: aggregate desktop smoke wrapper through WebView remote debugging
+- `scripts/desktop_webview_playback_smoke.mjs`: direct desktop playback smoke for `afterUpscale` and `interpolateOnly`
+- `scripts/desktop_jobs_window_recovery_smoke.mjs`: direct Jobs workspace recovery smoke
+- `scripts/desktop_blind_comparison_smoke.mjs`: direct detached blind comparison smoke
 - `scripts/generate-benchmarks.ps1`: synthetic benchmark fixture generation
 - `scripts/stop.ps1`: stop active dev and repo worker processes
 

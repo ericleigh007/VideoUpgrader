@@ -84,6 +84,8 @@ The first deliverable must support:
 ### Comparison And Analysis
 
 - The app must support side-by-side comparison of model outputs.
+- The app must support blind comparison of multiple generated samples from the same captured source interval.
+- The app must support a detached comparison workspace that keeps the source reference and generated samples time-aligned.
 - The app must support zoomed pixel inspection.
 - The app must support visual overlays such as absolute-difference heatmaps.
 - The app must calculate spatial metrics where reference data exists.
@@ -172,6 +174,7 @@ The first deliverable must support:
 - Automated GUI tests must verify the real desktop workflow for both upscaling and interpolation controls.
 - Automated GUI tests must verify pause, resume, and stop controls for active jobs.
 - Automated GUI tests must verify the distinction between `Resume`, `Restart`, and `Load Template` in the Jobs workspace.
+- Automated GUI tests must verify detached blind-comparison synchronization between the full-length source reference and generated sample previews.
 - Integration tests must include synthetic AV-sync fixtures that validate source-to-output sync across interpolation-only and post-upscale interpolation flows.
 - Unit tests must cover interpolation request validation, target-fps mapping, frame-count planning, and progress telemetry helpers.
 - Unit and integration tests must cover paused-state telemetry and the transition from running to paused to resumed to terminal job states.
