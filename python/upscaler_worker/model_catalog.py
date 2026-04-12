@@ -74,8 +74,19 @@ def model_runtime_asset(model_id: str) -> dict[str, object] | None:
     return dict(asset)
 
 
+def model_research_runtime(model_id: str) -> dict[str, object] | None:
+    runtime = get_model_definition(model_id).get("researchRuntime")
+    if not isinstance(runtime, dict):
+        return None
+    return dict(runtime)
+
+
 def model_special_handling(model_id: str) -> dict[str, object]:
     return dict(get_model_definition(model_id).get("specialHandling", {}))
+
+
+def model_support_tier(model_id: str) -> str:
+    return str(get_model_definition(model_id).get("supportTier", "next"))
 
 
 def visible_ui_models() -> list[dict[str, object]]:
@@ -103,3 +114,14 @@ def ensure_runnable_model(model_id: str) -> str:
     if model_execution_status(model_id) != "runnable":
         raise ValueError(f"Model '{model_id}' is cataloged but not yet runnable in the current app build")
     return model_id
+
+
+def ensure_benchmarkable_model(model_id: str) -> str:
+    ensure_supported_model(model_id)
+    if model_execution_status(model_id) == "runnable":
+        return model_id
+
+    if model_backend_id(model_id) == "pytorch-video-sr" and model_support_tier(model_id) == "research":
+        return model_id
+
+    raise ValueError(f"Model '{model_id}' is not benchmarkable in the current app build")

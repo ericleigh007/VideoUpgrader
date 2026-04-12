@@ -166,14 +166,18 @@
       "runtimeModelName": "rvrt-x4",
       "label": "RVRT x4",
       "summary": "Video-native recurrent transformer with temporal fusion, making it the first serious non-framewise target backend for real footage.",
-      "visibleInUi": false,
+      "visibleInUi": true,
       "comparisonEligible": false,
-      "executionStatus": "planned",
+      "executionStatus": "runnable",
       "supportTier": "research",
       "qualityRank": 6,
       "videoNative": true,
       "mediaSuitability": ["photo", "video"],
       "nativeScale": 4,
+      "researchRuntime": {
+        "kind": "external-command",
+        "commandEnvVar": "UPSCALER_RVRT_COMMAND"
+      },
       "specialHandling": {
         "cropMath": "scale-aware",
         "requiresVulkan": false,

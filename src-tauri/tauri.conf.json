@@ -10,6 +10,24 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$HOME/**",
+          "$DOCUMENT/**",
+          "$DESKTOP/**",
+          "$DOWNLOAD/**",
+          "$VIDEO/**",
+          "$PUBLIC/**",
+          "$APPDATA/**",
+          "$APPLOCALDATA/**",
+          "$TEMP/**"
+        ]
+      },
+      "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data: blob:; media-src 'self' asset: http://asset.localhost data: blob:",
+      "devCsp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420; img-src 'self' asset: http://asset.localhost data: blob:; media-src 'self' asset: http://asset.localhost data: blob:"
+    },
     "windows": [
       {
         "label": "main",
@@ -22,6 +40,12 @@
   },
   "bundle": {
     "active": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
     "targets": "all"
   }
 }

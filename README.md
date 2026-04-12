@@ -1,8 +1,19 @@
 # VideoUpgrader
 
+![VideoUpgrader icon](docs/images/video-upgrader-icon-512.png)
+
 VideoUpgrader is a Windows-first desktop app for evaluating video upscalers the way enthusiasts, researchers, and developers actually use them: by comparing outputs side by side, zooming into problem areas, checking framing behavior, boosting frame rate when needed, and then exporting a full processed video when a model and setting combination earns it.
 
 The project combines a Tauri desktop shell, a React comparison-first UI, and a Python worker that handles probing, synthetic benchmark generation, model execution, interpolation, encode, remux, and diagnostic benchmarking.
+
+## What's New
+
+Updated April 12, 2026.
+
+- The detached comparison window now keeps the Source reference and all blind-comparison players frame-synced in real desktop validation, so you can inspect the same logical frame instead of guessing whether offsets are coming from the tool.
+- The comparison Source pane now uses a valid full-length playable reference instead of falling back to a short browser clip, which removes the black-source and wrong-timestamp failures that made blind comparisons untrustworthy.
+- Comparison controls are now clearer during review: `Shift + wheel` resizes the comparison panes, `Ctrl + wheel` zooms the video content in sync across players, and drag pans the crop only after a real drag starts.
+- The comparison workflow was validated with deterministic AV-sync fixtures and the desktop smoke harness, which matters because it proves the separate comparison window is doing the same job in the native app that it appears to do in the browser tests.
 
 ## What VideoUpgrader Does
 
@@ -40,6 +51,28 @@ The app now supports three distinct video processing modes:
 
 Interpolation targets currently support 30 fps and 60 fps outputs through the Windows RIFE NCNN runtime.
 
+## Job Controls
+
+Active upscale and source-conversion jobs now support in-session pause, resume, and stop controls.
+
+- `Pause` must halt active processing without discarding the current live job record.
+- `Resume` must continue the same in-memory job when the desktop app is still running.
+- `Stop` must cancel the active job and keep its saved settings available for a later restart.
+- `Load Template` must restore any replayable historical run into the form so the user can adjust settings before starting a new run.
+- `Restart` must reload a stopped pipeline job from its saved settings and immediately queue a fresh run from the beginning.
+- Paused jobs are session-local. If the app exits while a job is paused, that run should fall back to the existing historical restart path rather than pretending it can live-resume after restart.
+- Live progress and the Jobs workspace must show `paused` as a first-class state.
+
+In practice, the action model is:
+
+- `Resume` = continue the same in-memory job.
+- `Restart` = rerun the saved request immediately from the beginning.
+- `Load Template` = restore the saved request into the editor without starting it.
+
+For new high-performance backends, the repo policy is CUDA-first on the detected NVIDIA workstation GPU whenever that execution path exists. Backends must either honor the selected GPU explicitly or surface a clear setup/fallback message rather than quietly dropping to a weaker path.
+
+The Python worker pause path depends on `psutil` for suspending active subprocess trees during long ffmpeg or NCNN stages.
+
 ## Available Models
 
 ### Runnable Now
@@ -48,19 +81,19 @@ Interpolation targets currently support 30 fps and 60 fps outputs through the Wi
 - `realesrnet-x4plus`: Real-ESRNet x4 Plus via PyTorch.
 - `bsrgan-x4`: BSRGAN x4 via PyTorch.
 - `swinir-realworld-x4`: SwinIR Real-World x4 via PyTorch.
+- `rvrt-x4`: RVRT x4 via an external video-SR runner configured through `UPSCALER_RVRT_COMMAND`.
 - `realesrgan-x4plus-anime`: compatibility model.
 - `realesr-animevideov3-x4`: compatibility model.
 
 ### Cataloged But Not Yet Runnable In The Current App Build
 
 - `hat-realhat-gan-x4`
-- `rvrt-x4`
 
 ### Backend Types
 
 - `realesrgan-ncnn`: portable NCNN Vulkan backend.
 - `pytorch-image-sr`: PyTorch frame-by-frame image SR backend.
-- `pytorch-video-sr`: planned video-native PyTorch backend.
+- `pytorch-video-sr`: research video-SR backend driven by an external command contract.
 
 ## Desktop Workflow
 
@@ -74,6 +107,78 @@ The intended workflow is:
 6. Export the winning result.
 
 The app is designed to support model-vs-model and settings-vs-settings evaluation on the same source material, not just single-pass transcoding.
+
+## Interface Tour
+
+### Main Workspace
+
+The top of the main workspace keeps the source preview, framing, and core run controls in one place.
+
+![Main page top](docs/images/main-page-top.png)
+
+Blind comparison setup lives directly in the main page so you can capture a preview start offset, choose candidate models, and launch anonymized samples without leaving the run configuration flow.
+
+![Main page blind compare](docs/images/main-page-blind-compare.png)
+
+The blind-test box is where you set the one-second or multi-second sample workflow, capture the source position, and open the synchronized comparison workspace.
+
+![Blind test box](docs/images/Blind-test-box.png)
+
+### Model And Pipeline Controls
+
+The right-hand model selector is where you choose among runnable upscale models and switch between evaluation targets quickly.
+
+![Right-hand model selector](docs/images/right-hand-model-selector.png)
+
+The encoder and interpolation controls sit beside the model controls so output codec, container, and frame-rate boost decisions stay visible while you configure a run.
+
+![Right-hand encoder and interpolation controls](docs/images/right-hand-w-encoder-and-interpolation.png)
+
+### Jobs And Comparison
+
+The Jobs page gives you a compact queue and history view for pipeline runs, source conversions, and replayable templates.
+
+![Jobs page](docs/images/jobs-page.png)
+
+The job details page exposes the stored request, progress state, and replay actions needed to restart or reload a run without rebuilding the settings by hand.
+
+![Job details page](docs/images/jobs-details-page.png)
+
+The detached comparison workspace is the core review surface for blind testing: the Source pane and every sample pane stay synchronized while you resize panes, zoom content, and pan around artifacts.
+
+![Model comparison page](docs/images/Model-comparison-page.png)
+
+## Output Showcase
+
+These reference stills in `docs/images/showcase` show the kind of before-and-after material the app is meant to inspect and export.
+
+Source frame example:
+
+![Voyager source](docs/images/showcase/voyager-source-576x432.png)
+
+Upscaled output example:
+
+![Voyager upscaled](docs/images/showcase/voyager-upscaled-2304x1728.png)
+
+Upscaled plus interpolated output example:
+
+![Voyager upscaled and interpolated](docs/images/showcase/voyager-upscaled-interpolated-2304x1728-60fps.png)
+
+Probe frame at `00:02:00.000`:
+
+![Probe 00 02 00](docs/images/showcase/probe-00-02-00_000.png)
+
+Probe frame at `00:02:30.000`:
+
+![Probe 00 02 30](docs/images/showcase/probe-00-02-30_000.png)
+
+Probe frame at `00:03:00.000`:
+
+![Probe 00 03 00](docs/images/showcase/probe-00-03-00_000.png)
+
+Probe frame at `00:03:30.000`:
+
+![Probe 00 03 30](docs/images/showcase/probe-00-03-30_000.png)
 
 ## Upscale And Interpolation Instructions
 
@@ -155,11 +260,15 @@ CLI notes:
 ## Prerequisites
 
 - Windows
-- Node.js 20+
-- npm
+- `winget` available through App Installer on a current Windows install
+
+`bootstrap.ps1` is now the intended soup-to-nuts setup path. It will install any missing local workstation dependencies it needs for this repo, including:
+
+- Node.js LTS
+- Python 3.10
 - Rust and Cargo
-- Python 3.10+ in the project-local `.venv` for the worker runtime
-- FFmpeg available on `PATH`
+- Microsoft C++ Build Tools with the Desktop C++ workload
+- Microsoft Edge WebView2 Runtime
 
 Preferred Python environment variable:
 
@@ -174,6 +283,17 @@ If that variable is not set, the repository scripts prefer the repo-local `.venv
 ```powershell
 ./scripts/bootstrap.ps1
 ```
+
+`bootstrap.ps1` now performs the full local deploy path for a fresh clone:
+
+- installs missing Windows toolchains and runtimes through `winget`
+- creates the repo-local `.venv` when needed
+- installs npm and Python dependencies
+- installs the pinned CUDA PyTorch runtime
+- builds the web and desktop host
+- pre-downloads the current runtime packages and runnable model weights, including the built-in RVRT repo and Vimeo x4 checkpoint
+
+After bootstrap completes, the first app launch should not need to stop for model or runtime downloads.
 
 ## Standard Commands
 
@@ -265,6 +385,18 @@ Benchmark the PyTorch streaming path:
 $env:PYTHONPATH='python'
 & $env:UPSCALER_PYTHON python/upscaler_worker/benchmark_pytorch_pipeline_paths.py --model-id swinir-realworld-x4 --execution-paths streaming --repeats 1 --duration-seconds 10 --width 1280 --height 720 --fps 24 --tile-size 128 --preset qualityBalanced --precision bf16 --output-mode preserveAspect4k --resolution-basis exact --target-width 3840 --target-height 2160
 ```
+
+RVRT now runs through the same external runner contract in both the desktop pipeline and the worker benchmarks. If the official RVRT repo is available at `tmp/RVRT`, the app will default to the built-in `upscaler_worker.rvrt_external_runner` automatically. `UPSCALER_RVRT_COMMAND` remains available as an override and can point to any command template that reads an input PNG sequence and writes an output PNG sequence. The command may use placeholders like `{input_dir}`, `{output_dir}`, `{model_id}`, `{tile_size}`, and `{frame_count}`.
+
+Example:
+
+```powershell
+$env:PYTHONPATH='python'
+$env:UPSCALER_RVRT_COMMAND='python path/to/your_rvrt_runner.py --input {input_dir} --output {output_dir} --model {model_id}'
+& $env:UPSCALER_PYTHON python/upscaler_worker/cli.py benchmark-upscaler --manifest-path artifacts/benchmarks/quick_fixture/manifest.json --model-id rvrt-x4 --tile-sizes 128 --repeats 1 --precision fp32
+```
+
+On this repo, the built-in default is active when `tmp/RVRT` exists, so the desktop app and worker CLI can run RVRT without setting `UPSCALER_RVRT_COMMAND` manually.
 
 ## Runtime Notes
 

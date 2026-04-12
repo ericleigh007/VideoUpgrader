@@ -14,6 +14,7 @@ from upscaler_worker.pipeline import (
     _effective_tile_size,
     _pipeline_percent,
     _plan_pipeline_segments,
+    _resolve_quality_policy,
     _resolve_video_encoder_config,
 )
 
@@ -125,6 +126,27 @@ class PipelineChunkingTests(unittest.TestCase):
         self.assertEqual(_effective_tile_size("realesrnet-x4plus", "qualityBalanced", 0), 384)
         self.assertEqual(_effective_tile_size("realesrnet-x4plus", "vramSafe", 0), 256)
         self.assertEqual(_effective_tile_size("realesrnet-x4plus", "qualityMax", 0), 512)
+        self.assertEqual(_effective_tile_size("rvrt-x4", "qualityMax", 0), 256)
+        self.assertEqual(_effective_tile_size("rvrt-x4", "qualityBalanced", 0), 192)
+        self.assertEqual(_effective_tile_size("rvrt-x4", "vramSafe", 0), 128)
+
+    def test_quality_policy_defaults_precision_by_backend_and_preset(self) -> None:
+        balanced = _resolve_quality_policy("realesrnet-x4plus", "qualityBalanced", 0, fp16=False, bf16=False, precision=None)
+        safe_video = _resolve_quality_policy("rvrt-x4", "vramSafe", 0, fp16=False, bf16=False, precision=None)
+        fixed_ncnn = _resolve_quality_policy("realesrgan-x4plus", "qualityMax", 0, fp16=False, bf16=False, precision=None)
+
+        self.assertEqual(balanced["selectedPrecision"], "bf16")
+        self.assertEqual(balanced["precisionSource"], "preset-default")
+        self.assertEqual(safe_video["selectedPrecision"], "fp16")
+        self.assertEqual(fixed_ncnn["selectedPrecision"], "fp32")
+        self.assertEqual(fixed_ncnn["precisionSource"], "backend-fixed")
+
+    def test_quality_policy_preserves_explicit_precision_override(self) -> None:
+        overridden = _resolve_quality_policy("realesrnet-x4plus", "qualityBalanced", 0, fp16=False, bf16=False, precision="fp32")
+
+        self.assertEqual(overridden["requestedPrecision"], "fp32")
+        self.assertEqual(overridden["selectedPrecision"], "fp32")
+        self.assertEqual(overridden["precisionSource"], "explicit-request")
 
     @patch("upscaler_worker.pipeline._probe_video_encoder", return_value=True)
     def test_resolve_video_encoder_prefers_nvenc_when_available(self, _probe_mock) -> None:
@@ -188,6 +210,7 @@ class PipelineChunkingTests(unittest.TestCase):
     def test_progress_telemetry_reports_fps_eta_and_resources(self, *_mocks) -> None:
         telemetry_state = pipeline_module.PipelineTelemetryState(
             started_at=100.0,
+            source_path="C:/fixtures/input.mp4",
             scratch_path=Path("scratch"),
             output_path=Path("output.mkv"),
         )

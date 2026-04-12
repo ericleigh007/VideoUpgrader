@@ -26,6 +26,13 @@ export interface GpuDevice {
   kind: GpuKind;
 }
 
+export interface ExternalResearchRuntimeStatus {
+  kind: "external-command";
+  commandEnvVar: string;
+  configured: boolean;
+  source?: "environment" | "repo-default" | "missing";
+}
+
 export interface SourceVideoSummary {
   path: string;
   previewPath: string;
@@ -54,6 +61,7 @@ export interface RuntimeStatus {
   rifeModelRoot?: string;
   availableGpus: GpuDevice[];
   defaultGpuId: number | null;
+  externalResearchRuntimes?: Record<string, ExternalResearchRuntimeStatus>;
 }
 
 export interface ModelRating {
@@ -64,6 +72,7 @@ export interface ModelRating {
 export interface BlindComparisonRecord {
   sourcePath: string;
   previewDurationSeconds: number;
+  previewStartOffsetSeconds?: number | null;
   winnerModelId: ModelId;
   candidateModelIds: ModelId[];
   createdAt: string;
@@ -77,6 +86,7 @@ export interface AppConfig {
 export interface BlindComparisonSelectionInput {
   sourcePath: string;
   previewDurationSeconds: number;
+  previewStartOffsetSeconds?: number | null;
   winnerModelId: ModelId;
   candidateModelIds: ModelId[];
 }
@@ -105,6 +115,7 @@ export interface RealesrganJobRequest extends OutputSizingOptions {
   gpuId: number | null;
   previewMode: boolean;
   previewDurationSeconds: number | null;
+  previewStartOffsetSeconds?: number | null;
   segmentDurationSeconds: number | null;
   outputPath: string;
   codec: VideoCodec;
@@ -114,7 +125,7 @@ export interface RealesrganJobRequest extends OutputSizingOptions {
   crf: number;
 }
 
-export type PipelinePhase = "queued" | "extracting" | "upscaling" | "interpolating" | "encoding" | "remuxing" | "completed" | "failed";
+export type PipelinePhase = "queued" | "paused" | "extracting" | "upscaling" | "interpolating" | "encoding" | "remuxing" | "completed" | "failed";
 
 export interface PipelineProgress {
   phase: PipelinePhase;
@@ -160,6 +171,76 @@ export interface InterpolationDiagnostics {
   segmentOverlapFrames: number;
 }
 
+export interface PipelineMediaSummary {
+  width: number;
+  height: number;
+  frameRate: number;
+  durationSeconds: number;
+  frameCount: number;
+  aspectRatio: number;
+  pixelCount: number;
+  hasAudio?: boolean | null;
+  container?: string | null;
+  videoCodec?: string | null;
+}
+
+export interface PipelineEffectiveSettings {
+  backendId?: string | null;
+  qualityPreset?: string | null;
+  requestedTileSize?: number | null;
+  effectiveTileSize: number;
+  requestedPrecision?: string | null;
+  selectedPrecision?: string | null;
+  effectivePrecision?: string | null;
+  precisionSource?: string | null;
+  processedDurationSeconds: number;
+  previewStartOffsetSeconds?: number | null;
+  segmentFrameLimit: number;
+  previewMode: boolean;
+  previewDurationSeconds?: number | null;
+  segmentDurationSeconds?: number | null;
+}
+
+export interface PipelineStageTimings {
+  extractSeconds: number;
+  upscaleSeconds: number;
+  interpolateSeconds: number;
+  encodeSeconds: number;
+  remuxSeconds: number;
+}
+
+export interface PipelineResourcePeaks {
+  processRssBytes?: number | null;
+  gpuMemoryUsedBytes?: number | null;
+  gpuMemoryTotalBytes?: number | null;
+  scratchSizeBytes?: number | null;
+  outputSizeBytes?: number | null;
+}
+
+export interface ManagedPipelineRunDetails {
+  request: RealesrganJobRequest;
+  sourceMedia?: PipelineMediaSummary | null;
+  outputMedia?: PipelineMediaSummary | null;
+  effectiveSettings?: PipelineEffectiveSettings | null;
+  executionPath?: string | null;
+  videoEncoder?: string | null;
+  videoEncoderLabel?: string | null;
+  runner?: string | null;
+  precision?: string | null;
+  torchCompileEnabled?: boolean | null;
+  torchCompileMode?: string | null;
+  torchCompileCudagraphs?: boolean | null;
+  stageTimings?: PipelineStageTimings | null;
+  resourcePeaks?: PipelineResourcePeaks | null;
+  modelRuntime?: Record<string, unknown> | null;
+  averageThroughputFps?: number | null;
+  segmentCount?: number | null;
+  segmentFrameLimit?: number | null;
+  frameCount?: number | null;
+  hadAudio?: boolean | null;
+  runtime?: RuntimeStatus | null;
+}
+
 export interface RealesrganJobPlan {
   model: string;
   command: string[];
@@ -174,8 +255,25 @@ export interface PipelineResult {
   hadAudio: boolean;
   codec: VideoCodec;
   container: OutputContainer;
+  sourceMedia?: PipelineMediaSummary | null;
+  outputMedia?: PipelineMediaSummary | null;
+  effectiveSettings?: PipelineEffectiveSettings | null;
   interpolationDiagnostics?: InterpolationDiagnostics | null;
+  executionPath?: string | null;
+  videoEncoder?: string | null;
+  videoEncoderLabel?: string | null;
+  runner?: string | null;
+  precision?: string | null;
+  torchCompileEnabled?: boolean | null;
+  torchCompileMode?: string | null;
+  torchCompileCudagraphs?: boolean | null;
   runtime: RuntimeStatus;
+  stageTimings?: PipelineStageTimings | null;
+  resourcePeaks?: PipelineResourcePeaks | null;
+  modelRuntime?: Record<string, unknown> | null;
+  averageThroughputFps?: number | null;
+  segmentCount?: number | null;
+  segmentFrameLimit?: number | null;
   log: string[];
 }
 
@@ -196,7 +294,7 @@ export interface ManagedJobSummary {
   jobId: string;
   jobKind: "pipeline" | "sourceConversion" | string;
   label: string;
-  state: "queued" | "running" | "succeeded" | "failed" | "cancelled" | string;
+  state: "queued" | "running" | "paused" | "succeeded" | "failed" | "cancelled" | "interrupted" | string;
   sourcePath: string | null;
   modelId: string | null;
   codec: string | null;
@@ -207,12 +305,13 @@ export interface ManagedJobSummary {
   scratchStats: PathStats | null;
   outputPath: string | null;
   outputStats: PathStats | null;
+  pipelineRunDetails?: ManagedPipelineRunDetails | null;
   updatedAt: string;
 }
 
 export interface PipelineJobStatus {
   jobId: string;
-  state: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  state: "queued" | "running" | "paused" | "succeeded" | "failed" | "cancelled";
   progress: PipelineProgress;
   result: PipelineResult | null;
   error: string | null;
@@ -220,7 +319,7 @@ export interface PipelineJobStatus {
 
 export interface SourceConversionJobStatus {
   jobId: string;
-  state: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  state: "queued" | "running" | "paused" | "succeeded" | "failed" | "cancelled";
   progress: PipelineProgress;
   result: SourceVideoSummary | null;
   error: string | null;
@@ -233,12 +332,16 @@ export interface DesktopApi {
   probeSourceVideo(sourcePath: string): Promise<SourceVideoSummary>;
   startSourceConversionToMp4(sourcePath: string): Promise<string>;
   getSourceConversionJob(jobId: string): Promise<SourceConversionJobStatus>;
+  pauseSourceConversionJob(jobId: string): Promise<void>;
+  resumeSourceConversionJob(jobId: string): Promise<void>;
   cancelSourceConversionJob(jobId: string): Promise<void>;
   getAppConfig(): Promise<AppConfig>;
   saveModelRating(modelId: ModelId, rating: number | null): Promise<AppConfig>;
   recordBlindComparisonSelection(selection: BlindComparisonSelectionInput): Promise<AppConfig>;
   startPipeline(request: RealesrganJobRequest): Promise<string>;
   getPipelineJob(jobId: string): Promise<PipelineJobStatus>;
+  pausePipelineJob(jobId: string): Promise<void>;
+  resumePipelineJob(jobId: string): Promise<void>;
   cancelPipelineJob(jobId: string): Promise<void>;
   getPathStats(path: string): Promise<PathStats>;
   getScratchStorageSummary(): Promise<ScratchStorageSummary>;

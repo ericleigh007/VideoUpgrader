@@ -13,7 +13,7 @@ from spandrel import ImageModelDescriptor, ModelLoader
 
 from upscaler_worker.model_catalog import ensure_runnable_model, model_label, model_runtime_asset
 from upscaler_worker.precision import resolve_precision_mode
-from upscaler_worker.runtime import runtime_root
+from upscaler_worker.runtime import download_file_with_retries, runtime_root
 
 
 MODEL_TILE_OVERLAP = 32
@@ -62,9 +62,7 @@ def ensure_model_checkpoint(model_id: str) -> Path:
         return checkpoint_path
 
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    partial_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".part")
-    urllib.request.urlretrieve(download_url, partial_path)
-    partial_path.replace(checkpoint_path)
+    download_file_with_retries(download_url, checkpoint_path)
     return checkpoint_path
 
 
@@ -407,6 +405,7 @@ def load_runtime_model(
     dtype = torch.float32
     autocast_dtype: torch.dtype | None = None
     batching_dtype = torch.float32
+    effective_precision_mode = precision_mode
     if device.type == "cuda" and precision_mode == "fp16" and bool(descriptor.supports_half):
         descriptor = descriptor.half()
         dtype = torch.float16
@@ -414,6 +413,7 @@ def load_runtime_model(
         log.append("Using fp16 inference for PyTorch image SR.")
     elif device.type == "cuda" and precision_mode == "fp16":
         descriptor = descriptor.float()
+        effective_precision_mode = "fp32"
         log.append("FP16 requested, but this PyTorch image SR model/runtime does not support half precision. Using fp32 instead.")
     elif device.type == "cuda" and precision_mode == "bf16" and bool(getattr(descriptor, "supports_bfloat16", False)):
         descriptor = descriptor.float()
@@ -422,6 +422,7 @@ def load_runtime_model(
         log.append("Using bf16 autocast inference for PyTorch image SR.")
     elif device.type == "cuda" and precision_mode == "bf16":
         descriptor = descriptor.float()
+        effective_precision_mode = "fp32"
         log.append("BF16 requested, but this PyTorch image SR model/runtime does not support bfloat16 precision. Using fp32 instead.")
     else:
         descriptor = descriptor.float()
@@ -457,7 +458,7 @@ def load_runtime_model(
         device=device,
         dtype=dtype,
         autocast_dtype=autocast_dtype,
-        precision_mode=precision_mode,
+        precision_mode=effective_precision_mode,
         runner=resolved_runner,
         scale=int(descriptor.scale),
         frame_batch_size=frame_batch_size,

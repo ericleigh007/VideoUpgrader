@@ -9,7 +9,8 @@ describe("modelCatalog", () => {
       "realesrgan-x4plus",
       "realesrnet-x4plus",
       "bsrgan-x4",
-      "swinir-realworld-x4"
+      "swinir-realworld-x4",
+      "rvrt-x4"
     ]);
   });
 

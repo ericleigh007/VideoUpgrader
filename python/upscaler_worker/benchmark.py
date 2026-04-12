@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from upscaler_worker.model_catalog import ensure_runnable_model, model_backend_id, model_label
+from upscaler_worker.model_catalog import ensure_benchmarkable_model, ensure_runnable_model, model_backend_id, model_label
 from upscaler_worker.precision import resolve_precision_mode
 from upscaler_worker.runtime import ensure_runtime_assets
 
@@ -152,14 +152,14 @@ def _sample_and_render_gpu_status(*, state: LiveRunMonitorState, prefix: str) ->
     return message
 
 
-def _run_ncnn_command_with_heartbeat(
+def _run_command_with_heartbeat(
     *,
     command: list[str],
-    tile_size: int,
-    repeat_index: int,
+    status_label: str,
+    env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], float, dict[str, object]]:
     started = time.perf_counter()
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     monitor_state = LiveRunMonitorState()
     last_reported_at = 0.0
 
@@ -171,7 +171,7 @@ def _run_ncnn_command_with_heartbeat(
                 _emit_live_status(
                     _sample_and_render_gpu_status(
                         state=monitor_state,
-                        prefix=f"[tile {tile_size} run {repeat_index}] running NCNN benchmark | elapsed {elapsed:.1f}s",
+                        prefix=f"[{status_label}] running benchmark | elapsed {elapsed:.1f}s",
                     )
                 )
                 last_reported_at = now
@@ -188,7 +188,7 @@ def _run_ncnn_command_with_heartbeat(
     _emit_live_status(
         _sample_and_render_gpu_status(
             state=monitor_state,
-            prefix=f"[tile {tile_size} run {repeat_index}] completed NCNN run in {wall_seconds:.2f}s",
+            prefix=f"[{status_label}] completed benchmark run in {wall_seconds:.2f}s",
         )
     )
     return (
@@ -473,7 +473,7 @@ def benchmark_fixture(
     pytorch_runner: str = "torch",
 ) -> dict[str, object]:
     precision_mode = resolve_precision_mode(fp16=fp16, bf16=bf16, precision=precision)
-    ensure_runnable_model(model_id)
+    ensure_benchmarkable_model(model_id)
     manifest = _load_manifest(manifest_path)
     entries = list(manifest.get("entries", []))
     if not entries:
@@ -515,6 +515,19 @@ def benchmark_fixture(
                     gpu_id=gpu_id,
                 )
             )
+        elif backend_id == "pytorch-video-sr":
+            results.append(
+                _benchmark_pytorch_video_fixture(
+                    degraded_paths=degraded_paths,
+                    width=width,
+                    height=height,
+                    model_id=model_id,
+                    tile_size=tile_size,
+                    repeats=repeats,
+                    gpu_id=gpu_id,
+                    precision=precision_mode,
+                )
+            )
         else:
             raise RuntimeError(f"Unsupported benchmark backend '{backend_id}' for model '{model_id}'")
 
@@ -530,6 +543,92 @@ def benchmark_fixture(
         "repeats": repeats,
         "precision": precision_mode,
         "results": results,
+    }
+
+
+def _benchmark_pytorch_video_fixture(
+    *,
+    degraded_paths: list[Path],
+    width: int,
+    height: int,
+    model_id: str,
+    tile_size: int,
+    repeats: int,
+    gpu_id: int | None,
+    precision: str,
+) -> dict[str, object]:
+    from upscaler_worker.models.pytorch_video_sr import build_external_video_sr_command, validate_external_video_sr_outputs
+
+    input_dir = degraded_paths[0].parent
+    if any(path.parent != input_dir for path in degraded_paths):
+        raise ValueError("Video SR benchmark fixtures must live under a single input directory")
+
+    command_info = build_external_video_sr_command(
+        model_id=model_id,
+        input_dir=input_dir,
+        output_dir=Path(tempfile.gettempdir()) / "upscaler-video-sr-probe",
+        tile_size=tile_size,
+        gpu_id=gpu_id,
+        precision=precision,
+    )
+    notes = [
+        f"Research runner env var: {command_info.command_env_var}",
+        f"Research command template resolves to: {' '.join(command_info.command)}",
+    ]
+
+    repeat_metrics: list[dict[str, object]] = []
+    for repeat_index in range(repeats):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "out"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            command_info = build_external_video_sr_command(
+                model_id=model_id,
+                input_dir=input_dir,
+                output_dir=output_dir,
+                tile_size=tile_size,
+                gpu_id=gpu_id,
+                precision=precision,
+            )
+
+            completed, wall_seconds, gpu_activity = _run_command_with_heartbeat(
+                command=command_info.command,
+                status_label=f"tile {tile_size} run {repeat_index + 1}",
+                env=command_info.environment,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    f"External video SR benchmark failed for model '{model_id}'. stdout: {completed.stdout} stderr: {completed.stderr}"
+                )
+            output_count = validate_external_video_sr_outputs(input_dir=input_dir, output_dir=output_dir)
+            if gpu_activity["warning"]:
+                _emit_live_status(f"[tile {tile_size} run {repeat_index + 1}] WARNING | {gpu_activity['warning']}")
+
+            repeat_metrics.append(
+                {
+                    "repeat": repeat_index + 1,
+                    "wallSeconds": wall_seconds,
+                    "imagesPerSecond": _safe_images_per_second(output_count, wall_seconds),
+                    "megapixelsPerSecond": _safe_megapixels_per_second(output_count, width, height, wall_seconds),
+                    "gpuActivity": gpu_activity,
+                    "outputFrameCount": output_count,
+                }
+            )
+
+    best_wall = min(metric["wallSeconds"] for metric in repeat_metrics)
+    avg_wall = sum(metric["wallSeconds"] for metric in repeat_metrics) / len(repeat_metrics)
+    return {
+        "tileSize": tile_size,
+        "frameBatchSize": None,
+        "dtype": precision,
+        "device": "external",
+        "repeatMetrics": repeat_metrics,
+        "summary": {
+            "bestWallSeconds": round(best_wall, 4),
+            "averageWallSeconds": round(avg_wall, 4),
+            "bestImagesPerSecond": round(_safe_images_per_second(len(degraded_paths), best_wall), 3),
+            "bestMegapixelsPerSecond": round(_safe_megapixels_per_second(len(degraded_paths), width, height, best_wall), 3),
+        },
+        "notes": notes,
     }
 
 
@@ -726,10 +825,9 @@ def _benchmark_ncnn_fixture(
                 command.extend(["-t", str(tile_size)])
 
             _emit_live_status(f"[tile {tile_size} run {repeat_index + 1}/{repeats}] starting NCNN fixture benchmark")
-            completed, wall_seconds, gpu_activity = _run_ncnn_command_with_heartbeat(
+            completed, wall_seconds, gpu_activity = _run_command_with_heartbeat(
                 command=command,
-                tile_size=tile_size,
-                repeat_index=repeat_index + 1,
+                status_label=f"tile {tile_size} run {repeat_index + 1}",
             )
             if completed.returncode != 0:
                 raise RuntimeError(

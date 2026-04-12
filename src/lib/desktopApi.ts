@@ -88,6 +88,24 @@ export const desktopApi: DesktopApi = {
     return invoke<SourceConversionJobStatus>("get_source_conversion_job", { jobId });
   },
 
+  async pauseSourceConversionJob(jobId: string) {
+    const mock = mockApi();
+    if (mock?.pauseSourceConversionJob) {
+      return mock.pauseSourceConversionJob(jobId);
+    }
+
+    return invoke<void>("pause_source_conversion_job", { jobId });
+  },
+
+  async resumeSourceConversionJob(jobId: string) {
+    const mock = mockApi();
+    if (mock?.resumeSourceConversionJob) {
+      return mock.resumeSourceConversionJob(jobId);
+    }
+
+    return invoke<void>("resume_source_conversion_job", { jobId });
+  },
+
   async cancelSourceConversionJob(jobId: string) {
     const mock = mockApi();
     if (mock?.cancelSourceConversionJob) {
@@ -140,6 +158,24 @@ export const desktopApi: DesktopApi = {
     }
 
     return invoke<PipelineJobStatus>("get_realesrgan_pipeline_job", { jobId });
+  },
+
+  async pausePipelineJob(jobId: string) {
+    const mock = mockApi();
+    if (mock?.pausePipelineJob) {
+      return mock.pausePipelineJob(jobId);
+    }
+
+    return invoke<void>("pause_realesrgan_pipeline_job", { jobId });
+  },
+
+  async resumePipelineJob(jobId: string) {
+    const mock = mockApi();
+    if (mock?.resumePipelineJob) {
+      return mock.resumePipelineJob(jobId);
+    }
+
+    return invoke<void>("resume_realesrgan_pipeline_job", { jobId });
   },
 
   async cancelPipelineJob(jobId: string) {

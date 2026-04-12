@@ -7,6 +7,8 @@ async function main() {
   const pipelineMode = process.env.DESKTOP_PIPELINE_MODE ?? 'afterUpscale';
   const targetAspect = process.env.TARGET_ASPECT ?? '1:1';
   const previewWaitMs = Number.parseInt(process.env.PREVIEW_WAIT_MS ?? '10000', 10);
+  const pipelineLaunchWaitMs = Number.parseInt(process.env.PIPELINE_LAUNCH_WAIT_MS ?? '5000', 10);
+  const pipelineProgressWaitMs = Number.parseInt(process.env.PIPELINE_PROGRESS_WAIT_MS ?? '120000', 10);
   const cdpConnectTimeoutMs = Number.parseInt(process.env.CDP_CONNECT_TIMEOUT_MS ?? '60000', 10);
   const cropNudgeMode = process.env.CROP_NUDGE_MODE ?? 'xy';
   const expectedMockSourcePath = `C:/fixtures/sample-input.${mockContainer}`;
@@ -24,10 +26,41 @@ async function main() {
     }
   }
 
+  async function waitForLiveProgress(page, panelPage = null) {
+    if (panelPage) {
+      const panelVisible = await panelPage.getByTestId('job-progress-panel').waitFor({ timeout: 10000 }).then(() => true).catch(() => false);
+      if (panelVisible) {
+        await panelPage.waitForFunction(() => {
+          const lastUpdate = document.querySelector('[data-testid="progress-last-update"]')?.textContent ?? '';
+          return lastUpdate.includes('Last update') && !lastUpdate.includes('waiting for first update');
+        }, undefined, { timeout: pipelineProgressWaitMs });
+        return;
+      }
+    }
+
+    await expect.poll(
+      async () => await page.getByTestId('pipeline-launch-state').getAttribute('data-state'),
+      { timeout: pipelineLaunchWaitMs },
+    ).toMatch(/queued|running|paused/);
+  }
+
   const browser = await chromium.connectOverCDP('http://127.0.0.1:9223', { timeout: cdpConnectTimeoutMs });
   try {
     const context = browser.contexts()[0];
-    const page = context?.pages().find((candidate) => candidate.url().includes('localhost:1420'));
+    const detachedPages = context?.pages().filter((candidate) => {
+      const url = candidate.url();
+      return url.includes('view=jobs') || url.includes('view=comparison');
+    }) ?? [];
+    for (const detachedPage of detachedPages) {
+      await detachedPage.close().catch(() => {});
+    }
+
+    await expect.poll(
+      () => context?.pages().map((candidate) => candidate.url()) ?? [],
+      { timeout: 10000 },
+    ).toContainEqual(expect.stringContaining('localhost:1420'));
+
+    const page = context?.pages().find((candidate) => candidate.url().includes('localhost:1420') && !candidate.url().includes('view='));
     if (!page) {
       throw new Error('Could not find the Upscaler desktop webview target');
     }
@@ -257,6 +290,48 @@ async function main() {
       throw new Error(`Source preview did not appear. Diagnostics: ${JSON.stringify(diagnostics)}`);
     }
 
+    let jobsPage = null;
+    let jobsWindowSummary = null;
+    if (!isRealBackendMode && !isInterpolationOnlyMode) {
+      await page.getByTestId('job-cleanup-panel-toggle').click();
+      await expect.poll(() => context.pages().map((candidate) => candidate.url()), {
+        timeout: 10000,
+      }).toContainEqual(expect.stringContaining('view=jobs'));
+      jobsPage = context.pages().find((candidate) => candidate.url().includes('view=jobs'));
+      if (!jobsPage) {
+        throw new Error(`Detached Jobs window did not appear. Known pages: ${JSON.stringify(context.pages().map((candidate) => candidate.url()))}`);
+      }
+      await jobsPage.waitForLoadState('domcontentloaded');
+      await jobsPage.bringToFront();
+      await expect(jobsPage.getByTestId('job-cleanup-panel')).toBeVisible();
+      await expect(jobsPage.getByTestId('jobs-window-close')).toHaveCount(0);
+      await expect(jobsPage.getByTestId('top-status-panel')).toHaveCount(0);
+      const cleanupTableShell = jobsPage.getByTestId('cleanup-jobs-table-shell');
+      const cleanupEmptyState = jobsPage.getByText('No tracked or historical managed jobs found yet.', { exact: true });
+      await expect.poll(async () => {
+        if (await cleanupTableShell.count()) {
+          return 'table';
+        }
+        if (await cleanupEmptyState.count()) {
+          return 'empty';
+        }
+        return null;
+      }, {
+        timeout: 30000,
+      }).not.toBeNull();
+      jobsWindowSummary = {
+        url: jobsPage.url(),
+        state: await cleanupTableShell.count() ? 'table' : 'empty',
+      };
+      if (jobsWindowSummary.state === 'table') {
+        jobsWindowSummary.tableMetrics = await cleanupTableShell.evaluate((element) => ({
+          clientWidth: element.clientWidth,
+          scrollWidth: element.scrollWidth,
+        }));
+      }
+      await page.bringToFront();
+    }
+
     await expect(page.getByTestId('source-preview')).toBeVisible();
     if (isRealBackendMode || mockContainer !== 'mp4') {
       await expect(page.getByTestId('source-preview-mode')).toContainText('preview');
@@ -282,15 +357,31 @@ async function main() {
         await page.getByTestId('pipeline-toggle-upscale').click();
         await expect(page.getByTestId('frame-rate-mode-readout')).toHaveValue('Enabled standalone');
       }
+      await page.getByTestId('preview-mode-checkbox').check();
+      await page.getByTestId('preview-duration-input').fill('3');
       await page.getByTestId('frame-rate-target-select').selectOption('60');
       await page.getByTestId('save-output-button').click();
       await page.getByTestId('run-upscale-button').click();
     }
 
+    await expect.poll(
+      async () => await page.getByTestId('pipeline-launch-state').getAttribute('data-state'),
+      { timeout: pipelineLaunchWaitMs },
+    ).toMatch(/starting|queued|running|paused/);
+
     if (!isRealBackendMode) {
       await expect.poll(async () => await page.evaluate(() => window.__UPSCALER_TEST_STATE__?.lastRequest ?? null), {
         timeout: 10000,
       }).not.toBeNull();
+    }
+
+    if (jobsPage) {
+      await jobsPage.bringToFront();
+      await waitForLiveProgress(page, jobsPage);
+      await page.bringToFront();
+    } else if (!isRealBackendMode) {
+      await page.getByTestId('job-cleanup-panel-toggle').click();
+      await waitForLiveProgress(page, page);
     }
 
     const lastRequest = !isRealBackendMode
@@ -309,6 +400,7 @@ async function main() {
       pipelineMode,
       targetAspect,
       overlapRequest: lastRequest,
+      jobsWindowSummary,
       mockDiagnostics,
     };
 
