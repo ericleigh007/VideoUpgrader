@@ -31,6 +31,14 @@
       "runtime": "python-torch",
       "supportsGpuSelection": true,
       "frameTransport": "sequence-native"
+    },
+    {
+      "id": "pytorch-image-colorization",
+      "label": "PyTorch Image Colorization",
+      "loader": "pytorch-checkpoint",
+      "runtime": "python-torch",
+      "supportsGpuSelection": true,
+      "frameTransport": "directory-batch"
     }
   ],
   "models": [
@@ -41,6 +49,7 @@
       "runtimeModelName": "realesrgan-x4plus",
       "label": "Real-ESRGAN x4 Plus",
       "summary": "General-purpose photographic model with the strongest sharpening and texture lift in the current NCNN runtime.",
+      "task": "upscale",
       "visibleInUi": true,
       "comparisonEligible": true,
       "executionStatus": "runnable",
@@ -63,6 +72,7 @@
       "runtimeModelName": "realesrnet-x4plus",
       "label": "Real-ESRNet x4 Plus",
       "summary": "More conservative Real-ESR family model with lower halo risk and a useful baseline against stronger sharpening models.",
+      "task": "upscale",
       "visibleInUi": true,
       "comparisonEligible": true,
       "executionStatus": "runnable",
@@ -90,6 +100,7 @@
       "runtimeModelName": "bsrgan-x4",
       "label": "BSRGAN x4",
       "summary": "Blind real-world super-resolution model with strong handling for noisy, compressed, or degraded photographic footage.",
+      "task": "upscale",
       "visibleInUi": true,
       "comparisonEligible": true,
       "executionStatus": "runnable",
@@ -117,6 +128,7 @@
       "runtimeModelName": "Real_HAT_GAN_SRx4",
       "label": "HAT Real HAT GAN x4",
       "summary": "Hybrid attention transformer tuned for high perceptual quality in real-world image SR, suitable for frame-by-frame video analysis.",
+      "task": "upscale",
       "visibleInUi": false,
       "comparisonEligible": false,
       "executionStatus": "planned",
@@ -139,6 +151,7 @@
       "runtimeModelName": "swinir-realworld-x4",
       "label": "SwinIR Real-World x4",
       "summary": "Transformer-based image super-resolution model with strong texture recovery and more restrained sharpening than ESRGAN variants.",
+      "task": "upscale",
       "visibleInUi": true,
       "comparisonEligible": true,
       "executionStatus": "runnable",
@@ -166,6 +179,7 @@
       "runtimeModelName": "rvrt-x4",
       "label": "RVRT x4",
       "summary": "Video-native recurrent transformer with temporal fusion, making it the first serious non-framewise target backend for real footage.",
+      "task": "upscale",
       "visibleInUi": true,
       "comparisonEligible": false,
       "executionStatus": "runnable",
@@ -192,6 +206,7 @@
       "runtimeModelName": "realesrgan-x4plus-anime",
       "label": "Real-ESRGAN x4 Plus Anime",
       "summary": "Compatibility-only bundled model retained so the app can exercise multi-result comparisons before the PyTorch backends land.",
+      "task": "upscale",
       "visibleInUi": false,
       "comparisonEligible": false,
       "executionStatus": "runnable",
@@ -214,6 +229,7 @@
       "runtimeModelName": "realesr-animevideov3-x4",
       "label": "Real-ESR AnimeVideo v3 x4",
       "summary": "Compatibility-only bundled video model retained to give the app multiple runnable outputs for immediate side-by-side validation.",
+      "task": "upscale",
       "visibleInUi": false,
       "comparisonEligible": false,
       "executionStatus": "runnable",
@@ -228,6 +244,176 @@
         "supportsGpuId": true,
         "prefersFixedScaleModelOutput": true,
         "variantSuffixByScale": true
+      }
+    },
+    {
+      "id": "ddcolor-modelscope",
+      "backendId": "pytorch-image-colorization",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "ddcolor-modelscope",
+      "label": "DDColor ModelScope",
+      "summary": "Photo-realistic automatic colorization model intended for grayscale photographs and live-action film frames.",
+      "task": "colorize",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "next",
+      "qualityRank": 1,
+      "supportsContextInput": false,
+      "supportedContextKinds": [],
+      "videoNative": false,
+      "mediaSuitability": ["photo", "video", "live-action", "grayscale"],
+      "nativeScale": 1,
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": false
+      }
+    },
+    {
+      "id": "ddcolor-paper",
+      "backendId": "pytorch-image-colorization",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "ddcolor-paper",
+      "label": "DDColor Paper",
+      "summary": "Higher-fidelity DDColor checkpoint for local grayscale-to-color comparisons on real footage.",
+      "task": "colorize",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "next",
+      "qualityRank": 2,
+      "supportsContextInput": false,
+      "supportedContextKinds": [],
+      "videoNative": false,
+      "mediaSuitability": ["photo", "video", "live-action", "grayscale"],
+      "nativeScale": 1,
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": false
+      }
+    },
+    {
+      "id": "deoldify-stable",
+      "backendId": "pytorch-image-colorization",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "deoldify-stable",
+      "label": "DeOldify Stable",
+      "summary": "Conservative DeOldify variant favored for portraits and natural live-action scenes.",
+      "task": "colorize",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "next",
+      "qualityRank": 3,
+      "supportsContextInput": false,
+      "supportedContextKinds": [],
+      "videoNative": false,
+      "mediaSuitability": ["photo", "video", "live-action", "grayscale"],
+      "nativeScale": 1,
+      "runtimeAsset": {
+        "kind": "checkpoint",
+        "fileName": "ColorizeStable_gen.pth",
+        "downloadUrl": "https://www.dropbox.com/s/axsd2g85uyixaho/ColorizeStable_gen.pth?dl=1"
+      },
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": false
+      }
+    },
+    {
+      "id": "deoldify-video",
+      "backendId": "pytorch-image-colorization",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "deoldify-video",
+      "label": "DeOldify Video",
+      "summary": "DeOldify video-focused variant optimized for stable frame-to-frame colorization on grayscale footage.",
+      "task": "colorize",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "next",
+      "qualityRank": 4,
+      "supportsContextInput": false,
+      "supportedContextKinds": [],
+      "videoNative": false,
+      "mediaSuitability": ["photo", "video", "live-action", "grayscale"],
+      "nativeScale": 1,
+      "runtimeAsset": {
+        "kind": "checkpoint",
+        "fileName": "ColorizeVideo_gen.pth",
+        "downloadUrl": "https://data.deepai.org/deoldify/ColorizeVideo_gen.pth"
+      },
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": false
+      }
+    },
+    {
+      "id": "deepremaster",
+      "backendId": "pytorch-image-colorization",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "deepremaster",
+      "label": "DeepRemaster",
+      "summary": "Reference-guided video colorization candidate that uses selected context images associated with the source clip.",
+      "task": "colorize",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "research",
+      "qualityRank": 5,
+      "supportsContextInput": true,
+      "supportedContextKinds": ["referenceImages"],
+      "videoNative": true,
+      "mediaSuitability": ["photo", "video", "live-action", "grayscale"],
+      "nativeScale": 1,
+      "runtimeAsset": {
+        "kind": "checkpoint",
+        "fileName": "remasternet.pth.tar",
+        "downloadUrl": "http://iizuka.cs.tsukuba.ac.jp/data/remasternet.pth.tar"
+      },
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": false
+      }
+    },
+    {
+      "id": "colormnet",
+      "backendId": "pytorch-image-colorization",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "colormnet",
+      "label": "ColorMNet",
+      "summary": "Exemplar-propagation video colorization candidate designed around one anchor reference frame that closely matches the target shot.",
+      "task": "colorize",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "research",
+      "qualityRank": 6,
+      "supportsContextInput": true,
+      "supportedContextKinds": ["referenceImages"],
+      "videoNative": true,
+      "mediaSuitability": ["photo", "video", "live-action", "grayscale"],
+      "nativeScale": 1,
+      "runtimeAsset": {
+        "kind": "checkpoint",
+        "fileName": "DINOv2FeatureV6_LocalAtten_s2_154000.pth",
+        "downloadUrl": "https://github.com/yyang181/colormnet/releases/download/v0.1/DINOv2FeatureV6_LocalAtten_s2_154000.pth"
+      },
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "prefersFixedScaleModelOutput": false
       }
     }
   ]

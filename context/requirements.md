@@ -10,10 +10,9 @@ It replaces the inconsistent placeholder naming and prior carry-over text. It is
 
 VideoUpgrader is a Windows-first desktop application for:
 
-- Comparing multiple video upscaler models on the same source content.
-- Interpolating existing video to higher frame rates such as 30 fps and 60 fps.
-- Running interpolation after upscaling when the user wants final-resolution motion synthesis.
-- Exporting full-length upscaled video while preserving or reattaching the original audio.
+- Creating video upgrade pipelines including, but not limited to Colorization, Upscaling, frame interpolation
+- Comparing multiple pipeilne combinations of models on the same source content.
+- Exporting full-length processed video while preserving or reattaching the original audio.
 - Analyzing output quality at the frame, pixel, and temporal level.
 - Running repeatable synthetic benchmark scenarios for objective regression testing.
 
@@ -22,6 +21,7 @@ VideoUpgrader is a Windows-first desktop application for:
 - Developers evaluating super-resolution model quality.
 - Power users comparing model behavior on long-form video.
 - Researchers validating spatial and temporal restoration quality.
+- End users wanting to process complete video content of up to 3 hours in length.
 
 ## Core Product Goals
 
@@ -55,6 +55,26 @@ The first deliverable must support:
 - The app must support long-form video rather than only short clips.
 - The app must support MP4 and WEBM and MKV input.
 - The app should support MOV input
+
+### Colorization
+
+- The app must allow for video to be colorized both with and without contextual information.
+- Contextual information will depend on the model, but could include text prompts, images, or video.
+- The app must support experimental reference-guided colorization workflows in addition to fully automatic colorization models.
+- The app must persist source-specific color reference libraries so the user can reuse and curate context images across sessions.
+
+#### Experimental Reference-Guided Colorization Workflow
+
+- The app should support splitting a source video into shot-level work units when the selected colorizer performs best on visually coherent shots rather than a full edited sequence.
+- The app should support extracting at least one representative frame for each detected or user-defined shot so that frame can be edited externally.
+- The app should support a workflow where a representative grayscale frame is sent to an external AI image editor that accepts image input plus prompt guidance and returns a colorized target frame.
+- The app should support assigning the edited target frame back to the corresponding shot as exemplar or reference context for shot-local colorization.
+- The app should support marking individual shots as approved when their color result is good enough, without requiring the entire source video to be re-reviewed from scratch.
+- The app should support reassembling approved colorized shots into a full-length output in source order.
+- The app must restore or remux the original audio back onto the reassembled colorized output when audio is present.
+- The app should surface that shot-to-shot color continuity is an experimental review problem and may require manual correction or rerendering when adjacent shots do not blend acceptably.
+- The app should preserve enough metadata for shot-based runs that the user can inspect which exemplar, prompt, or context assets were used for each shot.
+- The app should treat prompt-driven or exemplar-driven colorization as experimental quality-assist workflows rather than guaranteed deterministic restoration.
 
 ### Upscaling
 
@@ -150,7 +170,7 @@ The first deliverable must support:
 ### Desktop Backend
 
 - The backend must coordinate media probing, decode, job scheduling, caching, export, and diagnostics.
-- The backend may use GPU resources up to approximately 12 GB of VRAM.
+- The backend may use GPU resources up to approximately 24 GB of VRAM.
 - High-performance backends added to the repository must prefer CUDA-accelerated PyTorch or equivalent discrete-GPU execution on the detected NVIDIA workstation GPU when that path is available.
 - High-performance backends added to the repository must propagate the selected GPU into their runtime layer and must surface an explicit fallback or setup error instead of silently dropping to a slower path.
 - The backend must support memory-safe execution options such as tiling.
@@ -179,7 +199,7 @@ The first deliverable must support:
 - Unit tests must cover interpolation request validation, target-fps mapping, frame-count planning, and progress telemetry helpers.
 - Unit and integration tests must cover paused-state telemetry and the transition from running to paused to resumed to terminal job states.
 - Integration and GUI tests must assert that interpolation progress, fps throughput, RAM usage, and GPU usage are surfaced correctly to the user.
-- Synthetic benchmark tests must generate known reference content, degrade it deterministically, upscale it, and compare outputs against the original high-resolution master.
+- Synthetic benchmark tests must generate known reference content, degrade it deterministically, and convert it through the pipeline, comparing outputs against the original high-resolution master.
 
 ## Development And Build Requirements
 

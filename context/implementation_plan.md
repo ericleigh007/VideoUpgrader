@@ -17,7 +17,7 @@ This plan is based on the current baseline in [requirements.md](requirements.md)
 - Automated testing is required, including GUI verification.
 - Progress telemetry must expose phase progress, throughput, ETA, RAM, and GPU usage for long-running jobs.
 - Model artifacts may come from GitHub or Hugging Face and should be locally cached.
-- GPU usage can target up to roughly 12 GB of VRAM.
+- GPU usage can target up to roughly 24 GB of VRAM.
 
 ## Product Recommendation
 

@@ -5,6 +5,7 @@
       "sourcePath": "C:\\eric\\Breakfast at Tiffany's (3⧸9) Movie CLIP - Moon River (1961) HD [uirBWk-qd9A].webm",
       "previewDurationSeconds": 8,
       "previewStartOffsetSeconds": null,
+      "comparisonSignature": null,
       "winnerModelId": "realesrgan-x4plus",
       "candidateModelIds": [
         "realesrgan-x4plus",
@@ -18,6 +19,7 @@
       "sourcePath": "C:\\eric\\Audrey Hepburn Makes Her First Appearance and Johnny Is Nervous ｜ Carson Tonight Show [nXdrhKrdvGc].webm",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": null,
+      "comparisonSignature": null,
       "winnerModelId": "swinir-realworld-x4",
       "candidateModelIds": [
         "swinir-realworld-x4",
@@ -31,6 +33,7 @@
       "sourcePath": "C:\\eric\\Audrey Hepburn Makes Her First Appearance and Johnny Is Nervous ｜ Carson Tonight Show [nXdrhKrdvGc].webm",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": null,
+      "comparisonSignature": null,
       "winnerModelId": "swinir-realworld-x4",
       "candidateModelIds": [
         "swinir-realworld-x4",
@@ -44,6 +47,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": null,
+      "comparisonSignature": null,
       "winnerModelId": "realesrnet-x4plus",
       "candidateModelIds": [
         "realesrnet-x4plus",
@@ -57,6 +61,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": null,
+      "comparisonSignature": null,
       "winnerModelId": "realesrnet-x4plus",
       "candidateModelIds": [
         "realesrnet-x4plus",
@@ -70,6 +75,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": null,
+      "comparisonSignature": null,
       "winnerModelId": "bsrgan-x4",
       "candidateModelIds": [
         "bsrgan-x4",
@@ -83,6 +89,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": null,
+      "comparisonSignature": null,
       "winnerModelId": "swinir-realworld-x4",
       "candidateModelIds": [
         "swinir-realworld-x4",
@@ -96,6 +103,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": null,
+      "comparisonSignature": null,
       "winnerModelId": "realesrgan-x4plus",
       "candidateModelIds": [
         "realesrgan-x4plus",
@@ -109,6 +117,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
       "winnerModelId": "realesrnet-x4plus",
       "candidateModelIds": [
         "realesrnet-x4plus",
@@ -122,6 +131,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
       "winnerModelId": "realesrnet-x4plus",
       "candidateModelIds": [
         "realesrnet-x4plus",
@@ -135,6 +145,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
       "winnerModelId": "swinir-realworld-x4",
       "candidateModelIds": [
         "swinir-realworld-x4",
@@ -148,6 +159,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
       "winnerModelId": "realesrnet-x4plus",
       "candidateModelIds": [
         "realesrnet-x4plus",
@@ -161,6 +173,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
       "winnerModelId": "swinir-realworld-x4",
       "candidateModelIds": [
         "swinir-realworld-x4",
@@ -174,6 +187,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\artifacts\\runtime\\comparison-av-sync.mp4",
       "previewDurationSeconds": 4,
       "previewStartOffsetSeconds": 3.0,
+      "comparisonSignature": null,
       "winnerModelId": "realesrnet-x4plus",
       "candidateModelIds": [
         "realesrnet-x4plus",
@@ -187,6 +201,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\artifacts\\inputs\\av-sync-desktop-smoke.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": 3.2,
+      "comparisonSignature": null,
       "winnerModelId": "realesrnet-x4plus",
       "candidateModelIds": [
         "realesrnet-x4plus",
@@ -200,6 +215,7 @@
       "sourcePath": "C:\\eric\\Breakfast at Tiffany's (3⧸9) Movie CLIP - Moon River (1961) HD [uirBWk-qd9A].webm",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": 38.32360300250208,
+      "comparisonSignature": null,
       "winnerModelId": "swinir-realworld-x4",
       "candidateModelIds": [
         "swinir-realworld-x4",
@@ -212,6 +228,7 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\artifacts\\inputs\\av-sync-desktop-smoke.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": 3.2,
+      "comparisonSignature": null,
       "winnerModelId": "swinir-realworld-x4",
       "candidateModelIds": [
         "swinir-realworld-x4",
@@ -225,12 +242,363 @@
       "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\artifacts\\runtime\\converted-sources\\Star Trek Voyager Season 02 Episode 18 - Deathwish_bd1d1efa2d0795c8.mp4",
       "previewDurationSeconds": 1,
       "previewStartOffsetSeconds": 1797.9149291075896,
+      "comparisonSignature": null,
       "winnerModelId": "realesrgan-x4plus",
       "candidateModelIds": [
         "rvrt-x4",
         "realesrgan-x4plus"
       ],
       "createdAt": "1775947861"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
+      "winnerModelId": "swinir-realworld-x4",
+      "candidateModelIds": [
+        "swinir-realworld-x4",
+        "realesrgan-x4plus",
+        "realesrnet-x4plus",
+        "bsrgan-x4"
+      ],
+      "createdAt": "1776524235"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
+      "winnerModelId": "realesrnet-x4plus",
+      "candidateModelIds": [
+        "realesrnet-x4plus",
+        "swinir-realworld-x4",
+        "bsrgan-x4",
+        "realesrgan-x4plus"
+      ],
+      "createdAt": "1776535851"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
+      "winnerModelId": "deoldify-video",
+      "candidateModelIds": [
+        "deoldify-video",
+        "ddcolor-modelscope",
+        "deoldify-stable",
+        "ddcolor-paper"
+      ],
+      "createdAt": "1776538402"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
+      "winnerModelId": "realesrnet-x4plus",
+      "candidateModelIds": [
+        "realesrnet-x4plus",
+        "bsrgan-x4",
+        "realesrgan-x4plus",
+        "swinir-realworld-x4"
+      ],
+      "createdAt": "1776539757"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
+      "winnerModelId": "realesrgan-x4plus",
+      "candidateModelIds": [
+        "realesrgan-x4plus",
+        "swinir-realworld-x4",
+        "bsrgan-x4",
+        "realesrnet-x4plus"
+      ],
+      "createdAt": "1776540252"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
+      "winnerModelId": "ddcolor-paper",
+      "candidateModelIds": [
+        "ddcolor-paper",
+        "deoldify-stable",
+        "deoldify-video",
+        "ddcolor-modelscope"
+      ],
+      "createdAt": "1776540317"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
+      "winnerModelId": "deoldify-video",
+      "candidateModelIds": [
+        "deoldify-video",
+        "ddcolor-modelscope",
+        "deoldify-stable",
+        "ddcolor-paper"
+      ],
+      "createdAt": "1776540385"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
+      "winnerModelId": "bsrgan-x4",
+      "candidateModelIds": [
+        "bsrgan-x4",
+        "swinir-realworld-x4",
+        "realesrnet-x4plus",
+        "realesrgan-x4plus"
+      ],
+      "createdAt": "1776540558"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
+      "winnerModelId": "realesrgan-x4plus",
+      "candidateModelIds": [
+        "realesrgan-x4plus",
+        "bsrgan-x4",
+        "realesrnet-x4plus",
+        "swinir-realworld-x4"
+      ],
+      "createdAt": "1776540781"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": null,
+      "winnerModelId": "ddcolor-modelscope",
+      "candidateModelIds": [
+        "ddcolor-modelscope",
+        "deoldify-video",
+        "deoldify-stable",
+        "ddcolor-paper"
+      ],
+      "createdAt": "1776541070"
+    },
+    {
+      "sourcePath": "C:\\eric\\Somewhere Over the Rainbow - The Wizard of Oz (1⧸8) Movie CLIP (1939) HD [PSZxmZmBfnU].webm",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 100.83402835696414,
+      "comparisonSignature": null,
+      "winnerModelId": "deoldify-video",
+      "candidateModelIds": [
+        "deoldify-video",
+        "ddcolor-paper",
+        "deoldify-stable",
+        "ddcolor-modelscope"
+      ],
+      "createdAt": "1776541437"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"off\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"bsrgan-x4\",\"realesrgan-x4plus\",\"realesrnet-x4plus\",\"swinir-realworld-x4\"],\"colorizationContext\":null}",
+      "winnerModelId": "bsrgan-x4",
+      "candidateModelIds": [
+        "bsrgan-x4",
+        "realesrgan-x4plus",
+        "realesrnet-x4plus",
+        "swinir-realworld-x4"
+      ],
+      "createdAt": "1776551587"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"colorizeOnly\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"ddcolor-modelscope\",\"ddcolor-paper\",\"deoldify-stable\",\"deoldify-video\"],\"colorizationContext\":null}",
+      "winnerModelId": "deoldify-video",
+      "candidateModelIds": [
+        "deoldify-video",
+        "deoldify-stable",
+        "ddcolor-paper",
+        "ddcolor-modelscope"
+      ],
+      "createdAt": "1776551802"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"off\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"bsrgan-x4\",\"realesrgan-x4plus\",\"realesrnet-x4plus\",\"swinir-realworld-x4\"],\"colorizationContext\":null}",
+      "winnerModelId": "swinir-realworld-x4",
+      "candidateModelIds": [
+        "swinir-realworld-x4",
+        "bsrgan-x4",
+        "realesrnet-x4plus",
+        "realesrgan-x4plus"
+      ],
+      "createdAt": "1776552186"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"off\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"bsrgan-x4\",\"realesrgan-x4plus\",\"realesrnet-x4plus\",\"swinir-realworld-x4\"],\"colorizationContext\":null}",
+      "winnerModelId": "realesrnet-x4plus",
+      "candidateModelIds": [
+        "realesrnet-x4plus",
+        "realesrgan-x4plus",
+        "swinir-realworld-x4",
+        "bsrgan-x4"
+      ],
+      "createdAt": "1776552384"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"colorizeOnly\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"ddcolor-modelscope\",\"ddcolor-paper\",\"deoldify-stable\",\"deoldify-video\"],\"colorizationContext\":null}",
+      "winnerModelId": "ddcolor-modelscope",
+      "candidateModelIds": [
+        "ddcolor-modelscope",
+        "deoldify-stable",
+        "deoldify-video",
+        "ddcolor-paper"
+      ],
+      "createdAt": "1776552473"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"beforeUpscale\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrnet-x4plus\",\"candidateModelIds\":[\"ddcolor-modelscope\",\"ddcolor-paper\",\"deoldify-stable\",\"deoldify-video\"],\"colorizationContext\":null}",
+      "winnerModelId": "ddcolor-paper",
+      "candidateModelIds": [
+        "ddcolor-paper",
+        "deoldify-video",
+        "deoldify-stable",
+        "ddcolor-modelscope"
+      ],
+      "createdAt": "1776552839"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"off\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"bsrgan-x4\",\"realesrgan-x4plus\",\"realesrnet-x4plus\",\"swinir-realworld-x4\"],\"colorizationContext\":null}",
+      "winnerModelId": "realesrgan-x4plus",
+      "candidateModelIds": [
+        "realesrgan-x4plus",
+        "realesrnet-x4plus",
+        "bsrgan-x4",
+        "swinir-realworld-x4"
+      ],
+      "createdAt": "1776553048"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"colorizeOnly\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"ddcolor-modelscope\",\"ddcolor-paper\",\"deoldify-stable\",\"deoldify-video\"],\"colorizationContext\":null}",
+      "winnerModelId": "ddcolor-modelscope",
+      "candidateModelIds": [
+        "ddcolor-modelscope",
+        "ddcolor-paper",
+        "deoldify-video",
+        "deoldify-stable"
+      ],
+      "createdAt": "1776553137"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"beforeUpscale\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrnet-x4plus\",\"candidateModelIds\":[\"ddcolor-modelscope\",\"ddcolor-paper\",\"deoldify-stable\",\"deoldify-video\"],\"colorizationContext\":null}",
+      "winnerModelId": "ddcolor-paper",
+      "candidateModelIds": [
+        "ddcolor-paper",
+        "ddcolor-modelscope",
+        "deoldify-video",
+        "deoldify-stable"
+      ],
+      "createdAt": "1776553310"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"off\",\"interpolationMode\":\"afterUpscale\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"bsrgan-x4\",\"realesrgan-x4plus\",\"realesrnet-x4plus\",\"swinir-realworld-x4\"],\"colorizationContext\":null}",
+      "winnerModelId": "realesrgan-x4plus",
+      "candidateModelIds": [
+        "realesrgan-x4plus",
+        "realesrnet-x4plus",
+        "bsrgan-x4",
+        "swinir-realworld-x4"
+      ],
+      "createdAt": "1776553848"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"off\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"bsrgan-x4\",\"realesrgan-x4plus\",\"realesrnet-x4plus\",\"swinir-realworld-x4\"],\"colorizationContext\":null}",
+      "winnerModelId": "swinir-realworld-x4",
+      "candidateModelIds": [
+        "swinir-realworld-x4",
+        "realesrnet-x4plus",
+        "bsrgan-x4",
+        "realesrgan-x4plus"
+      ],
+      "createdAt": "1776554195"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"colorizeOnly\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"ddcolor-modelscope\",\"ddcolor-paper\",\"deoldify-stable\",\"deoldify-video\"],\"colorizationContext\":null}",
+      "winnerModelId": "ddcolor-paper",
+      "candidateModelIds": [
+        "ddcolor-paper",
+        "ddcolor-modelscope",
+        "deoldify-stable",
+        "deoldify-video"
+      ],
+      "createdAt": "1776554292"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"beforeUpscale\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrnet-x4plus\",\"candidateModelIds\":[\"ddcolor-modelscope\",\"ddcolor-paper\",\"deoldify-stable\",\"deoldify-video\"],\"colorizationContext\":null}",
+      "winnerModelId": "ddcolor-paper",
+      "candidateModelIds": [
+        "ddcolor-paper",
+        "ddcolor-modelscope",
+        "deoldify-video",
+        "deoldify-stable"
+      ],
+      "createdAt": "1776554465"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"off\",\"interpolationMode\":\"afterUpscale\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"bsrgan-x4\",\"realesrgan-x4plus\",\"realesrnet-x4plus\",\"swinir-realworld-x4\"],\"colorizationContext\":null}",
+      "winnerModelId": "realesrgan-x4plus",
+      "candidateModelIds": [
+        "realesrgan-x4plus",
+        "realesrnet-x4plus",
+        "swinir-realworld-x4",
+        "bsrgan-x4"
+      ],
+      "createdAt": "1776554569"
     }
   ]
 }

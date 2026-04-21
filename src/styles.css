@@ -1040,6 +1040,89 @@ input {
   padding-top: 4px;
 }
 
+.color-context-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgba(116, 49, 24, 0.12);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.58);
+}
+
+.color-context-panel-header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.color-context-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.color-context-library-card {
+  display: grid;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(255, 247, 242, 0.82);
+  border: 1px solid rgba(176, 74, 47, 0.14);
+}
+
+.color-context-library-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--ink-muted);
+}
+
+.color-context-path {
+  word-break: break-all;
+}
+
+.color-context-entry-list {
+  display: grid;
+  gap: 8px;
+}
+
+.color-context-entry {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(116, 49, 24, 0.08);
+}
+
+.color-context-entry-selected {
+  border-color: rgba(176, 74, 47, 0.32);
+  background: rgba(255, 243, 236, 0.95);
+}
+
+.color-context-entry-copy {
+  display: grid;
+  gap: 2px;
+  cursor: pointer;
+}
+
+.color-context-entry-copy span {
+  font-size: 12px;
+  color: var(--ink-muted);
+  word-break: break-all;
+}
+
+.color-context-entry-delete-button {
+  align-self: center;
+  white-space: nowrap;
+}
+
 .pipeline-stage-body-muted {
   padding: 4px 0 0;
 }

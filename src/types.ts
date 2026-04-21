@@ -16,6 +16,12 @@ export type PytorchRunner = "torch" | "tensorrt";
 
 export type InterpolationMode = "off" | "afterUpscale" | "interpolateOnly";
 
+export type ColorizationMode = "off" | "colorizeOnly" | "beforeUpscale";
+
+export type ColorizationContextKind = "referenceImages";
+
+export type DeepRemasterProcessingMode = "standard" | "high";
+
 export type InterpolationTargetFps = 30 | 60;
 
 export type GpuKind = "discrete" | "integrated" | "unknown";
@@ -69,10 +75,37 @@ export interface ModelRating {
   updatedAt: string;
 }
 
+export interface SourceContextLibraryEntry {
+  entryId: string;
+  fileName: string;
+  relativePath: string;
+  absolutePath: string;
+  sizeBytes: number;
+  createdAt: string;
+}
+
+export interface SourceContextLibrary {
+  libraryId: string;
+  sourcePath: string;
+  sourceFileName: string;
+  sourceFingerprint: string;
+  folderPath: string;
+  refsPath: string;
+  createdAt: string;
+  entries: SourceContextLibraryEntry[];
+}
+
+export interface SelectedColorizationContext {
+  libraryId: string;
+  selectedEntryIds: string[];
+  referenceImagePaths: string[];
+}
+
 export interface BlindComparisonRecord {
   sourcePath: string;
   previewDurationSeconds: number;
   previewStartOffsetSeconds?: number | null;
+  comparisonSignature?: string | null;
   winnerModelId: ModelId;
   candidateModelIds: ModelId[];
   createdAt: string;
@@ -87,6 +120,7 @@ export interface BlindComparisonSelectionInput {
   sourcePath: string;
   previewDurationSeconds: number;
   previewStartOffsetSeconds?: number | null;
+  comparisonSignature?: string | null;
   winnerModelId: ModelId;
   candidateModelIds: ModelId[];
 }
@@ -107,6 +141,10 @@ export interface OutputSizingOptions {
 export interface RealesrganJobRequest extends OutputSizingOptions {
   sourcePath: string;
   modelId: ModelId;
+  colorizationMode: ColorizationMode;
+  colorizerModelId: ModelId | null;
+  colorizationContext: SelectedColorizationContext | null;
+  deepremasterProcessingMode: DeepRemasterProcessingMode;
   outputMode: OutputMode;
   qualityPreset: QualityPreset;
   interpolationMode: InterpolationMode;
@@ -125,7 +163,7 @@ export interface RealesrganJobRequest extends OutputSizingOptions {
   crf: number;
 }
 
-export type PipelinePhase = "queued" | "paused" | "extracting" | "upscaling" | "interpolating" | "encoding" | "remuxing" | "completed" | "failed";
+export type PipelinePhase = "queued" | "paused" | "extracting" | "colorizing" | "upscaling" | "interpolating" | "encoding" | "remuxing" | "completed" | "failed";
 
 export interface PipelineProgress {
   phase: PipelinePhase;
@@ -134,6 +172,7 @@ export interface PipelineProgress {
   processedFrames: number;
   totalFrames: number;
   extractedFrames: number;
+  colorizedFrames: number;
   upscaledFrames: number;
   interpolatedFrames: number;
   encodedFrames: number;
@@ -154,6 +193,7 @@ export interface PipelineProgress {
   scratchSizeBytes?: number | null;
   outputSizeBytes?: number | null;
   extractStageSeconds?: number | null;
+  colorizeStageSeconds?: number | null;
   upscaleStageSeconds?: number | null;
   interpolateStageSeconds?: number | null;
   encodeStageSeconds?: number | null;
@@ -203,6 +243,7 @@ export interface PipelineEffectiveSettings {
 
 export interface PipelineStageTimings {
   extractSeconds: number;
+  colorizeSeconds: number;
   upscaleSeconds: number;
   interpolateSeconds: number;
   encodeSeconds: number;
@@ -327,9 +368,13 @@ export interface SourceConversionJobStatus {
 
 export interface DesktopApi {
   selectVideoFile(): Promise<string | null>;
+  selectContextFiles(): Promise<string[]>;
   selectOutputFile(defaultPath: string, container: OutputContainer): Promise<string | null>;
   ensureRuntimeAssets(): Promise<RuntimeStatus>;
   probeSourceVideo(sourcePath: string): Promise<SourceVideoSummary>;
+  getSourceContextLibrary(sourcePath: string): Promise<SourceContextLibrary | null>;
+  importSourceContextFiles(sourcePath: string, importPaths: string[]): Promise<SourceContextLibrary>;
+  removeSourceContextEntry(sourcePath: string, entryId: string): Promise<SourceContextLibrary>;
   startSourceConversionToMp4(sourcePath: string): Promise<string>;
   getSourceConversionJob(jobId: string): Promise<SourceConversionJobStatus>;
   pauseSourceConversionJob(jobId: string): Promise<void>;

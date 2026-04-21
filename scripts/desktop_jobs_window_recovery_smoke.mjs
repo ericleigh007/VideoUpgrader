@@ -489,6 +489,8 @@ async function main() {
       const state = await page.evaluate(() => window.__UPSCALER_DESKTOP_TEST__.readState());
       return state.lifecycle;
     }, { timeout: 10000 }).toBe('interrupted');
+    await jobsPage.reload({ waitUntil: 'domcontentloaded' });
+    await jobsPage.waitForLoadState('domcontentloaded');
     await expect(jobsPage.getByTestId('cleanup-job-desktop-running-job')).toContainText('Desktop Interrupted Job', { timeout: 10000 });
     await expect(jobsPage.getByTestId('cleanup-row-restart-desktop-running-job')).toBeVisible();
     await jobsPage.getByTestId('cleanup-row-restart-desktop-running-job').click();

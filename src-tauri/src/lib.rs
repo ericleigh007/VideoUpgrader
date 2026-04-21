@@ -12,11 +12,20 @@ use sysinfo::{ProcessesToUpdate, System};
 
 const DIRECTORY_STATS_CACHE_TTL_MS: u128 = 5_000;
 
+fn default_deepremaster_processing_mode() -> String {
+    "standard".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RealesrganJobRequest {
     source_path: String,
     model_id: String,
+    colorization_mode: String,
+    colorizer_model_id: Option<String>,
+    colorization_context: Option<SelectedColorizationContext>,
+    #[serde(default = "default_deepremaster_processing_mode")]
+    deepremaster_processing_mode: String,
     output_mode: String,
     quality_preset: String,
     interpolation_mode: String,
@@ -43,6 +52,14 @@ struct RealesrganJobRequest {
     tile_size: u32,
     fp16: bool,
     crf: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectedColorizationContext {
+    library_id: String,
+    selected_entry_ids: Vec<String>,
+    reference_image_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,10 +98,17 @@ struct PipelineEffectiveSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PipelineStageTimings {
+    #[serde(default)]
     extract_seconds: f64,
+    #[serde(default)]
+    colorize_seconds: f64,
+    #[serde(default)]
     upscale_seconds: f64,
+    #[serde(default)]
     interpolate_seconds: f64,
+    #[serde(default)]
     encode_seconds: f64,
+    #[serde(default)]
     remux_seconds: f64,
 }
 
@@ -153,6 +177,7 @@ struct BlindComparisonRecord {
     source_path: String,
     preview_duration_seconds: u32,
     preview_start_offset_seconds: Option<f64>,
+    comparison_signature: Option<String>,
     winner_model_id: String,
     candidate_model_ids: Vec<String>,
     created_at: String,
@@ -171,8 +196,42 @@ struct BlindComparisonSelectionInput {
     source_path: String,
     preview_duration_seconds: u32,
     preview_start_offset_seconds: Option<f64>,
+    comparison_signature: Option<String>,
     winner_model_id: String,
     candidate_model_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceContextManifest {
+    source_path: String,
+    source_file_name: String,
+    source_fingerprint: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceContextLibraryEntry {
+    entry_id: String,
+    file_name: String,
+    relative_path: String,
+    absolute_path: String,
+    size_bytes: u64,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceContextLibrary {
+    library_id: String,
+    source_path: String,
+    source_file_name: String,
+    source_fingerprint: String,
+    folder_path: String,
+    refs_path: String,
+    created_at: String,
+    entries: Vec<SourceContextLibraryEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +335,8 @@ struct PipelineProgress {
     processed_frames: usize,
     total_frames: usize,
     extracted_frames: usize,
+    #[serde(default)]
+    colorized_frames: usize,
     upscaled_frames: usize,
     #[serde(default)]
     interpolated_frames: usize,
@@ -313,6 +374,8 @@ struct PipelineProgress {
     output_size_bytes: Option<u64>,
     #[serde(default)]
     extract_stage_seconds: Option<f64>,
+    #[serde(default)]
+    colorize_stage_seconds: Option<f64>,
     #[serde(default)]
     upscale_stage_seconds: Option<f64>,
     #[serde(default)]
@@ -516,6 +579,249 @@ fn app_config_path() -> PathBuf {
     repo_root().join("config").join("model_preferences.json")
 }
 
+fn context_libraries_root() -> PathBuf {
+    repo_root().join("artifacts").join("context-libraries")
+}
+
+fn normalize_source_identity(source_path: &str) -> String {
+    source_path.trim().replace('\\', "/").to_lowercase()
+}
+
+fn sanitize_name_component(value: &str, fallback: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| if character.is_ascii_alphanumeric() { character.to_ascii_lowercase() } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+
+    if sanitized.is_empty() {
+        fallback.to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn source_context_fingerprint(source_path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(normalize_source_identity(source_path).as_bytes());
+    format!("{:x}", hasher.finalize())[..8].to_string()
+}
+
+fn source_context_library_id(source_path: &str) -> String {
+    let source_name = Path::new(source_path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("source");
+    format!(
+        "{}__{}",
+        sanitize_name_component(source_name, "source"),
+        source_context_fingerprint(source_path)
+    )
+}
+
+fn source_context_library_dir(source_path: &str) -> PathBuf {
+    context_libraries_root().join(source_context_library_id(source_path))
+}
+
+fn source_context_manifest_path(source_path: &str) -> PathBuf {
+    source_context_library_dir(source_path).join("source.json")
+}
+
+fn source_context_refs_dir(source_path: &str) -> PathBuf {
+    source_context_library_dir(source_path).join("refs")
+}
+
+fn source_context_entry_id(relative_path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(relative_path.replace('\\', "/").to_lowercase().as_bytes());
+    format!("{:x}", hasher.finalize())[..12].to_string()
+}
+
+fn read_source_context_manifest(source_path: &str) -> Result<Option<SourceContextManifest>, String> {
+    let manifest_path = source_context_manifest_path(source_path);
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("Failed to read source context manifest at {}: {error}", manifest_path.display()))?;
+    let manifest = serde_json::from_str::<SourceContextManifest>(&content)
+        .map_err(|error| format!("Failed to parse source context manifest at {}: {error}", manifest_path.display()))?;
+    Ok(Some(manifest))
+}
+
+fn ensure_source_context_manifest(source_path: &str) -> Result<SourceContextManifest, String> {
+    if let Some(existing) = read_source_context_manifest(source_path)? {
+        return Ok(existing);
+    }
+
+    let manifest = SourceContextManifest {
+        source_path: source_path.to_string(),
+        source_file_name: Path::new(source_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("source")
+            .to_string(),
+        source_fingerprint: source_context_fingerprint(source_path),
+        created_at: timestamp_string(),
+    };
+    let manifest_path = source_context_manifest_path(source_path);
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create source context directory {}: {error}", parent.display()))?;
+    }
+    let payload = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| format!("Failed to serialize source context manifest: {error}"))?;
+    fs::write(&manifest_path, payload)
+        .map_err(|error| format!("Failed to write source context manifest at {}: {error}", manifest_path.display()))?;
+    Ok(manifest)
+}
+
+fn context_library_entry_from_path(base_dir: &Path, entry_path: &Path) -> Result<SourceContextLibraryEntry, String> {
+    let metadata = fs::metadata(entry_path)
+        .map_err(|error| format!("Failed to inspect source context entry {}: {error}", entry_path.display()))?;
+    let relative_path = entry_path
+        .strip_prefix(base_dir)
+        .map_err(|error| format!("Failed to resolve relative source context path {}: {error}", entry_path.display()))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    Ok(SourceContextLibraryEntry {
+        entry_id: source_context_entry_id(&relative_path),
+        file_name: entry_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        relative_path,
+        absolute_path: entry_path.display().to_string(),
+        size_bytes: metadata.len(),
+        created_at: metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_secs().to_string())
+            .unwrap_or_else(timestamp_string),
+    })
+}
+
+fn load_source_context_library_internal(source_path: &str) -> Result<Option<SourceContextLibrary>, String> {
+    let Some(manifest) = read_source_context_manifest(source_path)? else {
+        return Ok(None);
+    };
+
+    let library_dir = source_context_library_dir(source_path);
+    let refs_dir = source_context_refs_dir(source_path);
+    let mut entries = if refs_dir.exists() {
+        fs::read_dir(&refs_dir)
+            .map_err(|error| format!("Failed to read source context directory {}: {error}", refs_dir.display()))?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.is_file() {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .map(|path| context_library_entry_from_path(&library_dir, &path))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    entries.sort_by(|left, right| left.file_name.to_lowercase().cmp(&right.file_name.to_lowercase()));
+
+    Ok(Some(SourceContextLibrary {
+        library_id: source_context_library_id(source_path),
+        source_path: manifest.source_path,
+        source_file_name: manifest.source_file_name,
+        source_fingerprint: manifest.source_fingerprint,
+        folder_path: library_dir.display().to_string(),
+        refs_path: refs_dir.display().to_string(),
+        created_at: manifest.created_at,
+        entries,
+    }))
+}
+
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("Failed to read file {} for hashing: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn find_existing_context_entry_by_hash(refs_dir: &Path, source_file: &Path) -> Result<Option<PathBuf>, String> {
+    if !refs_dir.exists() {
+        return Ok(None);
+    }
+
+    let source_hash = file_sha256(source_file)?;
+    for entry in fs::read_dir(refs_dir)
+        .map_err(|error| format!("Failed to read source context directory {}: {error}", refs_dir.display()))?
+    {
+        let entry = entry.map_err(|error| format!("Failed to inspect source context entry in {}: {error}", refs_dir.display()))?;
+        let entry_path = entry.path();
+        if !entry_path.is_file() {
+            continue;
+        }
+
+        if file_sha256(&entry_path)? == source_hash {
+            return Ok(Some(entry_path));
+        }
+    }
+
+    Ok(None)
+}
+
+fn source_context_entry_path(source_path: &str, entry_id: &str) -> Result<Option<PathBuf>, String> {
+    let library_dir = source_context_library_dir(source_path);
+    let refs_dir = source_context_refs_dir(source_path);
+    if !refs_dir.exists() {
+        return Ok(None);
+    }
+
+    for entry in fs::read_dir(&refs_dir)
+        .map_err(|error| format!("Failed to read source context directory {}: {error}", refs_dir.display()))?
+    {
+        let entry = entry.map_err(|error| format!("Failed to inspect source context entry in {}: {error}", refs_dir.display()))?;
+        let entry_path = entry.path();
+        if !entry_path.is_file() {
+            continue;
+        }
+
+        let context_entry = context_library_entry_from_path(&library_dir, &entry_path)?;
+        if context_entry.entry_id == entry_id {
+            return Ok(Some(entry_path));
+        }
+    }
+
+    Ok(None)
+}
+
+fn dedupe_destination_path(target_dir: &Path, source_name: &str) -> PathBuf {
+    let source_path = Path::new(source_name);
+    let stem = source_path.file_stem().and_then(|value| value.to_str()).unwrap_or("context");
+    let extension = source_path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let sanitized_stem = sanitize_name_component(stem, "context");
+    let sanitized_extension = sanitize_name_component(extension, "");
+    let mut candidate = if sanitized_extension.is_empty() {
+        target_dir.join(&sanitized_stem)
+    } else {
+        target_dir.join(format!("{sanitized_stem}.{sanitized_extension}"))
+    };
+    let mut index = 2;
+    while candidate.exists() {
+        candidate = if sanitized_extension.is_empty() {
+            target_dir.join(format!("{sanitized_stem}_{index}"))
+        } else {
+            target_dir.join(format!("{sanitized_stem}_{index}.{sanitized_extension}"))
+        };
+        index += 1;
+    }
+    candidate
+}
+
 fn timestamp_string() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -582,6 +888,18 @@ fn build_cache_key(request: &RealesrganJobRequest) -> String {
     let mut hasher = Sha256::new();
     hasher.update(request.source_path.as_bytes());
     hasher.update(request.model_id.as_bytes());
+    hasher.update(request.colorization_mode.as_bytes());
+    hasher.update(request.colorizer_model_id.as_deref().unwrap_or_default().as_bytes());
+    hasher.update(request.deepremaster_processing_mode.as_bytes());
+    if let Some(colorization_context) = &request.colorization_context {
+        hasher.update(colorization_context.library_id.as_bytes());
+        for entry_id in &colorization_context.selected_entry_ids {
+            hasher.update(entry_id.as_bytes());
+        }
+        for reference_image_path in &colorization_context.reference_image_paths {
+            hasher.update(reference_image_path.as_bytes());
+        }
+    }
     hasher.update(request.output_mode.as_bytes());
     hasher.update(request.quality_preset.as_bytes());
     hasher.update(request.interpolation_mode.as_bytes());
@@ -630,6 +948,7 @@ fn default_progress(phase: &str, percent: u32, message: &str) -> PipelineProgres
         total_frames: 0,
         extracted_frames: 0,
         upscaled_frames: 0,
+        colorized_frames: 0,
         interpolated_frames: 0,
         encoded_frames: 0,
         remuxed_frames: 0,
@@ -649,6 +968,7 @@ fn default_progress(phase: &str, percent: u32, message: &str) -> PipelineProgres
         scratch_size_bytes: None,
         output_size_bytes: None,
         extract_stage_seconds: None,
+        colorize_stage_seconds: None,
         upscale_stage_seconds: None,
         interpolate_stage_seconds: None,
         encode_stage_seconds: None,
@@ -1290,6 +1610,8 @@ fn prepare_realesrgan_job(request: RealesrganJobRequest) -> RealesrganJobPlan {
         request.source_path.clone(),
         "--model-id".to_string(),
         request.model_id.clone(),
+        "--colorization-mode".to_string(),
+        request.colorization_mode.clone(),
         "--output-mode".to_string(),
         request.output_mode.clone(),
         "--preset".to_string(),
@@ -1315,6 +1637,23 @@ fn prepare_realesrgan_job(request: RealesrganJobRequest) -> RealesrganJobPlan {
         "--crf".to_string(),
         request.crf.to_string(),
     ];
+
+    if let Some(colorizer_model_id) = &request.colorizer_model_id {
+        command.push("--colorizer-model-id".to_string());
+        command.push(colorizer_model_id.clone());
+    }
+
+    command.push("--deepremaster-processing-mode".to_string());
+    command.push(request.deepremaster_processing_mode.clone());
+
+    if let Some(colorization_context) = &request.colorization_context {
+        command.push("--color-context-library-id".to_string());
+        command.push(colorization_context.library_id.clone());
+        for reference_image_path in &colorization_context.reference_image_paths {
+            command.push("--color-reference-image".to_string());
+            command.push(reference_image_path.clone());
+        }
+    }
 
     if let Some(custom_aspect_width) = request.custom_aspect_width {
         command.push("--custom-aspect-width".to_string());
@@ -1491,6 +1830,7 @@ fn start_source_conversion_to_mp4(state: tauri::State<AppState>, source_path: St
                                 processed_frames: 0,
                                 total_frames: 0,
                                 extracted_frames: 0,
+                                colorized_frames: 0,
                                 upscaled_frames: 0,
                                 interpolated_frames: 0,
                                 encoded_frames: 0,
@@ -1511,6 +1851,7 @@ fn start_source_conversion_to_mp4(state: tauri::State<AppState>, source_path: St
                                 scratch_size_bytes: None,
                                 output_size_bytes: None,
                                 extract_stage_seconds: None,
+                                colorize_stage_seconds: None,
                                 upscale_stage_seconds: None,
                                 interpolate_stage_seconds: None,
                                 encode_stage_seconds: None,
@@ -1690,12 +2031,71 @@ fn record_blind_comparison_selection(selection: BlindComparisonSelectionInput) -
         source_path: selection.source_path,
         preview_duration_seconds: selection.preview_duration_seconds,
         preview_start_offset_seconds: selection.preview_start_offset_seconds,
+        comparison_signature: selection.comparison_signature,
         winner_model_id: selection.winner_model_id,
         candidate_model_ids: selection.candidate_model_ids,
         created_at: timestamp_string(),
     });
     write_app_config(&config)?;
     Ok(config)
+}
+
+#[tauri::command]
+fn get_source_context_library(source_path: String) -> Result<Option<SourceContextLibrary>, String> {
+    load_source_context_library_internal(&source_path)
+}
+
+#[tauri::command]
+fn import_source_context_files(source_path: String, import_paths: Vec<String>) -> Result<SourceContextLibrary, String> {
+    if import_paths.is_empty() {
+        return Err("Select at least one context image to import".to_string());
+    }
+
+    ensure_source_context_manifest(&source_path)?;
+    let refs_dir = source_context_refs_dir(&source_path);
+    fs::create_dir_all(&refs_dir)
+        .map_err(|error| format!("Failed to create source context refs directory {}: {error}", refs_dir.display()))?;
+
+    for import_path in import_paths {
+        let source_file = PathBuf::from(&import_path);
+        if !source_file.is_file() {
+            return Err(format!("Context import path is not a file: {}", source_file.display()));
+        }
+
+        if find_existing_context_entry_by_hash(&refs_dir, &source_file)?.is_some() {
+            continue;
+        }
+
+        let destination = dedupe_destination_path(
+            &refs_dir,
+            source_file.file_name().and_then(|value| value.to_str()).unwrap_or("context"),
+        );
+        fs::copy(&source_file, &destination).map_err(|error| {
+            format!(
+                "Failed to copy context image from {} to {}: {error}",
+                source_file.display(),
+                destination.display()
+            )
+        })?;
+    }
+
+    load_source_context_library_internal(&source_path)?
+        .ok_or_else(|| "Imported context library could not be loaded".to_string())
+}
+
+#[tauri::command]
+fn remove_source_context_entry(source_path: String, entry_id: String) -> Result<SourceContextLibrary, String> {
+    if entry_id.trim().is_empty() {
+        return Err("Source context entry id cannot be empty".to_string());
+    }
+
+    let entry_path = source_context_entry_path(&source_path, &entry_id)?
+        .ok_or_else(|| format!("Source context entry '{entry_id}' was not found"))?;
+    fs::remove_file(&entry_path)
+        .map_err(|error| format!("Failed to remove source context entry {}: {error}", entry_path.display()))?;
+
+    load_source_context_library_internal(&source_path)?
+        .ok_or_else(|| "Updated context library could not be loaded after deletion".to_string())
 }
 
 #[tauri::command]
@@ -1752,6 +2152,8 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
         request.source_path.clone(),
         "--model-id".to_string(),
         request.model_id.clone(),
+        "--colorization-mode".to_string(),
+        request.colorization_mode.clone(),
         "--output-mode".to_string(),
         request.output_mode.clone(),
         "--preset".to_string(),
@@ -1816,6 +2218,23 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
     if let Some(crop_height) = request.crop_height {
         owned_args.push("--crop-height".to_string());
         owned_args.push(crop_height.to_string());
+    }
+
+    if let Some(colorizer_model_id) = &request.colorizer_model_id {
+        owned_args.push("--colorizer-model-id".to_string());
+        owned_args.push(colorizer_model_id.clone());
+    }
+
+    owned_args.push("--deepremaster-processing-mode".to_string());
+    owned_args.push(request.deepremaster_processing_mode.clone());
+
+    if let Some(colorization_context) = &request.colorization_context {
+        owned_args.push("--color-context-library-id".to_string());
+        owned_args.push(colorization_context.library_id.clone());
+        for reference_image_path in &colorization_context.reference_image_paths {
+            owned_args.push("--color-reference-image".to_string());
+            owned_args.push(reference_image_path.clone());
+        }
     }
 
     owned_args.push("--job-id".to_string());
@@ -1897,6 +2316,7 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
                                 processed_frames: 0,
                                 total_frames: 0,
                                 extracted_frames: 0,
+                                colorized_frames: 0,
                                 upscaled_frames: 0,
                                 interpolated_frames: 0,
                                 encoded_frames: 0,
@@ -1917,6 +2337,7 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
                                 scratch_size_bytes: None,
                                 output_size_bytes: None,
                                 extract_stage_seconds: None,
+                                colorize_stage_seconds: None,
                                 upscale_stage_seconds: None,
                                 interpolate_stage_seconds: None,
                                 encode_stage_seconds: None,
@@ -2135,6 +2556,9 @@ pub fn run() {
             get_app_config,
             save_model_rating,
             record_blind_comparison_selection,
+            get_source_context_library,
+            import_source_context_files,
+            remove_source_context_entry,
             start_realesrgan_pipeline,
             get_realesrgan_pipeline_job,
             cancel_realesrgan_pipeline_job,
@@ -2154,11 +2578,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     fn sample_request() -> RealesrganJobRequest {
         RealesrganJobRequest {
             source_path: "C:/fixtures/input.mp4".to_string(),
             model_id: "realesrgan-x4plus".to_string(),
+            colorization_mode: "off".to_string(),
+            colorizer_model_id: None,
+            colorization_context: None,
+            deepremaster_processing_mode: "standard".to_string(),
             output_mode: "preserveAspect4k".to_string(),
             quality_preset: "qualityBalanced".to_string(),
             interpolation_mode: "off".to_string(),
@@ -2177,6 +2606,7 @@ mod tests {
             crop_height: None,
             preview_mode: false,
             preview_duration_seconds: None,
+            preview_start_offset_seconds: None,
             segment_duration_seconds: Some(10.0),
             output_path: "C:/exports/output.mp4".to_string(),
             codec: "h264".to_string(),
@@ -2218,6 +2648,7 @@ mod tests {
             processed_frames: 2396,
             total_frames: 28491,
             extracted_frames: 2396,
+            colorized_frames: 0,
             upscaled_frames: 0,
             interpolated_frames: 0,
             encoded_frames: 0,
@@ -2238,6 +2669,7 @@ mod tests {
             scratch_size_bytes: None,
             output_size_bytes: None,
             extract_stage_seconds: None,
+            colorize_stage_seconds: None,
             upscale_stage_seconds: None,
             interpolate_stage_seconds: None,
             encode_stage_seconds: None,
@@ -2261,6 +2693,7 @@ mod tests {
             processed_frames: 256,
             total_frames: 28491,
             extracted_frames: 599,
+            colorized_frames: 0,
             upscaled_frames: 256,
             interpolated_frames: 0,
             encoded_frames: 0,
@@ -2281,6 +2714,7 @@ mod tests {
             scratch_size_bytes: None,
             output_size_bytes: None,
             extract_stage_seconds: None,
+            colorize_stage_seconds: None,
             upscale_stage_seconds: None,
             interpolate_stage_seconds: None,
             encode_stage_seconds: None,
@@ -2350,6 +2784,7 @@ mod tests {
                 processed_frames: 0,
                 total_frames: 0,
                 extracted_frames: 0,
+                colorized_frames: 0,
                 upscaled_frames: 0,
                 interpolated_frames: 0,
                 encoded_frames: 0,
@@ -2370,6 +2805,7 @@ mod tests {
                 scratch_size_bytes: None,
                 output_size_bytes: None,
                 extract_stage_seconds: None,
+                colorize_stage_seconds: None,
                 upscale_stage_seconds: None,
                 interpolate_stage_seconds: None,
                 encode_stage_seconds: None,
@@ -2390,5 +2826,112 @@ mod tests {
         assert_eq!(summary.progress.phase, "upscaling");
         assert_eq!(summary.progress.percent, 99);
         assert!(summary.progress.message.contains("Recovered running worker process"));
+    }
+
+    fn unique_test_source_path(label: &str) -> String {
+        format!(
+            "C:/tests/{label}_{}.mp4",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        )
+    }
+
+    fn make_temp_test_dir(label: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "upscaler_source_context_{label}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("temporary test directory should be created");
+        dir
+    }
+
+    #[test]
+    fn importing_duplicate_context_content_does_not_create_duplicate_entries() {
+        let source_path = unique_test_source_path("dedupe");
+        let library_dir = source_context_library_dir(&source_path);
+        let temp_dir = make_temp_test_dir("dedupe");
+        let first_path = temp_dir.join("dorothy.jpg");
+        let duplicate_path = temp_dir.join("dorothy-copy.jpg");
+        let updated_path = temp_dir.join("dorothy.jpg.updated");
+
+        fs::write(&first_path, b"same-bytes").expect("first context file should be written");
+        fs::write(&duplicate_path, b"same-bytes").expect("duplicate context file should be written");
+        fs::write(&updated_path, b"different-bytes").expect("updated context file should be written");
+
+        let cleanup = || {
+            let _ = fs::remove_dir_all(&library_dir);
+            let _ = fs::remove_dir_all(&temp_dir);
+        };
+
+        let _ = fs::remove_dir_all(&library_dir);
+
+        let first_library = import_source_context_files(
+            source_path.clone(),
+            vec![first_path.display().to_string()],
+        ).expect("first context import should succeed");
+        assert_eq!(first_library.entries.len(), 1);
+
+        let duplicate_library = import_source_context_files(
+            source_path.clone(),
+            vec![duplicate_path.display().to_string()],
+        ).expect("duplicate context import should succeed");
+        assert_eq!(duplicate_library.entries.len(), 1);
+
+        let updated_library = import_source_context_files(
+            source_path.clone(),
+            vec![updated_path.display().to_string()],
+        ).expect("different context import should succeed");
+        assert_eq!(updated_library.entries.len(), 2);
+        assert!(updated_library.entries.iter().any(|entry| entry.file_name == "dorothy.jpg"));
+        assert!(updated_library.entries.iter().any(|entry| entry.file_name.starts_with("dorothy")));
+
+        cleanup();
+    }
+
+    #[test]
+    fn remove_source_context_entry_deletes_the_selected_entry() {
+        let source_path = unique_test_source_path("delete");
+        let library_dir = source_context_library_dir(&source_path);
+        let temp_dir = make_temp_test_dir("delete");
+        let first_path = temp_dir.join("one.jpg");
+        let second_path = temp_dir.join("two.jpg");
+
+        fs::write(&first_path, b"one").expect("first context file should be written");
+        fs::write(&second_path, b"two").expect("second context file should be written");
+
+        let cleanup = || {
+            let _ = fs::remove_dir_all(&library_dir);
+            let _ = fs::remove_dir_all(&temp_dir);
+        };
+
+        let _ = fs::remove_dir_all(&library_dir);
+
+        let library = import_source_context_files(
+            source_path.clone(),
+            vec![
+                first_path.display().to_string(),
+                second_path.display().to_string(),
+            ],
+        ).expect("context import should succeed");
+        assert_eq!(library.entries.len(), 2);
+
+        let removed_entry = library
+            .entries
+            .iter()
+            .find(|entry| entry.file_name == OsStr::new("one.jpg").to_string_lossy())
+            .expect("one.jpg should be present before deletion");
+
+        let updated_library = remove_source_context_entry(source_path.clone(), removed_entry.entry_id.clone())
+            .expect("context deletion should succeed");
+        assert_eq!(updated_library.entries.len(), 1);
+        assert!(updated_library.entries.iter().all(|entry| entry.entry_id != removed_entry.entry_id));
+        assert!(updated_library.entries.iter().all(|entry| entry.file_name != "one.jpg"));
+
+        cleanup();
     }
 }

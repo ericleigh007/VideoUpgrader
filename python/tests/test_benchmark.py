@@ -114,6 +114,84 @@ class BenchmarkHarnessTests(unittest.TestCase):
             self.assertEqual(result["runner"], "external-executable")
             self.assertEqual(len(result["results"]), 1)
 
+    def test_benchmark_fixture_supports_runnable_colorizer_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            generate_benchmark_fixture(
+                output_dir=Path(temp_dir),
+                name="fixture_colorizer",
+                frames=2,
+                width=640,
+                height=360,
+                downscale_width=320,
+                downscale_height=180,
+            )
+            with patch("upscaler_worker.benchmark._benchmark_colorizer_fixture", return_value={"tileSize": 0, "summary": {}}):
+                result = benchmark_fixture(
+                    manifest_path=Path(temp_dir) / "fixture_colorizer" / "manifest.json",
+                    model_id="ddcolor-modelscope",
+                    tile_sizes=[0],
+                    repeats=1,
+                    gpu_id=None,
+                    fp16=False,
+                )
+
+            self.assertEqual(result["modelId"], "ddcolor-modelscope")
+            self.assertEqual(result["backendId"], "pytorch-image-colorization")
+            self.assertEqual(result["runner"], "torch")
+            self.assertEqual(len(result["results"]), 1)
+
+    def test_benchmark_fixture_supports_runnable_deoldify_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            generate_benchmark_fixture(
+                output_dir=Path(temp_dir),
+                name="fixture_deoldify",
+                frames=2,
+                width=640,
+                height=360,
+                downscale_width=320,
+                downscale_height=180,
+            )
+            with patch("upscaler_worker.benchmark._benchmark_colorizer_fixture", return_value={"tileSize": 0, "summary": {}}):
+                result = benchmark_fixture(
+                    manifest_path=Path(temp_dir) / "fixture_deoldify" / "manifest.json",
+                    model_id="deoldify-stable",
+                    tile_sizes=[0],
+                    repeats=1,
+                    gpu_id=None,
+                    fp16=False,
+                )
+
+            self.assertEqual(result["modelId"], "deoldify-stable")
+            self.assertEqual(result["backendId"], "pytorch-image-colorization")
+            self.assertEqual(result["runner"], "torch")
+            self.assertEqual(len(result["results"]), 1)
+
+    def test_benchmark_fixture_supports_runnable_deoldify_video_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            generate_benchmark_fixture(
+                output_dir=Path(temp_dir),
+                name="fixture_deoldify_video",
+                frames=2,
+                width=640,
+                height=360,
+                downscale_width=320,
+                downscale_height=180,
+            )
+            with patch("upscaler_worker.benchmark._benchmark_colorizer_fixture", return_value={"tileSize": 0, "summary": {}}):
+                result = benchmark_fixture(
+                    manifest_path=Path(temp_dir) / "fixture_deoldify_video" / "manifest.json",
+                    model_id="deoldify-video",
+                    tile_sizes=[0],
+                    repeats=1,
+                    gpu_id=None,
+                    fp16=False,
+                )
+
+            self.assertEqual(result["modelId"], "deoldify-video")
+            self.assertEqual(result["backendId"], "pytorch-image-colorization")
+            self.assertEqual(result["runner"], "torch")
+            self.assertEqual(len(result["results"]), 1)
+
     def test_compare_frame_pair_reports_identical_images(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             left = Path(temp_dir) / "left.png"

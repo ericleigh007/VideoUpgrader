@@ -1,7 +1,7 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { Fragment, useEffect, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent as ReactWheelEvent } from "react";
 import { desktopApi } from "./lib/desktopApi";
-import { getBackendDefinition, getBlindComparisonModels, getModelDefinition, getUiModels, getVisibleModels, type ModelDefinition } from "./lib/catalog";
+import { getBackendDefinition, getBlindComparisonColorizerModels, getBlindComparisonModels, getModelDefinition, getUiColorizerModels, getUiModels, getVisibleColorizerModels, getVisibleModels, type ModelDefinition } from "./lib/catalog";
 import { defaultCropRect, planOutputFraming, resolveAspectRatio, resolveCropRect, type NormalizedCropRect } from "./lib/framing";
 import { buildInterpolationWarning, interpolationTargetFpsOptions, isInterpolationEnabled } from "./lib/interpolation";
 import {
@@ -18,6 +18,8 @@ import type { RepeatPipelineRequestAction, RepeatPipelineRequestEnvelope } from 
 import type {
   AppConfig,
   AspectRatioPreset,
+  ColorizationMode,
+  DeepRemasterProcessingMode,
   InterpolationMode,
   InterpolationTargetFps,
   ManagedJobSummary,
@@ -39,16 +41,23 @@ import type {
   ResolutionBasis,
   RuntimeStatus,
   ScratchStorageSummary,
+  SelectedColorizationContext,
+  SourceContextLibrary,
   SourceConversionJobStatus,
   SourceVideoSummary,
   VideoCodec,
 } from "./types";
 
 const models = getUiModels();
-const blindComparisonDefaultCandidates = getBlindComparisonModels();
-const blindComparisonAvailableModels = getVisibleModels().filter((model) => model.executionStatus === "runnable");
+const colorizerModels = getUiColorizerModels();
+const blindComparisonUpscaleDefaultCandidates = getBlindComparisonModels();
+const blindComparisonUpscaleAvailableModels = getVisibleModels().filter((model) => model.executionStatus === "runnable");
+const blindComparisonColorizerDefaultCandidates = getBlindComparisonColorizerModels();
+const blindComparisonColorizerAvailableModels = getVisibleColorizerModels().filter((model) => model.executionStatus === "runnable");
 const runnableModels = models.filter((model) => model.executionStatus === "runnable");
 const plannedModels = models.filter((model) => model.executionStatus !== "runnable");
+const runnableColorizerModels = colorizerModels.filter((model) => model.executionStatus === "runnable");
+const plannedColorizerModels = colorizerModels.filter((model) => model.executionStatus !== "runnable");
 
 const outputModes: Array<{ value: OutputMode; label: string }> = [
   { value: "preserveAspect4k", label: "Preserve Aspect In Target" },
@@ -70,6 +79,11 @@ const codecs: Array<{ value: VideoCodec; label: string }> = [
 const containers: Array<{ value: OutputContainer; label: string }> = [
   { value: "mp4", label: "MP4" },
   { value: "mkv", label: "MKV" }
+];
+
+const deepRemasterProcessingModes: Array<{ value: DeepRemasterProcessingMode; label: string; detail: string }> = [
+  { value: "standard", label: "Standard", detail: "Uses the upstream 320px minimum-edge working size." },
+  { value: "high", label: "High", detail: "Raises the DeepRemaster working size to a 512px minimum edge for stronger structure matching." },
 ];
 
 const pytorchRunners: Array<{ value: PytorchRunner; label: string }> = [
@@ -103,12 +117,61 @@ function tauriWindowingAvailable(): boolean {
   return isTauri();
 }
 
+function colorizerContextSummary(model: ModelDefinition, supportsReferenceContext: boolean): string {
+  if (!supportsReferenceContext) {
+    return `${model.label} does not use added context in the current build.`;
+  }
+
+  if (model.value === "colormnet") {
+    return "ColorMNet is designed around one exemplar-like reference frame. Pick the still closest to the target shot; posters and publicity stills are weaker inputs.";
+  }
+
+  return "Reference images are stored per source clip, then explicitly selected for this run.";
+}
+
+function colorizerAvailabilitySummary(model: ModelDefinition): string {
+  if (model.value === "colormnet") {
+    return model.executionStatus === "runnable"
+      ? "ColorMNet now launches through the worker runtime. Use one anchor still that closely matches the target shot."
+      : "ColorMNet is cataloged, but the worker backend has not landed yet. Plan for a single exemplar-style reference rather than a loose stack of posters.";
+  }
+
+  return model.executionStatus === "runnable"
+    ? `${model.label} is available in the current worker build.`
+    : "This colorizer is cataloged for the live-action grayscale workflow, but the worker backend has not landed yet.";
+}
+
+function normalizeColorContextSelection(
+  entryIds: string[],
+  options?: { singleSelection?: boolean; preferLast?: boolean },
+): string[] {
+  const unique = Array.from(new Set(entryIds));
+  if (!options?.singleSelection || unique.length <= 1) {
+    return unique;
+  }
+
+  const selected = options.preferLast ? unique[unique.length - 1] : unique[0];
+  return selected ? [selected] : [];
+}
+
 function recommendedPytorchRunner(modelId: ModelId): PytorchRunner {
   const model = getModelDefinition(modelId);
   if (model.backendId === "pytorch-image-sr" && model.value === "swinir-realworld-x4") {
     return "tensorrt";
   }
   return "torch";
+}
+
+function primaryPipelineModelId(params: {
+  upscaleModelId: ModelId;
+  colorizerModelId: ModelId;
+  isUpscaleStepEnabled: boolean;
+  isColorizationStepEnabled: boolean;
+}): ModelId {
+  if (params.isColorizationStepEnabled && !params.isUpscaleStepEnabled) {
+    return params.colorizerModelId;
+  }
+  return params.upscaleModelId;
 }
 
 const aspectRatioPresets: Array<{ value: AspectRatioPreset; label: string }> = [
@@ -159,6 +222,7 @@ interface BlindComparisonEntry {
 interface BlindComparisonState {
   state: "running" | "ready" | "failed";
   startedAt?: number;
+  comparisonSignature: string;
   entries: BlindComparisonEntry[];
   previewDurationSeconds: number;
   previewStartOffsetSeconds: number;
@@ -245,6 +309,7 @@ interface BlindComparisonRevealPayload {
   startedAt: number;
   previewDurationSeconds: number;
   previewStartOffsetSeconds: number;
+  comparisonSignature?: string | null;
   winnerModelId: ModelId;
   candidateModelIds: ModelId[];
 }
@@ -373,11 +438,10 @@ function normalizeTimestampMillis(timestamp: number | string | null | undefined)
   return parsed < 1_000_000_000_000 ? parsed * 1000 : parsed;
 }
 
-function blindComparisonOutputPath(source: SourceVideoSummary, container: OutputContainer, modelId: string, anonymousLabel: string, runToken: string): string {
+function blindComparisonOutputPath(source: SourceVideoSummary, container: OutputContainer, anonymousLabel: string, runToken: string): string {
   const fileStem = source.path.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") ?? "comparison_source";
-  const sanitizedModelId = modelId.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
   const sanitizedLabel = anonymousLabel.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
-  return `${OUTPUT_ROOT}/blind/${fileStem}_${runToken}_${sanitizedLabel}_${sanitizedModelId}.${container}`;
+    return `${OUTPUT_ROOT}/blind/${fileStem}_${runToken}_${sanitizedLabel}.${container}`;
 }
 
 function parsePositiveIntegerInput(value: string): number | null {
@@ -474,6 +538,7 @@ function createQueuedJob(jobId: string): PipelineJobStatus {
       processedFrames: 0,
       totalFrames: 0,
       extractedFrames: 0,
+      colorizedFrames: 0,
       upscaledFrames: 0,
       interpolatedFrames: 0,
       encodedFrames: 0,
@@ -495,6 +560,7 @@ function createPendingComparisonJob(): PipelineJobStatus {
       processedFrames: 0,
       totalFrames: 0,
       extractedFrames: 0,
+      colorizedFrames: 0,
       upscaledFrames: 0,
       interpolatedFrames: 0,
       encodedFrames: 0,
@@ -511,6 +577,20 @@ function delay(milliseconds: number): Promise<void> {
   });
 }
 
+
+function modelSupportsReferenceContext(model: ModelDefinition): boolean {
+  return Boolean(model.supportsContextInput && model.supportedContextKinds?.includes("referenceImages"));
+}
+
+function sameStringSet(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  const normalizedLeft = [...left].sort();
+  const normalizedRight = [...right].sort();
+  return normalizedLeft.every((value, index) => value === normalizedRight[index]);
+}
 function createQueuedConversionJob(jobId: string): SourceConversionJobStatus {
   return {
     jobId,
@@ -522,6 +602,7 @@ function createQueuedConversionJob(jobId: string): SourceConversionJobStatus {
       processedFrames: 0,
       totalFrames: 0,
       extractedFrames: 0,
+      colorizedFrames: 0,
       upscaledFrames: 0,
       interpolatedFrames: 0,
       encodedFrames: 0,
@@ -656,6 +737,7 @@ function formatStageTimingsSummary(timings: PipelineStageTimings | null | undefi
 
   const values = [
     { label: "extract", value: timings.extractSeconds },
+    { label: "colorize", value: timings.colorizeSeconds },
     { label: "upscale", value: timings.upscaleSeconds },
     { label: "interpolate", value: timings.interpolateSeconds },
     { label: "encode", value: timings.encodeSeconds },
@@ -675,6 +757,7 @@ function formatStageTimingsSummary(timings: PipelineStageTimings | null | undefi
 function formatStageTimings(progress: PipelineProgress): string {
   return formatStageTimingsSummary({
     extractSeconds: progress.extractStageSeconds ?? 0,
+    colorizeSeconds: progress.colorizeStageSeconds ?? 0,
     upscaleSeconds: progress.upscaleStageSeconds ?? 0,
     interpolateSeconds: progress.interpolateStageSeconds ?? 0,
     encodeSeconds: progress.encodeStageSeconds ?? 0,
@@ -898,6 +981,9 @@ function buildPipelineActivityTitle(progress: PipelineProgress): string {
   if (progress.phase === "extracting") {
     return "Extracting source frames";
   }
+  if (progress.phase === "colorizing") {
+    return "Colorizing extracted frames";
+  }
   if (progress.phase === "upscaling") {
     return progress.batchCount ? "Upscaling the current batch" : "Upscaling extracted frames";
   }
@@ -925,6 +1011,9 @@ function formatPipelinePhaseLabel(phase: string): string {
   }
   if (phase === "extracting") {
     return "Extracting";
+  }
+  if (phase === "colorizing") {
+    return "Colorizing";
   }
   if (phase === "upscaling") {
     return "Upscaling";
@@ -981,6 +1070,7 @@ function buildProgressEventKey(progress: PipelineProgress): string {
     progress.message,
     progress.processedFrames,
     progress.extractedFrames,
+    progress.colorizedFrames,
     progress.upscaledFrames,
     progress.interpolatedFrames,
     progress.encodedFrames,
@@ -1016,9 +1106,19 @@ function cleanupKindLabel(job: TrackedJobEntry): string {
     return "Conversion";
   }
   const hasInterpolation = (job.progress.interpolatedFrames ?? 0) > 0;
+  const hasColorization = (job.progress.colorizedFrames ?? 0) > 0;
   const hasUpscale = (job.progress.upscaledFrames ?? 0) > 0 || Boolean(job.modelId);
+  if (hasInterpolation && hasUpscale && hasColorization) {
+    return "Colorize + Upscale + Motion";
+  }
+  if (hasColorization && hasUpscale) {
+    return "Colorize + Upscale";
+  }
   if (hasInterpolation && hasUpscale) {
     return "Upscale + Motion";
+  }
+  if (hasColorization) {
+    return "Colorize";
   }
   if (hasInterpolation) {
     return "Motion";
@@ -1125,6 +1225,8 @@ function clampJobsWindowBounds(bounds: JobsWindowBounds, width: number, height: 
 
 type PersistedRunSettings = {
   modelId: ModelId;
+  colorizerModelId: ModelId;
+  deepremasterProcessingMode: DeepRemasterProcessingMode;
   outputMode: OutputMode;
   qualityPreset: QualityPreset;
   selectedGpuId: number | null;
@@ -1138,6 +1240,7 @@ type PersistedRunSettings = {
   container: OutputContainer;
   tileSize: number;
   crf: number;
+  isColorizationStepEnabled: boolean;
   isUpscaleStepEnabled: boolean;
   isInterpolationStepEnabled: boolean;
   interpolationTargetFps: InterpolationTargetFps;
@@ -1166,6 +1269,12 @@ function parsePersistedRunSettings(raw: string | null): Partial<PersistedRunSett
 
     if (typeof parsed.modelId === "string" && models.some((model) => model.value === parsed.modelId)) {
       settings.modelId = parsed.modelId;
+    }
+    if (typeof parsed.colorizerModelId === "string" && colorizerModels.some((model) => model.value === parsed.colorizerModelId)) {
+      settings.colorizerModelId = parsed.colorizerModelId;
+    }
+    if (parsed.deepremasterProcessingMode === "standard" || parsed.deepremasterProcessingMode === "high") {
+      settings.deepremasterProcessingMode = parsed.deepremasterProcessingMode;
     }
     if (parsed.outputMode === "preserveAspect4k" || parsed.outputMode === "cropTo4k" || parsed.outputMode === "native4x") {
       settings.outputMode = parsed.outputMode;
@@ -1205,6 +1314,9 @@ function parsePersistedRunSettings(raw: string | null): Partial<PersistedRunSett
     }
     if (typeof parsed.crf === "number" && Number.isFinite(parsed.crf)) {
       settings.crf = parsed.crf;
+    }
+    if (typeof parsed.isColorizationStepEnabled === "boolean") {
+      settings.isColorizationStepEnabled = parsed.isColorizationStepEnabled;
     }
     if (typeof parsed.isUpscaleStepEnabled === "boolean") {
       settings.isUpscaleStepEnabled = parsed.isUpscaleStepEnabled;
@@ -1391,13 +1503,35 @@ function toggleIncludedModel(modelIds: ModelId[], targetModelId: ModelId): Model
 }
 
 function sameCandidateModelSet(left: ModelId[], right: ModelId[]): boolean {
-  if (left.length !== right.length) {
-    return false;
-  }
+  return sameStringSet(left, right);
+}
 
-  const normalizedLeft = [...left].sort();
-  const normalizedRight = [...right].sort();
-  return normalizedLeft.every((value, index) => value === normalizedRight[index]);
+function buildBlindComparisonSignature(params: {
+  sourcePath: string;
+  previewDurationSeconds: number;
+  previewStartOffsetSeconds: number;
+  colorizationMode: ColorizationMode;
+  interpolationMode: InterpolationMode;
+  upscaleModelId: ModelId;
+  candidateModelIds: ModelId[];
+  colorizationContext: SelectedColorizationContext | null;
+  deepremasterProcessingMode: DeepRemasterProcessingMode;
+}): string {
+  return JSON.stringify({
+    sourcePath: params.sourcePath,
+    previewDurationSeconds: params.previewDurationSeconds,
+    previewStartOffsetSeconds: Number(params.previewStartOffsetSeconds.toFixed(3)),
+    colorizationMode: params.colorizationMode,
+    interpolationMode: params.interpolationMode,
+    upscaleModelId: params.upscaleModelId,
+    candidateModelIds: [...params.candidateModelIds].sort(),
+    deepremasterProcessingMode: params.deepremasterProcessingMode,
+    colorizationContext: params.colorizationContext ? {
+      libraryId: params.colorizationContext.libraryId,
+      selectedEntryIds: [...params.colorizationContext.selectedEntryIds].sort(),
+      referenceImagePaths: [...params.colorizationContext.referenceImagePaths].sort(),
+    } : null,
+  });
 }
 
 function sameBlindComparisonRecord(
@@ -1407,6 +1541,11 @@ function sameBlindComparisonRecord(
 ): boolean {
   const recordCreatedAt = Number.isFinite(Date.parse(record.createdAt)) ? Date.parse(record.createdAt) : 0;
   const startedAt = blindComparison.startedAt ?? 0;
+  if (record.comparisonSignature) {
+    return record.sourcePath === sourcePath
+      && (startedAt <= 0 || (recordCreatedAt > 0 && recordCreatedAt >= startedAt - 1000))
+      && record.comparisonSignature === blindComparison.comparisonSignature;
+  }
   return record.sourcePath === sourcePath
     && (startedAt <= 0 || (recordCreatedAt > 0 && recordCreatedAt >= startedAt - 1000))
     && record.previewDurationSeconds === blindComparison.previewDurationSeconds
@@ -1419,6 +1558,11 @@ function sameBlindComparisonReveal(
   sourcePath: string,
   payload: BlindComparisonRevealPayload,
 ): boolean {
+  if (payload.comparisonSignature) {
+    return payload.sourcePath === sourcePath
+      && (blindComparison.startedAt ?? 0) === payload.startedAt
+      && payload.comparisonSignature === blindComparison.comparisonSignature;
+  }
   return payload.sourcePath === sourcePath
     && (blindComparison.startedAt ?? 0) === payload.startedAt
     && payload.previewDurationSeconds === blindComparison.previewDurationSeconds
@@ -1456,6 +1600,8 @@ export default function App() {
   const canOpenNativeJobsWindow = tauriWindowingAvailable() && !isStandaloneView;
   const canOpenNativeComparisonWindow = tauriWindowingAvailable() && !isStandaloneView;
   const [modelId, setModelId] = useState<ModelId>(persistedRunSettings.modelId ?? "realesrgan-x4plus");
+  const [colorizerModelId, setColorizerModelId] = useState<ModelId>(persistedRunSettings.colorizerModelId ?? "ddcolor-modelscope");
+  const [deepremasterProcessingMode, setDeepremasterProcessingMode] = useState<DeepRemasterProcessingMode>(persistedRunSettings.deepremasterProcessingMode ?? "standard");
   const [outputMode, setOutputMode] = useState<OutputMode>(persistedRunSettings.outputMode ?? "preserveAspect4k");
   const [qualityPreset, setQualityPreset] = useState<QualityPreset>(persistedRunSettings.qualityPreset ?? "qualityBalanced");
   const [selectedGpuId, setSelectedGpuId] = useState<number | null>(persistedRunSettings.selectedGpuId ?? null);
@@ -1470,6 +1616,7 @@ export default function App() {
   const [container, setContainer] = useState<OutputContainer>(persistedRunSettings.container ?? "mp4");
   const [tileSize, setTileSize] = useState<number>(persistedRunSettings.tileSize ?? 0);
   const [crf, setCrf] = useState<number>(persistedRunSettings.crf ?? 18);
+  const [isColorizationStepEnabled, setIsColorizationStepEnabled] = useState<boolean>(persistedRunSettings.isColorizationStepEnabled ?? false);
   const [isUpscaleStepEnabled, setIsUpscaleStepEnabled] = useState<boolean>(persistedRunSettings.isUpscaleStepEnabled ?? true);
   const [isInterpolationStepEnabled, setIsInterpolationStepEnabled] = useState<boolean>(persistedRunSettings.isInterpolationStepEnabled ?? false);
   const [interpolationTargetFps, setInterpolationTargetFps] = useState<InterpolationTargetFps>(persistedRunSettings.interpolationTargetFps ?? 60);
@@ -1493,6 +1640,8 @@ export default function App() {
   const [sourceConversionMode, setSourceConversionMode] = useState<"preview" | "replace" | null>(null);
   const [sourceConversionSourcePath, setSourceConversionSourcePath] = useState<string | null>(null);
   const [previewPlaybackPath, setPreviewPlaybackPath] = useState<string | null>(null);
+  const [sourceContextLibrary, setSourceContextLibrary] = useState<SourceContextLibrary | null>(null);
+  const [selectedColorContextEntryIds, setSelectedColorContextEntryIds] = useState<string[]>([]);
   const [uiNow, setUiNow] = useState<number>(() => Date.now());
   const [sourcePathStats, setSourcePathStats] = useState<PathStats | null>(null);
   const [outputPathStats, setOutputPathStats] = useState<PathStats | null>(null);
@@ -1521,7 +1670,7 @@ export default function App() {
     );
   });
   const [selectedBlindComparisonModelIds, setSelectedBlindComparisonModelIds] = useState<ModelId[]>(
-    blindComparisonDefaultCandidates.map((candidate) => candidate.value),
+    blindComparisonUpscaleDefaultCandidates.map((candidate) => candidate.value),
   );
   const [blindComparisonStartOffsetSeconds, setBlindComparisonStartOffsetSeconds] = useState<number>(0);
   const [blindComparison, setBlindComparison] = useState<BlindComparisonState | null>(null);
@@ -1611,7 +1760,10 @@ export default function App() {
       .filter((job) => isActiveCleanupState(job.state as TrackedJobEntry["state"]))
       .sort((left, right) => normalizeTimestampMillis(right.updatedAt) - normalizeTimestampMillis(left.updatedAt))[0] ?? null
     : null;
-  const activeDisplayProgress = activePrimaryJob?.progress ?? activeManagedJob?.progress ?? null;
+  const activeBlindComparisonEntries = blindComparison?.entries.filter((entry) => Boolean(entry.jobId) && isActiveCleanupState(entry.status.state as TrackedJobEntry["state"])) ?? [];
+  const activeBlindComparisonEntry = activeBlindComparisonEntries[0] ?? null;
+  const activeBlindComparisonJob = activeBlindComparisonEntry?.status ?? null;
+  const activeDisplayProgress = activePrimaryJob?.progress ?? activeBlindComparisonJob?.progress ?? activeManagedJob?.progress ?? null;
   const progressPercent = activeDisplayProgress?.percent ?? (result ? 100 : 0);
   const progressMessage = activeDisplayProgress?.message ?? status;
   const isPipelinePaused = pipelineJob?.state === "paused";
@@ -1622,14 +1774,45 @@ export default function App() {
   const pipelineLaunchStateLabel = pipelineLaunchState === "starting" ? "launching" : pipelineLaunchState;
   const hasRecoveredManagedJob = Boolean(activeManagedJob);
   const isBlindComparisonRunning = blindComparison?.state === "running";
+  const isBlindComparisonJobPaused = activeBlindComparisonJob?.state === "paused";
+  const isBlindComparisonJobRunning = Boolean(activeBlindComparisonJob && isActiveCleanupState(activeBlindComparisonJob.state as TrackedJobEntry["state"]));
   const selectedGpu = runtime?.availableGpus.find((gpu) => gpu.id === selectedGpuId) ?? null;
   const selectedModel = getModelDefinition(modelId);
   const selectedBackend = getBackendDefinition(selectedModel.backendId);
+  const selectedColorizerModel = getModelDefinition(colorizerModelId);
+  const selectedColorizerBackend = getBackendDefinition(selectedColorizerModel.backendId);
+  const selectedColorizerSupportsReferenceContext = modelSupportsReferenceContext(selectedColorizerModel);
+  const isDeepRemasterSelected = selectedColorizerModel.value === "deepremaster";
+  const isColorMNetSelected = selectedColorizerModel.value === "colormnet";
+  const selectedDeepRemasterProcessingMode = deepRemasterProcessingModes.find((mode) => mode.value === deepremasterProcessingMode) ?? deepRemasterProcessingModes[0];
   const isSelectedModelImplemented = selectedModel.executionStatus === "runnable";
   const selectedModelLaunchRequirement = modelLaunchRequirement(selectedModel, runtime);
   const isSelectedModelLaunchable = selectedModelLaunchRequirement === null;
+  const isSelectedColorizerImplemented = selectedColorizerModel.executionStatus === "runnable";
+  const selectedColorizerLaunchRequirement = modelLaunchRequirement(selectedColorizerModel, runtime);
+  const isSelectedColorizerLaunchable = selectedColorizerLaunchRequirement === null;
+  const blindComparisonDefaultCandidates = isColorizationStepEnabled ? blindComparisonColorizerDefaultCandidates : blindComparisonUpscaleDefaultCandidates;
+  const blindComparisonAvailableModels = isColorizationStepEnabled ? blindComparisonColorizerAvailableModels : blindComparisonUpscaleAvailableModels;
+  const blindComparisonSubjectLabel = isColorizationStepEnabled ? "colorizers" : "models";
   const supportsPytorchRunner = selectedBackend.id === "pytorch-image-sr";
   const selectedModelRating = appConfig?.modelRatings[selectedModel.value]?.rating ?? null;
+  const effectiveSelectedColorContextEntryIds = normalizeColorContextSelection(selectedColorContextEntryIds, {
+    singleSelection: isColorMNetSelected,
+    preferLast: true,
+  });
+  const selectedColorContextEntries = sourceContextLibrary?.entries.filter((entry) => effectiveSelectedColorContextEntryIds.includes(entry.entryId)) ?? [];
+  const selectedColorizationContext: SelectedColorizationContext | null = selectedColorizerSupportsReferenceContext
+    && sourceContextLibrary
+    && selectedColorContextEntries.length > 0
+    ? {
+        libraryId: sourceContextLibrary.libraryId,
+        selectedEntryIds: selectedColorContextEntries.map((entry) => entry.entryId),
+        referenceImagePaths: selectedColorContextEntries.map((entry) => entry.absolutePath),
+      }
+    : null;
+  const selectedColorizerReferenceRequirement = isColorizationStepEnabled && isColorMNetSelected && !selectedColorizationContext
+    ? "ColorMNet needs one selected reference still before launch."
+    : null;
   const selectedBlindComparisonModels = blindComparisonAvailableModels.filter((model) => selectedBlindComparisonModelIds.includes(model.value));
   const comparisonEntries = blindComparison?.entries.filter((entry) => Boolean(entry.status.result?.outputPath)) ?? [];
   const comparisonFrameRateCandidates = [
@@ -1649,6 +1832,13 @@ export default function App() {
   const comparisonPreviewStartOffsetSeconds = blindComparison?.previewStartOffsetSeconds ?? 0;
   const isComparisonWorkspaceVisible = isComparisonOnlyView || isComparisonWorkspaceOpen;
   const comparisonRequiresConvertedSourcePreview = Boolean(source && !supportsEmbeddedFullLengthPreview(source.container));
+
+  useEffect(() => {
+    if (sameStringSet(selectedColorContextEntryIds, effectiveSelectedColorContextEntryIds)) {
+      return;
+    }
+    setSelectedColorContextEntryIds(effectiveSelectedColorContextEntryIds);
+  }, [effectiveSelectedColorContextEntryIds, selectedColorContextEntryIds]);
   const comparisonSourceReferenceReady = Boolean(source && (!comparisonRequiresConvertedSourcePreview || previewPlaybackPath));
   const comparisonSourcePreviewPath = source
     ? (supportsEmbeddedFullLengthPreview(source.container) ? source.path : (previewPlaybackPath ?? null))
@@ -1684,18 +1874,24 @@ export default function App() {
     && sourceConversionMode === "preview"
     && isSourceConversionRunning
   );
+  const colorizationMode: ColorizationMode = !isColorizationStepEnabled
+    ? "off"
+    : isUpscaleStepEnabled
+      ? "beforeUpscale"
+      : "colorizeOnly";
   const interpolationMode: InterpolationMode = !isUpscaleStepEnabled && isInterpolationStepEnabled
     ? "interpolateOnly"
     : isUpscaleStepEnabled && isInterpolationStepEnabled
       ? "afterUpscale"
       : "off";
-  const hasEnabledPipelineStep = isUpscaleStepEnabled || isInterpolationStepEnabled;
+  const hasEnabledPipelineStep = isColorizationStepEnabled || isUpscaleStepEnabled || isInterpolationStepEnabled;
   const interpolationEnabled = isInterpolationEnabled(interpolationMode);
   const selectedQualityPresetLabel = qualityPresets.find((entry) => entry.value === qualityPreset)?.label ?? qualityPreset;
   const selectedCodecLabel = codecs.find((entry) => entry.value === codec)?.label ?? codec.toUpperCase();
   const selectedContainerLabel = containers.find((entry) => entry.value === container)?.label ?? container.toUpperCase();
   const encodingDetailsSummary = `${selectedCodecLabel} / ${selectedContainerLabel} • CRF ${crf} • ${selectedQualityPresetLabel} • Tile ${tileSize > 0 ? tileSize : "Auto"}`;
   const compactPipelineLabel = [
+    isColorizationStepEnabled ? selectedColorizerModel.label : null,
     isUpscaleStepEnabled ? selectedModel.label : null,
     interpolationEnabled ? `Interpolation ${interpolationTargetFps} fps` : null,
     hasEnabledPipelineStep ? selectedCodecLabel : null,
@@ -1714,9 +1910,51 @@ export default function App() {
     || isPipelineRunning
     || isBlockingSourceConversionRunning
     || !hasEnabledPipelineStep
+    || (isColorizationStepEnabled && !isSelectedColorizerLaunchable)
     || (isUpscaleStepEnabled && !isSelectedModelLaunchable);
   const isBlindComparisonDisabled = isBusy || !source || isBlindComparisonRunning || isPipelineRunning || isBlockingSourceConversionRunning || selectedBlindComparisonModelIds.length < 2;
   const nowTimestamp = uiNow;
+
+  useEffect(() => {
+    const availableIds = new Set(blindComparisonAvailableModels.map((model) => model.value));
+    const recommendedIds = blindComparisonDefaultCandidates.map((candidate) => candidate.value);
+    setSelectedBlindComparisonModelIds((current) => {
+      const filtered = current.filter((modelValue) => availableIds.has(modelValue));
+      if (filtered.length >= 2 || recommendedIds.length < 2) {
+        return filtered.length === current.length ? current : filtered;
+      }
+      const sameRecommended = filtered.length === recommendedIds.length && filtered.every((modelValue, index) => modelValue === recommendedIds[index]);
+      return sameRecommended ? current : recommendedIds;
+    });
+  }, [blindComparisonAvailableModels, blindComparisonDefaultCandidates]);
+
+  useEffect(() => {
+    if (!source?.path) {
+      setSourceContextLibrary(null);
+      setSelectedColorContextEntryIds([]);
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const library = await refreshSourceContextLibrary(source.path);
+        if (cancelled) {
+          return;
+        }
+        setSourceContextLibrary(library);
+      } catch (caught) {
+        if (!cancelled) {
+          setError(caught instanceof Error ? caught.message : String(caught));
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [source?.path]);
+
   const trackedJobCandidates: Array<TrackedJobEntry | null> = [
     sourceConversionJob ? {
       id: sourceConversionJob.jobId,
@@ -1795,6 +2033,53 @@ export default function App() {
         ])
         : null,
     } : null,
+    ...activeBlindComparisonEntries.map<TrackedJobEntry>((entry) => ({
+      id: entry.jobId ?? entry.sampleId,
+      jobKind: "pipeline",
+      label: `Blind Comparison ${entry.anonymousLabel}`,
+      state: entry.status.state,
+      phase: entry.status.progress.phase,
+      progress: entry.status.progress,
+      modelId: entry.modelId,
+      codec: entry.status.result?.codec ?? BLIND_COMPARISON_PREVIEW_CODEC,
+      container: entry.status.result?.container ?? BLIND_COMPARISON_PREVIEW_CONTAINER,
+      recordedCount: entry.status.progress.totalFrames,
+      message: entry.status.progress.message,
+      updatedAt: nowTimestamp,
+      sourcePath: source?.path ?? null,
+      scratchPath: entry.status.result?.workDir ?? null,
+      scratchSizeBytes: entry.status.progress.scratchSizeBytes ?? 0,
+      outputPath: entry.status.result?.outputPath ?? null,
+      outputSizeBytes: entry.status.progress.outputSizeBytes ?? 0,
+      pipelineRunDetails: null,
+      onPause: entry.jobId && (entry.status.state === "queued" || entry.status.state === "running")
+        ? () => {
+          void pausePipelineJobById(entry.jobId!, "Pausing blind comparison sample...", "Failed to pause blind comparison sample.");
+        }
+        : null,
+      onResume: entry.jobId && entry.status.state === "paused"
+        ? () => {
+          void resumePipelineJobById(entry.jobId!, "Resuming blind comparison sample...", "Failed to resume blind comparison sample.");
+        }
+        : null,
+      onStop: entry.jobId && isActiveCleanupState(entry.status.state as TrackedJobEntry["state"])
+        ? () => {
+          void cancelPipelineJobById(entry.jobId!, "Stopping blind comparison sample...", "Failed to stop blind comparison sample.");
+        }
+        : null,
+      onClearScratch: entry.status.result?.workDir && isManagedArtifactPath(entry.status.result.workDir)
+        ? () => void deleteManagedArtifact(entry.status.result!.workDir, `${entry.anonymousLabel} scratch`, () => {}, [
+          "Deletes intermediate artifacts for this blind comparison sample.",
+          "The blind comparison card remains, but reruns will regenerate the sample output.",
+        ])
+        : null,
+      onDeleteOutput: entry.status.result?.outputPath && isManagedArtifactPath(entry.status.result.outputPath)
+        ? () => void deleteManagedArtifact(entry.status.result!.outputPath, `${entry.anonymousLabel} output`, () => {}, [
+          "Deletes the generated preview export for this blind comparison sample.",
+          "Use this after reviewing or rerunning a blind comparison set.",
+        ])
+        : null,
+    })),
   ];
   const trackedJobs = trackedJobCandidates.filter((entry): entry is TrackedJobEntry => entry !== null);
   const historicalJobs = managedJobs.map<TrackedJobEntry>((job) => ({
@@ -1889,6 +2174,12 @@ export default function App() {
       summary: `${pipelineJob.progress.extractedFrames}/${pipelineJob.progress.totalFrames || "?"}`,
     },
     {
+      id: "colorize",
+      label: "Colorize",
+      value: ratioFromCounts(pipelineJob.progress.colorizedFrames, pipelineJob.progress.totalFrames, pipelineJob.state === "succeeded"),
+      summary: `${pipelineJob.progress.colorizedFrames}/${pipelineJob.progress.totalFrames || "?"}`,
+    },
+    {
       id: "upscale",
       label: "Upscale",
       value: ratioFromCounts(pipelineJob.progress.upscaledFrames, pipelineJob.progress.totalFrames, pipelineJob.state === "succeeded"),
@@ -1925,6 +2216,10 @@ export default function App() {
     ? "Pipeline Paused"
     : isPipelineRunning
       ? "Pipeline Running"
+      : isBlindComparisonJobPaused
+        ? "Blind Comparison Paused"
+        : isBlindComparisonJobRunning
+          ? "Blind Comparison Running"
       : isSourceConversionPaused
         ? "Source Conversion Paused"
         : isSourceConversionRunning
@@ -1936,19 +2231,30 @@ export default function App() {
       : result
         ? "Last Output Ready"
         : "Ready To Configure";
-  const compactPhaseBars = pipelinePhaseBars.filter((entry) => entry.id === "upscale" || entry.id === "interpolate");
+  const compactPhaseBars = pipelinePhaseBars.filter((entry) => entry.id === "colorize" || entry.id === "upscale" || entry.id === "interpolate");
   const activePipelineVisualStep = (() => {
     if (!pipelineJob) {
       return null;
     }
 
     switch (pipelineJob.progress.phase) {
+      case "colorizing":
+        return "colorize";
       case "interpolating":
         return "interpolate";
       case "encoding":
       case "remuxing":
       case "completed":
-        return pipelineJob.progress.interpolatedFrames > 0 ? "interpolate" : "upscale";
+        if (pipelineJob.progress.interpolatedFrames > 0) {
+          return "interpolate";
+        }
+        if (pipelineJob.progress.upscaledFrames > 0) {
+          return "upscale";
+        }
+        if (pipelineJob.progress.colorizedFrames > 0) {
+          return "colorize";
+        }
+        return "upscale";
       default:
         return "upscale";
     }
@@ -1957,6 +2263,8 @@ export default function App() {
     ? "Launch accepted • waiting for worker job id"
     : pipelineJob
     ? `${pipelinePhaseLabel ?? "Preparing"} • ${pipelineJob.progress.percent}% • ${activePrimaryJob && (activePrimaryJob.progress.estimatedRemainingSeconds ?? 0) > 0 ? `ETA ${formatElapsedSeconds(activePrimaryJob.progress.estimatedRemainingSeconds)}` : "ETA pending"}`
+    : activeBlindComparisonEntry && activeBlindComparisonJob
+      ? `${activeBlindComparisonEntry.anonymousLabel} • ${formatPipelinePhaseLabel(activeBlindComparisonJob.progress.phase)} • ${activeBlindComparisonJob.progress.percent}% • ${(activeBlindComparisonJob.progress.estimatedRemainingSeconds ?? 0) > 0 ? `ETA ${formatElapsedSeconds(activeBlindComparisonJob.progress.estimatedRemainingSeconds)}` : "ETA pending"}`
     : isSourceConversionPaused
       ? "Source conversion paused"
       : isSourceConversionRunning
@@ -1974,6 +2282,14 @@ export default function App() {
       ? () => {
           void pausePipeline();
         }
+      : isBlindComparisonJobPaused && activeBlindComparisonEntry?.jobId
+        ? () => {
+            void resumePipelineJobById(activeBlindComparisonEntry.jobId!, "Resuming blind comparison sample...", "Failed to resume blind comparison sample.");
+          }
+        : isBlindComparisonJobRunning && activeBlindComparisonEntry?.jobId
+          ? () => {
+              void pausePipelineJobById(activeBlindComparisonEntry.jobId!, "Pausing blind comparison sample...", "Failed to pause blind comparison sample.");
+            }
       : isSourceConversionPaused
         ? () => {
             void resumeSourceConversion();
@@ -1987,6 +2303,10 @@ export default function App() {
     ? () => {
         void cancelPipeline();
       }
+    : isBlindComparisonJobRunning && activeBlindComparisonEntry?.jobId
+      ? () => {
+          void cancelPipelineJobById(activeBlindComparisonEntry.jobId!, "Stopping blind comparison sample...", "Failed to stop blind comparison sample.");
+        }
     : isSourceConversionRunning
       ? () => {
           void cancelSourceConversion();
@@ -2715,7 +3035,12 @@ export default function App() {
               setSource(nextJob.result);
               setPreviewPlaybackPath(null);
               void resolveSourcePreviewUrl(nextJob.result.previewPath || nextJob.result.path);
-              setOutputPath(defaultOutputPath(nextJob.result, container, modelId));
+              setOutputPath(defaultOutputPath(nextJob.result, container, primaryPipelineModelId({
+                upscaleModelId: modelId,
+                colorizerModelId,
+                isUpscaleStepEnabled,
+                isColorizationStepEnabled,
+              })));
               setResult(null);
               setPipelineJob(null);
               setActiveJobId(null);
@@ -2773,7 +3098,7 @@ export default function App() {
       cancelled = true;
       window.clearInterval(intervalId);
     };
-  }, [container, modelId, source, sourceConversionJobId, sourceConversionMode, sourceConversionSourcePath]);
+  }, [colorizerModelId, container, isColorizationStepEnabled, isUpscaleStepEnabled, modelId, source, sourceConversionJobId, sourceConversionMode, sourceConversionSourcePath]);
 
   async function loadManagedArtifacts(includeScratchSummary = true): Promise<{
     scratchSummary: ScratchStorageSummary | null;
@@ -2963,6 +3288,8 @@ export default function App() {
   useEffect(() => {
     const nextSettings: PersistedRunSettings = {
       modelId,
+      colorizerModelId,
+      deepremasterProcessingMode,
       outputMode,
       qualityPreset,
       selectedGpuId,
@@ -2976,6 +3303,7 @@ export default function App() {
       container,
       tileSize,
       crf,
+      isColorizationStepEnabled,
       isUpscaleStepEnabled,
       isInterpolationStepEnabled,
       interpolationTargetFps,
@@ -2996,12 +3324,15 @@ export default function App() {
   }, [
     aspectRatioPreset,
     codec,
+    colorizerModelId,
+    deepremasterProcessingMode,
     container,
     crf,
     customAspectHeightInput,
     customAspectWidthInput,
     interpolationTargetFps,
     isBlindPanelOpen,
+    isColorizationStepEnabled,
     isCleanupPanelOpen,
     isInputPanelOpen,
     isInterpolationStepEnabled,
@@ -3162,6 +3493,10 @@ export default function App() {
       request: {
         sourcePath: job.sourcePath,
         modelId: job.modelId,
+        colorizationMode: "off",
+        colorizerModelId: null,
+        colorizationContext: null,
+        deepremasterProcessingMode: "standard",
         outputMode,
         qualityPreset,
         interpolationMode: inferredInterpolationMode,
@@ -3192,10 +3527,16 @@ export default function App() {
   }
 
   async function applyRepeatedPipelineRequest(request: RealesrganJobRequest): Promise<void> {
+    const nextColorizationEnabled = request.colorizationMode !== "off";
     const nextInterpolationEnabled = request.interpolationMode !== "off";
-    const nextUpscaleEnabled = request.interpolationMode !== "interpolateOnly";
+    const nextUpscaleEnabled = request.colorizationMode === "colorizeOnly" ? false : request.interpolationMode !== "interpolateOnly";
 
     setModelId(request.modelId);
+    if (request.colorizerModelId) {
+      setColorizerModelId(request.colorizerModelId);
+    }
+    setDeepremasterProcessingMode(request.deepremasterProcessingMode ?? "standard");
+    setSelectedColorContextEntryIds(request.colorizationContext?.selectedEntryIds ?? []);
     setOutputMode(request.outputMode);
     setQualityPreset(request.qualityPreset);
     setSelectedGpuId(request.gpuId);
@@ -3209,6 +3550,7 @@ export default function App() {
     setContainer(request.container);
     setTileSize(request.tileSize);
     setCrf(request.crf);
+    setIsColorizationStepEnabled(nextColorizationEnabled);
     setIsUpscaleStepEnabled(nextUpscaleEnabled);
     setIsInterpolationStepEnabled(nextInterpolationEnabled);
     setInterpolationTargetFps(request.interpolationTargetFps ?? 60);
@@ -3881,7 +4223,19 @@ export default function App() {
   }
 
   async function chooseOutputFile(): Promise<string | null> {
-    const selected = await desktopApi.selectOutputFile(defaultOutputPath(source, container, modelId), container);
+    const selected = await desktopApi.selectOutputFile(
+      defaultOutputPath(
+        source,
+        container,
+        primaryPipelineModelId({
+          upscaleModelId: modelId,
+          colorizerModelId,
+          isUpscaleStepEnabled,
+          isColorizationStepEnabled,
+        }),
+      ),
+      container,
+    );
     if (!selected) {
       return null;
     }
@@ -3896,7 +4250,7 @@ export default function App() {
     targetOutputPath: string,
     quickPreview: boolean,
     quickPreviewSeconds: number | null,
-    overrides?: Partial<Pick<RealesrganJobRequest, "codec" | "container" | "previewStartOffsetSeconds">>,
+    overrides?: Partial<Pick<RealesrganJobRequest, "codec" | "container" | "previewStartOffsetSeconds" | "colorizerModelId">>,
   ): RealesrganJobRequest {
     if (!source) {
       throw new Error("Select a source video before starting a pipeline.");
@@ -3909,6 +4263,10 @@ export default function App() {
     return {
       sourcePath: source.path,
       modelId: targetModelId,
+      colorizationMode,
+      colorizerModelId: isColorizationStepEnabled ? (overrides?.colorizerModelId ?? colorizerModelId) : null,
+      colorizationContext: isColorizationStepEnabled ? selectedColorizationContext : null,
+      deepremasterProcessingMode,
       outputMode,
       qualityPreset,
       interpolationMode,
@@ -3943,10 +4301,20 @@ export default function App() {
       ? (runtime ?? await ensureRuntime())
       : await ensureRuntime();
 
-    const requestModel = getModelDefinition(request.modelId);
-    const launchRequirement = modelLaunchRequirement(requestModel, nextRuntime);
-    if (launchRequirement) {
-      throw new Error(launchRequirement);
+    if (request.colorizationMode !== "off" && request.colorizerModelId) {
+      const requestColorizer = getModelDefinition(request.colorizerModelId);
+      const colorizerRequirement = modelLaunchRequirement(requestColorizer, nextRuntime);
+      if (colorizerRequirement) {
+        throw new Error(colorizerRequirement);
+      }
+    }
+
+    if (request.colorizationMode !== "colorizeOnly") {
+      const requestModel = getModelDefinition(request.modelId);
+      const launchRequirement = modelLaunchRequirement(requestModel, nextRuntime);
+      if (launchRequirement) {
+        throw new Error(launchRequirement);
+      }
     }
 
     setActivePipelineRequest(request);
@@ -3962,6 +4330,102 @@ export default function App() {
     setActiveJobId(jobId);
     setStatus(options?.queuedStatus ?? "Job queued.");
     return jobId;
+  }
+
+  async function refreshSourceContextLibrary(sourcePath: string): Promise<SourceContextLibrary | null> {
+    const library = await desktopApi.getSourceContextLibrary(sourcePath);
+    setSourceContextLibrary(library);
+    setSelectedColorContextEntryIds((current) => {
+      if (!library) {
+        return current.length === 0 ? current : [];
+      }
+      const availableIds = new Set(library.entries.map((entry) => entry.entryId));
+      const filtered = current.filter((entryId) => availableIds.has(entryId));
+      const normalized = normalizeColorContextSelection(filtered, { singleSelection: isColorMNetSelected });
+      return sameStringSet(normalized, current) ? current : normalized;
+    });
+    return library;
+  }
+
+  async function addSourceContextFiles(): Promise<void> {
+    if (!source) {
+      setStatus("Select a source video before adding context.");
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      setError(null);
+      const selectedPaths = await desktopApi.selectContextFiles();
+      if (selectedPaths.length === 0) {
+        setStatus("Context import cancelled.");
+        return;
+      }
+
+      const previousEntryIds = new Set(sourceContextLibrary?.entries.map((entry) => entry.entryId) ?? []);
+      const importedLibrary = await desktopApi.importSourceContextFiles(source.path, selectedPaths);
+      setSourceContextLibrary(importedLibrary);
+      const newlyImportedEntryIds = importedLibrary.entries
+        .filter((entry) => !previousEntryIds.has(entry.entryId))
+        .map((entry) => entry.entryId);
+      const importedCount = newlyImportedEntryIds.length;
+      const skippedCount = Math.max(0, selectedPaths.length - importedCount);
+      setSelectedColorContextEntryIds((current) => {
+        return normalizeColorContextSelection([...current, ...newlyImportedEntryIds], {
+          singleSelection: isColorMNetSelected,
+          preferLast: true,
+        });
+      });
+      if (importedCount > 0 && skippedCount > 0) {
+        setStatus(`Imported ${importedCount} new context image${importedCount === 1 ? "" : "s"}. Skipped ${skippedCount} duplicate${skippedCount === 1 ? "" : "s"}.`);
+      } else if (importedCount > 0) {
+        setStatus(`Imported ${importedCount} context image${importedCount === 1 ? "" : "s"}.`);
+      } else {
+        setStatus(`Skipped ${skippedCount} duplicate context image${skippedCount === 1 ? "" : "s"}.`);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setStatus("Context import failed.");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function removeSourceContextEntry(entryId: string, fileName: string): Promise<void> {
+    if (!source) {
+      setStatus("Select a source video before editing context.");
+      return;
+    }
+
+    try {
+      setIsBusy(true);
+      setError(null);
+      const updatedLibrary = await desktopApi.removeSourceContextEntry(source.path, entryId);
+      setSourceContextLibrary(updatedLibrary);
+      setSelectedColorContextEntryIds((current) => {
+        const remaining = current.filter((value) => value !== entryId);
+        return normalizeColorContextSelection(remaining, { singleSelection: isColorMNetSelected });
+      });
+      setStatus(`Deleted context image ${fileName}.`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setStatus("Context deletion failed.");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  function toggleColorContextEntry(entryId: string): void {
+    setSelectedColorContextEntryIds((current) => current.includes(entryId)
+      ? current.filter((value) => value !== entryId)
+      : normalizeColorContextSelection([...current, entryId], {
+        singleSelection: isColorMNetSelected,
+        preferLast: true,
+      }));
+  }
+
+  function clearSelectedColorContextEntries(): void {
+    setSelectedColorContextEntryIds([]);
   }
 
   async function confirmInterpolationPolicy(): Promise<boolean> {
@@ -3988,7 +4452,12 @@ export default function App() {
       setSource(summary);
       await resolveSourcePreviewUrl(summary.previewPath || summary.path);
       setPreviewPlaybackPath(null);
-      setOutputPath(defaultOutputPath(summary, container, modelId));
+      setOutputPath(defaultOutputPath(summary, container, primaryPipelineModelId({
+        upscaleModelId: modelId,
+        colorizerModelId,
+        isUpscaleStepEnabled,
+        isColorizationStepEnabled,
+      })));
       setResult(null);
       setPipelineJob(null);
       setActiveJobId(null);
@@ -4080,15 +4549,33 @@ export default function App() {
       return;
     }
 
-    if (!isSelectedModelImplemented) {
+    if (isUpscaleStepEnabled && !isSelectedModelImplemented) {
       setError(`${selectedModel.label} is cataloged but not implemented yet.`);
       setStatus("Selected model is not implemented yet.");
       return;
     }
 
-    if (!isSelectedModelLaunchable) {
+    if (isColorizationStepEnabled && !isSelectedColorizerImplemented) {
+      setError(`${selectedColorizerModel.label} is cataloged but not implemented yet.`);
+      setStatus("Selected colorizer is not implemented yet.");
+      return;
+    }
+
+    if (isUpscaleStepEnabled && !isSelectedModelLaunchable) {
       setError(selectedModelLaunchRequirement);
       setStatus("Selected model needs additional runtime setup before it can run.");
+      return;
+    }
+
+    if (isColorizationStepEnabled && !isSelectedColorizerLaunchable) {
+      setError(selectedColorizerLaunchRequirement);
+      setStatus("Selected colorizer needs additional runtime setup before it can run.");
+      return;
+    }
+
+    if (selectedColorizerReferenceRequirement) {
+      setError(selectedColorizerReferenceRequirement);
+      setStatus("Selected colorizer needs a reference still before it can run.");
       return;
     }
 
@@ -4107,7 +4594,17 @@ export default function App() {
 
       setStatus("Starting Real-ESRGAN pipeline...");
       await startPipelineFromRequest(
-        buildPipelineRequest(modelId, selectedOutputPath, previewMode, previewMode ? previewDurationSeconds : null),
+        buildPipelineRequest(
+          primaryPipelineModelId({
+            upscaleModelId: modelId,
+            colorizerModelId,
+            isUpscaleStepEnabled,
+            isColorizationStepEnabled,
+          }),
+          selectedOutputPath,
+          previewMode,
+          previewMode ? previewDurationSeconds : null,
+        ),
         { ensureRuntime: true, queuedStatus: "Job queued." }
       );
     } catch (caught) {
@@ -4119,19 +4616,37 @@ export default function App() {
     }
   }
 
+  async function cancelPipelineJobById(jobId: string, statusMessage: string, failureMessage: string): Promise<void> {
+    try {
+      setIsBusy(true);
+      setError(null);
+      await desktopApi.cancelPipelineJob(jobId);
+      setStatus(statusMessage);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setStatus(failureMessage);
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
   async function cancelPipeline(): Promise<void> {
     if (!activeJobId) {
       return;
     }
 
+    await cancelPipelineJobById(activeJobId, "Stopping pipeline...", "Failed to stop pipeline.");
+  }
+
+  async function pausePipelineJobById(jobId: string, statusMessage: string, failureMessage: string): Promise<void> {
     try {
       setIsBusy(true);
       setError(null);
-      await desktopApi.cancelPipelineJob(activeJobId);
-      setStatus("Stopping pipeline...");
+      await desktopApi.pausePipelineJob(jobId);
+      setStatus(statusMessage);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
-      setStatus("Failed to stop pipeline.");
+      setStatus(failureMessage);
     } finally {
       setIsBusy(false);
     }
@@ -4142,14 +4657,18 @@ export default function App() {
       return;
     }
 
+    await pausePipelineJobById(activeJobId, "Pausing pipeline...", "Failed to pause pipeline.");
+  }
+
+  async function resumePipelineJobById(jobId: string, statusMessage: string, failureMessage: string): Promise<void> {
     try {
       setIsBusy(true);
       setError(null);
-      await desktopApi.pausePipelineJob(activeJobId);
-      setStatus("Pausing pipeline...");
+      await desktopApi.resumePipelineJob(jobId);
+      setStatus(statusMessage);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
-      setStatus("Failed to pause pipeline.");
+      setStatus(failureMessage);
     } finally {
       setIsBusy(false);
     }
@@ -4160,17 +4679,7 @@ export default function App() {
       return;
     }
 
-    try {
-      setIsBusy(true);
-      setError(null);
-      await desktopApi.resumePipelineJob(activeJobId);
-      setStatus("Resuming pipeline...");
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-      setStatus("Failed to resume pipeline.");
-    } finally {
-      setIsBusy(false);
-    }
+    await resumePipelineJobById(activeJobId, "Resuming pipeline...", "Failed to resume pipeline.");
   }
 
   async function cancelSourceConversion(): Promise<void> {
@@ -4231,6 +4740,8 @@ export default function App() {
 
   function clearLoadedInput(): void {
     setSource(null);
+    setSourceContextLibrary(null);
+    setSelectedColorContextEntryIds([]);
     setSourcePathStats(null);
     setSourceConversionJob(null);
     setSourceConversionJobId(null);
@@ -4397,7 +4908,16 @@ export default function App() {
     }
 
     if (selectedBlindComparisonModelIds.length < 2) {
-      setError("Blind comparison needs at least two runnable models.");
+      setError(`Blind comparison needs at least two runnable ${blindComparisonSubjectLabel}.`);
+      return;
+    }
+
+    if (
+      isColorizationStepEnabled
+      && selectedBlindComparisonModelIds.includes("colormnet")
+      && !selectedColorizationContext
+    ) {
+      setError("ColorMNet needs one selected reference still before blind comparison can start.");
       return;
     }
 
@@ -4409,6 +4929,17 @@ export default function App() {
       const startOffsetSeconds = normalizePreviewStartOffsetSeconds(source, blindComparisonStartOffsetSeconds);
       const shuffledModels = shuffleModels(selectedBlindComparisonModelIds);
       const runToken = Date.now().toString(36);
+      const comparisonSignature = buildBlindComparisonSignature({
+        sourcePath: source.path,
+        previewDurationSeconds: duration,
+        previewStartOffsetSeconds: startOffsetSeconds,
+        colorizationMode,
+        interpolationMode,
+        upscaleModelId: modelId,
+        candidateModelIds: shuffledModels,
+        colorizationContext: selectedColorizationContext,
+        deepremasterProcessingMode,
+      });
       const startedEntries = shuffledModels.map((candidateModelId, index) => {
         const anonymousLabel = `Sample ${String.fromCharCode(65 + index)}`;
         return {
@@ -4423,6 +4954,7 @@ export default function App() {
       setBlindComparison({
         state: "running",
         startedAt: Date.now(),
+        comparisonSignature,
         entries: startedEntries,
         previewDurationSeconds: duration,
         previewStartOffsetSeconds: startOffsetSeconds,
@@ -4441,12 +4973,19 @@ export default function App() {
       void (async () => {
         for (const entry of startedEntries) {
           try {
-            const outputPath = blindComparisonOutputPath(source, BLIND_COMPARISON_PREVIEW_CONTAINER, entry.modelId, entry.anonymousLabel, runToken);
+            const outputPath = blindComparisonOutputPath(source, BLIND_COMPARISON_PREVIEW_CONTAINER, entry.anonymousLabel, runToken);
+            const comparisonTargetModelId = primaryPipelineModelId({
+              upscaleModelId: isColorizationStepEnabled ? modelId : entry.modelId,
+              colorizerModelId: entry.modelId,
+              isUpscaleStepEnabled,
+              isColorizationStepEnabled,
+            });
             const jobId = await desktopApi.startPipeline(
-              buildPipelineRequest(entry.modelId, outputPath, true, duration, {
+              buildPipelineRequest(comparisonTargetModelId, outputPath, true, duration, {
                 codec: BLIND_COMPARISON_PREVIEW_CODEC,
                 container: BLIND_COMPARISON_PREVIEW_CONTAINER,
                 previewStartOffsetSeconds: startOffsetSeconds,
+                colorizerModelId: isColorizationStepEnabled ? entry.modelId : undefined,
               })
             );
 
@@ -4475,6 +5014,18 @@ export default function App() {
                 } : current);
                 setError(nextError);
                 setStatus("Blind comparison failed.");
+                return;
+              }
+
+              if (nextStatus.state === "cancelled") {
+                const nextMessage = nextStatus.progress.message || nextStatus.error || "Blind comparison cancelled.";
+                setBlindComparison((current) => current ? {
+                  ...current,
+                  state: "failed",
+                  error: nextMessage,
+                } : current);
+                setError(null);
+                setStatus("Blind comparison cancelled.");
                 return;
               }
 
@@ -4528,6 +5079,7 @@ export default function App() {
         sourcePath: source.path,
         previewDurationSeconds: blindComparison.previewDurationSeconds,
         previewStartOffsetSeconds: blindComparison.previewStartOffsetSeconds,
+        comparisonSignature: blindComparison.comparisonSignature,
         winnerModelId: winner.modelId,
         candidateModelIds: blindComparison.entries.map((entry) => entry.modelId),
       });
@@ -4540,6 +5092,7 @@ export default function App() {
           startedAt: blindComparison.startedAt ?? 0,
           previewDurationSeconds: blindComparison.previewDurationSeconds,
           previewStartOffsetSeconds: blindComparison.previewStartOffsetSeconds,
+          comparisonSignature: blindComparison.comparisonSignature,
           winnerModelId: winner.modelId,
           candidateModelIds: blindComparison.entries.map((entry) => entry.modelId),
         } satisfies BlindComparisonRevealPayload)).catch(() => {
@@ -4652,7 +5205,7 @@ export default function App() {
               <div className="status-card-header-copy">
                 <span className="status-label">{compactStatusTitle}</span>
                 <div className="status-card-headline-row">
-                  <strong>{isSourceConversionRunning ? "Preparing source preview" : activeManagedJob ? managedJobLabel(activeManagedJob.label, activeManagedJob.sourcePath) : compactPipelineLabel}</strong>
+                  <strong>{isSourceConversionRunning ? "Preparing source preview" : activeBlindComparisonEntry ? `Blind Comparison ${activeBlindComparisonEntry.anonymousLabel}` : activeManagedJob ? managedJobLabel(activeManagedJob.label, activeManagedJob.sourcePath) : compactPipelineLabel}</strong>
                 </div>
               </div>
             </div>
@@ -4665,7 +5218,9 @@ export default function App() {
               <span data-testid="top-status-eta">
                 {activePrimaryJob && (activePrimaryJob.progress.estimatedRemainingSeconds ?? 0) > 0
                   ? `ETA ${formatElapsedSeconds(activePrimaryJob.progress.estimatedRemainingSeconds)}`
-                  : isPipelineRunning || isSourceConversionRunning
+                  : activeBlindComparisonJob && (activeBlindComparisonJob.progress.estimatedRemainingSeconds ?? 0) > 0
+                    ? `ETA ${formatElapsedSeconds(activeBlindComparisonJob.progress.estimatedRemainingSeconds)}`
+                  : isPipelineRunning || isBlindComparisonJobRunning || isSourceConversionRunning
                     ? "ETA pending"
                     : "Not running"}
               </span>
@@ -4711,10 +5266,10 @@ export default function App() {
                     data-testid="top-status-pause-button"
                     onClick={topStatusPauseAction}
                     disabled={isBusy}
-                    aria-label={isPipelinePaused || isSourceConversionPaused ? "Resume the active job" : "Pause the active job"}
-                    title={isPipelinePaused || isSourceConversionPaused ? "Resume the active job." : "Pause the active job."}
+                    aria-label={isPipelinePaused || isBlindComparisonJobPaused || isSourceConversionPaused ? "Resume the active job" : "Pause the active job"}
+                    title={isPipelinePaused || isBlindComparisonJobPaused || isSourceConversionPaused ? "Resume the active job." : "Pause the active job."}
                   >
-                    {isPipelinePaused || isSourceConversionPaused ? <span className="status-resume-icon" aria-hidden="true" /> : <span className="status-pause-icon" aria-hidden="true" />}
+                    {isPipelinePaused || isBlindComparisonJobPaused || isSourceConversionPaused ? <span className="status-resume-icon" aria-hidden="true" /> : <span className="status-pause-icon" aria-hidden="true" />}
                   </button>
                 ) : null}
                 {topStatusStopAction ? (
@@ -4724,8 +5279,8 @@ export default function App() {
                     data-testid="top-status-stop-button"
                     onClick={topStatusStopAction}
                     disabled={isBusy}
-                    aria-label={isPipelineRunning ? "Stop the active job" : "Stop the active source conversion"}
-                    title={isPipelineRunning ? "Stop the active job." : "Stop the active source conversion."}
+                    aria-label={isPipelineRunning || isBlindComparisonJobRunning ? "Stop the active job" : "Stop the active source conversion"}
+                    title={isPipelineRunning || isBlindComparisonJobRunning ? "Stop the active job." : "Stop the active source conversion."}
                   >
                     <span className="status-stop-icon" aria-hidden="true" />
                   </button>
@@ -5393,6 +5948,180 @@ export default function App() {
               </p>
             </div>
 
+            <section className={`pipeline-stage-panel${isColorizationStepEnabled ? " pipeline-stage-panel-enabled" : ""}${activePipelineVisualStep === "colorize" ? " pipeline-stage-panel-current" : ""}`} data-testid="pipeline-colorization-details">
+              <div className="pipeline-stage-panel-header" data-testid="pipeline-colorization-summary">
+                <div className="pipeline-stage-heading-block" data-testid="colorizer-section-card">
+                  <span className="catalog-chip">Colorize</span>
+                  <strong>Restore grayscale footage</strong>
+                  <span>{selectedColorizerModel.label}</span>
+                </div>
+                <button type="button" role="switch" aria-checked={isColorizationStepEnabled} className={`pipeline-switch${isColorizationStepEnabled ? " pipeline-switch-enabled" : ""}`} data-testid="pipeline-toggle-colorization" onClick={() => setIsColorizationStepEnabled((current) => !current)}>
+                  <span className="pipeline-switch-track"><span className="pipeline-switch-thumb" /></span>
+                  <span className="pipeline-switch-label">{isColorizationStepEnabled ? "On" : "Off"}</span>
+                </button>
+              </div>
+              {isColorizationStepEnabled ? (
+                <section className="pipeline-stage-body" data-testid="colorizer-workspace-section">
+                  <label>
+                    Colorizer Model
+                    <select data-testid="colorizer-model-select" value={colorizerModelId} onChange={(event) => setColorizerModelId(event.target.value as ModelId)}>
+                      {runnableColorizerModels.length > 0 ? (
+                        <optgroup label="Available Now">
+                          {runnableColorizerModels.map((model) => (
+                            <option key={model.value} value={model.value}>{model.label}</option>
+                          ))}
+                        </optgroup>
+                      ) : null}
+                      <optgroup label="Planned">
+                        {plannedColorizerModels.map((model) => (
+                          <option key={model.value} value={model.value}>{model.label} (not implemented)</option>
+                        ))}
+                      </optgroup>
+                    </select>
+                  </label>
+                  {isDeepRemasterSelected ? (
+                    <label>
+                      DeepRemaster Processing
+                      <select
+                        data-testid="deepremaster-processing-mode-select"
+                        value={deepremasterProcessingMode}
+                        onChange={(event) => setDeepremasterProcessingMode(event.target.value as DeepRemasterProcessingMode)}
+                      >
+                        {deepRemasterProcessingModes.map((mode) => (
+                          <option key={mode.value} value={mode.value}>{mode.label}</option>
+                        ))}
+                      </select>
+                      <span className="input-hint">{selectedDeepRemasterProcessingMode.detail}</span>
+                    </label>
+                  ) : null}
+                  <section className="color-context-panel" data-testid="color-context-panel">
+                    <div className="color-context-panel-header">
+                      <div>
+                        <strong>Context</strong>
+                        <p className="summary" data-testid="color-context-summary">
+                          {colorizerContextSummary(selectedColorizerModel, selectedColorizerSupportsReferenceContext)}
+                        </p>
+                      </div>
+                      <div className="color-context-actions">
+                        <button
+                          type="button"
+                          className="action-button secondary-button"
+                          data-testid="color-context-add-button"
+                          onClick={() => void addSourceContextFiles()}
+                          disabled={!source || !selectedColorizerSupportsReferenceContext || isBusy}
+                        >
+                          Add Context
+                        </button>
+                        <button
+                          type="button"
+                          className="action-button ghost-button"
+                          data-testid="color-context-clear-selection-button"
+                          onClick={clearSelectedColorContextEntries}
+                          disabled={effectiveSelectedColorContextEntryIds.length === 0}
+                        >
+                          Clear Selection
+                        </button>
+                      </div>
+                    </div>
+                    {sourceContextLibrary ? (
+                      <div className="color-context-library-card" data-testid="color-context-library-card">
+                        <div className="color-context-library-meta">
+                          <span>Library: {sourceContextLibrary.libraryId}</span>
+                          <span>{effectiveSelectedColorContextEntryIds.length}/{sourceContextLibrary.entries.length} selected</span>
+                        </div>
+                        <p className="summary color-context-path" data-testid="color-context-library-path">{sourceContextLibrary.refsPath}</p>
+                        {sourceContextLibrary.entries.length > 0 ? (
+                          <div className="color-context-entry-list" data-testid="color-context-entry-list">
+                            {sourceContextLibrary.entries.map((entry) => {
+                              const checked = effectiveSelectedColorContextEntryIds.includes(entry.entryId);
+                              const checkboxId = `color-context-entry-${entry.entryId}`;
+                              return (
+                                <div key={entry.entryId} className={`color-context-entry${checked ? " color-context-entry-selected" : ""}`}>
+                                  <input
+                                    id={checkboxId}
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={() => toggleColorContextEntry(entry.entryId)}
+                                    disabled={!selectedColorizerSupportsReferenceContext || isBusy}
+                                    data-testid={checkboxId}
+                                  />
+                                  <label htmlFor={checkboxId} className="color-context-entry-copy">
+                                    <strong>{entry.fileName}</strong>
+                                    <span>{entry.relativePath}</span>
+                                  </label>
+                                  <button
+                                    type="button"
+                                    className="action-button ghost-button color-context-entry-delete-button"
+                                    data-testid={`color-context-entry-delete-${entry.entryId}`}
+                                    onClick={() => void removeSourceContextEntry(entry.entryId, entry.fileName)}
+                                    disabled={isBusy}
+                                  >
+                                    Delete
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <p className="summary">This source has a context library folder, but it does not contain any imported reference images yet.</p>
+                        )}
+                        {isColorMNetSelected ? (
+                          <p className="summary" data-testid="colormnet-context-guidance">
+                            ColorMNet runs from one anchor still that matches the target shot geometry as closely as possible. Selecting another still replaces the previous exemplar for this run.
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <p className="summary" data-testid="color-context-empty-state">
+                        {source
+                          ? "No context library exists for this source yet. Use Add Context to create one under the source-linked library folder."
+                          : "Select a source video to work with a source-linked context library."}
+                      </p>
+                    )}
+                  </section>
+                  <details className="pipeline-detail-disclosure" data-testid="colorizer-details-card">
+                    <summary className="pipeline-detail-summary">
+                      <span className="source-detail-summary-label">Colorizer notes</span>
+                      <span className="source-detail-summary-value">{selectedColorizerModel.label} • {selectedColorizerBackend.label} • {colorizationMode === "beforeUpscale" ? "Runs before upscale" : "Standalone colorization"}</span>
+                    </summary>
+                    <div className="pipeline-detail-body">
+                      <div className="catalog-card-header">
+                        <strong data-testid="selected-colorizer-label">{selectedColorizerModel.label}</strong>
+                        <span className={`catalog-chip execution-${!isSelectedColorizerImplemented ? "planned" : isSelectedColorizerLaunchable ? selectedColorizerModel.executionStatus : "setup-required"}`} data-testid="selected-colorizer-status">
+                          {!isSelectedColorizerImplemented ? "not implemented" : isSelectedColorizerLaunchable ? selectedColorizerModel.executionStatus : "setup required"}
+                        </span>
+                      </div>
+                      <p className="summary" data-testid="selected-colorizer-summary">{selectedColorizerModel.summary}</p>
+                      {!isSelectedColorizerImplemented ? (
+                        <p className="summary" data-testid="selected-colorizer-availability">{colorizerAvailabilitySummary(selectedColorizerModel)}</p>
+                      ) : !isSelectedColorizerLaunchable ? (
+                        <p className="summary" data-testid="selected-colorizer-launch-requirement">{selectedColorizerLaunchRequirement}</p>
+                      ) : selectedColorizerReferenceRequirement ? (
+                        <p className="summary" data-testid="selected-colorizer-reference-requirement">{selectedColorizerReferenceRequirement}</p>
+                      ) : null}
+                      <dl className="facts compact-facts">
+                        <div><dt>Backend</dt><dd>{selectedColorizerBackend.label}</dd></div>
+                        <div><dt>Runtime Model</dt><dd>{selectedColorizerModel.runtimeModelName}</dd></div>
+                        <div><dt>Support Tier</dt><dd>{selectedColorizerModel.supportTier}</dd></div>
+                        <div><dt>Quality Rank</dt><dd>#{selectedColorizerModel.qualityRank}</dd></div>
+                        {isDeepRemasterSelected ? <div><dt>Processing Mode</dt><dd>{selectedDeepRemasterProcessingMode.label}</dd></div> : null}
+                        <div><dt>Pipeline Order</dt><dd>{colorizationMode === "beforeUpscale" ? "Colorize before upscale" : "Colorize without upscale"}</dd></div>
+                        <div><dt>Suitability</dt><dd>{selectedColorizerModel.mediaSuitability.join(", ")}</dd></div>
+                      </dl>
+                    </div>
+                  </details>
+                  <p className="summary" data-testid="colorization-workspace-summary">
+                    The colorization stage can swap between locally runnable model backends so the app can compare quality and performance across different pipeline combinations.
+                  </p>
+                </section>
+              ) : null}
+            </section>
+
+            <div className="pipeline-arrow pipeline-arrow-large" aria-hidden="true">
+              <span className="pipeline-arrow-shaft" />
+              <span className="pipeline-arrow-head" />
+            </div>
+
             <section className={`pipeline-stage-panel${isUpscaleStepEnabled ? " pipeline-stage-panel-enabled" : ""}${activePipelineVisualStep === "upscale" ? " pipeline-stage-panel-current" : ""}`} data-testid="pipeline-upscale-details">
               <div className="pipeline-stage-panel-header" data-testid="pipeline-upscale-summary">
                 <div className="pipeline-stage-heading-block" data-testid="upscaler-section-card">
@@ -5689,7 +6418,7 @@ export default function App() {
             <label>
               Output File
               <div className="path-picker-row">
-                <input data-testid="output-path-input" className="path-readonly-input" type="text" value={outputPath ?? defaultOutputPath(source, container, modelId)} readOnly />
+                <input data-testid="output-path-input" className="path-readonly-input" type="text" value={outputPath ?? defaultOutputPath(source, container, primaryPipelineModelId({ upscaleModelId: modelId, colorizerModelId, isUpscaleStepEnabled, isColorizationStepEnabled }))} readOnly />
                 <button data-testid="save-output-button" className="action-button secondary-button" onClick={() => void chooseOutputFile()} disabled={isRunDisabled}>
                   Save As
                 </button>
@@ -5708,6 +6437,11 @@ export default function App() {
                 {selectedModelLaunchRequirement}
               </p>
             ) : null}
+            {hasEnabledPipelineStep && isColorizationStepEnabled && !isSelectedColorizerLaunchable ? (
+              <p className="summary" data-testid="run-disabled-colorizer-reason">
+                {selectedColorizerLaunchRequirement}
+              </p>
+            ) : null}
             <details className="pipeline-detail-disclosure pipeline-runtime-disclosure">
               <summary className="pipeline-detail-summary">
                 <span className="source-detail-summary-label">Runtime details</span>
@@ -5718,7 +6452,8 @@ export default function App() {
                   <dl className="facts compact-facts">
                     <div><dt>FFmpeg</dt><dd>{runtime.ffmpegPath}</dd></div>
                     <div><dt>Real-ESRGAN</dt><dd>{runtime.realesrganPath}</dd></div>
-                    <div><dt>Selected Model</dt><dd>{selectedModel.label}</dd></div>
+                    <div><dt>Selected Upscaler</dt><dd>{selectedModel.label}</dd></div>
+                    <div><dt>Selected Colorizer</dt><dd>{isColorizationStepEnabled ? selectedColorizerModel.label : "Off"}</dd></div>
                     <div><dt>Detected GPUs</dt><dd>{runtime.availableGpus.length > 0 ? runtime.availableGpus.map((gpu) => `${gpu.id}: ${gpu.name}`).join(" | ") : "None detected"}</dd></div>
                     <div><dt>Selected GPU</dt><dd>{selectedGpu ? `${selectedGpu.id}: ${selectedGpu.name}` : "Automatic / none"}</dd></div>
                     <div><dt>Saved Ratings</dt><dd>{Object.keys(appConfig?.modelRatings ?? {}).length}</dd></div>
@@ -6128,6 +6863,7 @@ export default function App() {
               <div className="progress-stat-grid">
                 <span className="truncated-line" data-testid="progress-total-frames" title={`Total Frames: ${pipelineJob.progress.totalFrames || "?"}`}>Total Frames: {pipelineJob.progress.totalFrames || "?"}</span>
                 <span className="truncated-line" data-testid="progress-extracted-frames" title={`Extracted PNGs: ${pipelineJob.progress.extractedFrames}`}>Extracted PNGs: {pipelineJob.progress.extractedFrames}</span>
+                <span className="truncated-line" data-testid="progress-colorized-frames" title={`Colorized PNGs: ${pipelineJob.progress.colorizedFrames}`}>Colorized PNGs: {pipelineJob.progress.colorizedFrames}</span>
                 <span className="truncated-line" data-testid="progress-upscaled-frames" title={`Upscaled PNGs: ${pipelineJob.progress.upscaledFrames}`}>Upscaled PNGs: {pipelineJob.progress.upscaledFrames}</span>
                 <span className="truncated-line" data-testid="progress-interpolated-frames" title={`Interpolated PNGs: ${pipelineJob.progress.interpolatedFrames}`}>Interpolated PNGs: {pipelineJob.progress.interpolatedFrames}</span>
                 <span className="truncated-line" data-testid="progress-encoded-frames" title={`Encoded Frames: ${pipelineJob.progress.encodedFrames}`}>Encoded Frames: {pipelineJob.progress.encodedFrames}</span>

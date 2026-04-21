@@ -14,8 +14,13 @@ async function openInterpolationControls(page) {
   }
 }
 
+const blindComparisonUpscalerIds = ["realesrgan-x4plus", "realesrnet-x4plus", "bsrgan-x4", "swinir-realworld-x4"];
+const blindComparisonColorizerIds = ["ddcolor-modelscope", "ddcolor-paper", "deoldify-stable", "deoldify-video"];
+
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
+    const mockBlindComparisonUpscalerIds = ["realesrgan-x4plus", "realesrnet-x4plus", "bsrgan-x4", "swinir-realworld-x4"];
+    const mockBlindComparisonColorizerIds = ["ddcolor-modelscope", "ddcolor-paper", "deoldify-stable", "deoldify-video"];
     let activeJob = null;
     let activeConversionJob = null;
     let lastRequest = null;
@@ -25,9 +30,51 @@ test.beforeEach(async ({ page }) => {
     const confirmMessages = [];
     const pipelineRequests = [];
     const previewLoadPaths = [];
+    const sourceContextLibraries = new Map();
+    const nextContextSelection = ["C:/fixtures/reference-still-a.jpg"];
     const appConfig = {
       modelRatings: {},
       blindComparisons: []
+    };
+    const fileNameFromPath = (inputPath) => String(inputPath).replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? "context";
+    const sourceFingerprint = (inputPath) => {
+      let hash = 0;
+      for (const character of String(inputPath).replace(/\\/g, "/").toLowerCase()) {
+        hash = (hash * 33 + character.charCodeAt(0)) >>> 0;
+      }
+      return hash.toString(16).padStart(8, "0");
+    };
+    const libraryIdForSource = (sourcePath) => `${fileNameFromPath(sourcePath).replace(/\.[^.]+$/, "").toLowerCase()}-${sourceFingerprint(sourcePath)}`;
+    const createContextEntry = (library, importPath, index) => {
+      const fileName = fileNameFromPath(importPath);
+      return {
+        entryId: `${fileName.replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase() || "context"}-${index + 1}`,
+        fileName,
+        relativePath: `refs/${fileName}`,
+        absolutePath: `${library.refsPath}/${fileName}`,
+        sizeBytes: 1024,
+        createdAt: new Date().toISOString()
+      };
+    };
+    const ensureSourceContextLibrary = (sourcePath) => {
+      const existing = sourceContextLibraries.get(sourcePath);
+      if (existing) {
+        return existing;
+      }
+
+      const libraryId = libraryIdForSource(sourcePath);
+      const created = {
+        libraryId,
+        sourcePath,
+        sourceFileName: fileNameFromPath(sourcePath),
+        sourceFingerprint: sourceFingerprint(sourcePath),
+        folderPath: `C:/workspace/artifacts/context-libraries/${libraryId}`,
+        refsPath: `C:/workspace/artifacts/context-libraries/${libraryId}/refs`,
+        createdAt: new Date().toISOString(),
+        entries: []
+      };
+      sourceContextLibraries.set(sourcePath, created);
+      return created;
     };
     window.confirm = (message) => {
       confirmMessages.push(String(message));
@@ -44,6 +91,9 @@ test.beforeEach(async ({ page }) => {
     window.__UPSCALER_MOCK__ = {
       async selectVideoFile() {
         return "C:/fixtures/sample-input.mp4";
+      },
+      async selectContextFiles() {
+        return [...nextContextSelection];
       },
       async selectOutputFile(_defaultPath, container) {
         return `C:/exports/upscaled-result.${container}`;
@@ -80,6 +130,30 @@ test.beforeEach(async ({ page }) => {
           hasAudio: true,
           container: "mp4",
           videoCodec: "h264"
+        };
+      },
+      async getSourceContextLibrary(sourcePath) {
+        return sourceContextLibraries.get(sourcePath) ?? null;
+      },
+      async importSourceContextFiles(sourcePath, importPaths) {
+        const library = ensureSourceContextLibrary(sourcePath);
+        for (const importPath of importPaths) {
+          if (library.entries.some((entry) => entry.fileName === fileNameFromPath(importPath))) {
+            continue;
+          }
+          library.entries.push(createContextEntry(library, importPath, library.entries.length));
+        }
+        return {
+          ...library,
+          entries: [...library.entries]
+        };
+      },
+      async removeSourceContextEntry(sourcePath, entryId) {
+        const library = ensureSourceContextLibrary(sourcePath);
+        library.entries = library.entries.filter((entry) => entry.entryId !== entryId);
+        return {
+          ...library,
+          entries: [...library.entries]
         };
       },
       async startSourceConversionToMp4(sourcePath) {
@@ -502,8 +576,8 @@ test.beforeEach(async ({ page }) => {
         lastRequest = request;
         pipelineRequests.push(request);
         window.__UPSCALER_TEST_STATE__.lastRequest = request;
-        if (request.gpuId !== 0) {
-          throw new Error(`Expected selected GPU 0, received ${request.gpuId}`);
+        if (typeof request.gpuId !== "number") {
+          throw new Error(`Expected a numeric GPU selection, received ${request.gpuId}`);
         }
         if (request.modelId === "swinir-realworld-x4" && !["torch", "tensorrt"].includes(request.pytorchRunner)) {
           throw new Error(`Expected a valid PyTorch runner for SwinIR, received ${request.pytorchRunner}`);
@@ -517,47 +591,58 @@ test.beforeEach(async ({ page }) => {
         if (request.interpolationMode === "off" && request.interpolationTargetFps !== null) {
           throw new Error(`Expected null interpolation target when interpolation is off, received ${request.interpolationTargetFps}`);
         }
-        if (![
-          "realesrgan-x4plus",
-          "realesrnet-x4plus",
-          "bsrgan-x4",
-          "swinir-realworld-x4",
-          "rvrt-x4"
-        ].includes(request.modelId)) {
-          throw new Error(`Expected selected model realesrgan-x4plus, received ${request.modelId}`);
+        if (![...mockBlindComparisonUpscalerIds, "rvrt-x4", ...mockBlindComparisonColorizerIds].includes(request.modelId)) {
+          throw new Error(`Received unsupported mock model id ${request.modelId}`);
         }
         const modelSuffix = request.modelId.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+        const colorizeOnly = request.colorizationMode === "colorizeOnly";
+        const colorizationEnabled = request.colorizationMode !== "off";
         const interpolationEnabled = request.interpolationMode !== "off";
+        const activePhase = colorizeOnly
+          ? "colorizing"
+          : interpolationEnabled
+            ? "interpolating"
+            : "upscaling";
+        const progressMessage = colorizeOnly
+          ? "Colorizing extracted frames"
+          : interpolationEnabled
+            ? "Interpolating additional frames"
+            : "Upscaling extracted frames";
+        const previewFrameCount = request.previewMode ? 72 : (interpolationEnabled ? 750 : 300);
+        const previewOutputWidth = colorizeOnly ? 1280 : 3840;
+        const previewOutputHeight = colorizeOnly ? 720 : 2160;
         activeJob = {
           jobId: `mock-job-${modelSuffix}`,
           state: "running",
           progress: {
-            phase: interpolationEnabled ? "interpolating" : "upscaling",
+            phase: activePhase,
             percent: 62,
-            message: interpolationEnabled ? "Interpolating additional frames" : "Upscaling extracted frames",
-            processedFrames: interpolationEnabled ? 430 : 180,
-            totalFrames: interpolationEnabled ? 750 : 300,
-            extractedFrames: 300,
-            upscaledFrames: interpolationEnabled ? 300 : 180,
+            message: progressMessage,
+            processedFrames: colorizeOnly ? 48 : interpolationEnabled ? 430 : 180,
+            totalFrames: previewFrameCount,
+            extractedFrames: colorizeOnly ? previewFrameCount : 300,
+            colorizedFrames: colorizationEnabled ? (colorizeOnly ? 48 : 180) : 0,
+            upscaledFrames: colorizeOnly ? 0 : interpolationEnabled ? 300 : 180,
             interpolatedFrames: interpolationEnabled ? 430 : 0,
             encodedFrames: 0,
             remuxedFrames: 0,
             segmentIndex: 1,
             segmentCount: 1,
-            segmentProcessedFrames: interpolationEnabled ? 430 : 180,
-            segmentTotalFrames: interpolationEnabled ? 750 : 300,
-            batchIndex: interpolationEnabled ? null : 15,
-            batchCount: interpolationEnabled ? null : 25,
+            segmentProcessedFrames: colorizeOnly ? 48 : interpolationEnabled ? 430 : 180,
+            segmentTotalFrames: previewFrameCount,
+            batchIndex: colorizeOnly || interpolationEnabled ? null : 15,
+            batchCount: colorizeOnly || interpolationEnabled ? null : 25,
             elapsedSeconds: 30,
-            averageFramesPerSecond: interpolationEnabled ? 14.5 : 6,
-            rollingFramesPerSecond: interpolationEnabled ? 16.2 : 7.5,
-            estimatedRemainingSeconds: interpolationEnabled ? 22 : 20,
+            averageFramesPerSecond: colorizeOnly ? 7.5 : interpolationEnabled ? 14.5 : 6,
+            rollingFramesPerSecond: colorizeOnly ? 8.1 : interpolationEnabled ? 16.2 : 7.5,
+            estimatedRemainingSeconds: colorizeOnly ? 12 : interpolationEnabled ? 22 : 20,
             processRssBytes: 1024 * 1024 * 512,
             gpuMemoryUsedBytes: 1024 * 1024 * 6144,
             gpuMemoryTotalBytes: 1024 * 1024 * 24576,
             scratchSizeBytes: 1024 * 1024 * 12,
             outputSizeBytes: 1024 * 1024 * 3,
             extractStageSeconds: 4,
+            colorizeStageSeconds: colorizationEnabled ? 8 : 0,
             upscaleStageSeconds: interpolationEnabled ? 18 : 18,
             interpolateStageSeconds: interpolationEnabled ? 11 : 0,
             encodeStageSeconds: 5,
@@ -583,19 +668,19 @@ test.beforeEach(async ({ page }) => {
               videoCodec: "vp9"
             },
             outputMedia: {
-              width: 3840,
-              height: 2160,
+              width: previewOutputWidth,
+              height: previewOutputHeight,
               frameRate: interpolationEnabled ? 60 : 24,
               durationSeconds: 12.5,
-              frameCount: interpolationEnabled ? 750 : 300,
+              frameCount: previewFrameCount,
               aspectRatio: 16 / 9,
-              pixelCount: 3840 * 2160,
+              pixelCount: previewOutputWidth * previewOutputHeight,
               hasAudio: true,
               container: request.container,
               videoCodec: request.codec
             },
             effectiveSettings: {
-              backendId: request.modelId === "rvrt-x4" ? "pytorch-video-sr" : "pytorch-image-sr",
+              backendId: colorizeOnly ? "pytorch-image-colorization" : request.modelId === "rvrt-x4" ? "pytorch-video-sr" : "pytorch-image-sr",
               qualityPreset: request.qualityPreset,
               requestedTileSize: request.tileSize,
               effectiveTileSize: request.tileSize,
@@ -612,10 +697,11 @@ test.beforeEach(async ({ page }) => {
             executionPath: interpolationEnabled ? "streaming" : "file-io",
             videoEncoder: request.codec === "h265" ? "hevc_nvenc" : "h264_nvenc",
             videoEncoderLabel: request.codec === "h265" ? "NVIDIA NVENC H.265" : "NVIDIA NVENC H.264",
-            runner: request.modelId === "rvrt-x4" ? "torch" : request.pytorchRunner,
+            runner: colorizeOnly || mockBlindComparisonColorizerIds.includes(request.modelId) ? "torch" : request.modelId === "rvrt-x4" ? "torch" : request.pytorchRunner,
             precision: "fp16",
             stageTimings: {
               extractSeconds: 4,
+              colorizeSeconds: colorizationEnabled ? 8 : 0,
               upscaleSeconds: 18,
               interpolateSeconds: interpolationEnabled ? 11 : 0,
               encodeSeconds: 5,
@@ -655,8 +741,8 @@ test.beforeEach(async ({ page }) => {
             } : null,
             log: [
               `Completed mock pipeline for ${request.modelId}`,
-              `Average throughput: ${interpolationEnabled ? "14.50" : "6.00"} fps`,
-              `Stage timings: extract 4s, upscale 18s, interpolate ${interpolationEnabled ? "11s" : "0s"}, encode 5s, remux 3s`,
+              `Average throughput: ${colorizeOnly ? "7.50" : interpolationEnabled ? "14.50" : "6.00"} fps`,
+              `Stage timings: extract 4s, colorize ${colorizationEnabled ? "8s" : "0s"}, upscale 18s, interpolate ${interpolationEnabled ? "11s" : "0s"}, encode 5s, remux 3s`,
               "Remuxed original audio"
             ]
           },
@@ -1335,6 +1421,144 @@ test("captures a blind comparison start offset and forwards it through preview r
   expect(Number(appConfig.blindComparisons[0]?.previewStartOffsetSeconds)).toBeGreaterThan(2);
 });
 
+test("routes blind comparison through colorizers when only colorization is enabled", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByTestId("select-video-button").click();
+  await page.getByTestId("pipeline-toggle-colorization").click();
+  await page.getByTestId("pipeline-toggle-upscale").click();
+  await page.getByTestId("blind-test-panel-toggle").click();
+  await page.getByTestId("run-blind-comparison-button").click();
+  await expect(page.getByTestId("comparison-inspector")).toBeVisible();
+
+  const { pipelineRequests } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+  const blindPreviewRequests = pipelineRequests.filter((request) => request.previewMode === true);
+  expect(blindPreviewRequests).toHaveLength(4);
+  expect(blindPreviewRequests.every((request) => request.colorizationMode === "colorizeOnly")).toBe(true);
+  expect(blindPreviewRequests.every((request) => request.modelId === request.colorizerModelId)).toBe(true);
+  expect([...new Set(blindPreviewRequests.map((request) => request.modelId))].sort()).toEqual(["ddcolor-modelscope", "ddcolor-paper", "deoldify-stable", "deoldify-video"]);
+});
+
+test("routes blind comparison through the selected upscaler while varying colorizers when colorize and upscale are both enabled", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByTestId("select-video-button").click();
+  await page.getByTestId("pipeline-toggle-colorization").click();
+  await page.getByTestId("model-select").selectOption("realesrnet-x4plus");
+  await page.getByTestId("blind-test-panel-toggle").click();
+  await page.getByTestId("run-blind-comparison-button").click();
+  await expect(page.getByTestId("comparison-inspector")).toBeVisible();
+
+  const { pipelineRequests } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+  const blindPreviewRequests = pipelineRequests.filter((request) => request.previewMode === true);
+  expect(blindPreviewRequests).toHaveLength(4);
+  expect(blindPreviewRequests.every((request) => request.colorizationMode === "beforeUpscale")).toBe(true);
+  expect(blindPreviewRequests.every((request) => request.modelId === "realesrnet-x4plus")).toBe(true);
+  expect([...new Set(blindPreviewRequests.map((request) => request.colorizerModelId))].sort()).toEqual(["ddcolor-modelscope", "ddcolor-paper", "deoldify-stable", "deoldify-video"]);
+});
+
+test("routes blind comparison through interpolate-after-upscale when interpolation is enabled", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByTestId("select-video-button").click();
+  await openInterpolationControls(page);
+  await page.getByTestId("frame-rate-target-select").selectOption("60");
+  await page.getByTestId("blind-test-panel-toggle").click();
+  await page.getByTestId("run-blind-comparison-button").click();
+  await expect(page.getByTestId("comparison-inspector")).toBeVisible();
+
+  const { pipelineRequests } = await page.evaluate(() => window.__UPSCALER_TEST_STATE__);
+  const blindPreviewRequests = pipelineRequests.filter((request) => request.previewMode === true);
+  expect(blindPreviewRequests).toHaveLength(4);
+  expect(blindPreviewRequests.every((request) => request.colorizationMode === "off")).toBe(true);
+  expect(blindPreviewRequests.every((request) => request.interpolationMode === "afterUpscale")).toBe(true);
+  expect(blindPreviewRequests.every((request) => request.interpolationTargetFps === 60)).toBe(true);
+  expect([...new Set(blindPreviewRequests.map((request) => request.modelId))].sort()).toEqual(["bsrgan-x4", "realesrgan-x4plus", "realesrnet-x4plus", "swinir-realworld-x4"]);
+});
+
+test("keeps top-status pause and stop controls available for active blind comparison jobs", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() => {
+    if (!window.__UPSCALER_MOCK__ || !window.__UPSCALER_TEST_STATE__) {
+      return;
+    }
+
+    const blindJobState = {
+      jobId: "blind-compare-live-job",
+      state: "running",
+      progress: {
+        phase: "colorizing",
+        percent: 33,
+        message: "Colorizing blind sample",
+        processedFrames: 24,
+        totalFrames: 72,
+        extractedFrames: 72,
+        colorizedFrames: 24,
+        upscaledFrames: 0,
+        interpolatedFrames: 0,
+        encodedFrames: 0,
+        remuxedFrames: 0,
+      },
+    };
+
+    window.__UPSCALER_MOCK__.startPipeline = async (request) => {
+      window.__UPSCALER_TEST_STATE__.pipelineRequests.push(request);
+      window.__UPSCALER_TEST_STATE__.lastRequest = request;
+      return blindJobState.jobId;
+    };
+    window.__UPSCALER_MOCK__.getPipelineJob = async () => ({
+      jobId: blindJobState.jobId,
+      state: blindJobState.state,
+      progress: { ...blindJobState.progress },
+      result: null,
+      error: blindJobState.state === "cancelled" ? "Job cancelled by user" : null,
+    });
+    window.__UPSCALER_MOCK__.pausePipelineJob = async () => {
+      blindJobState.state = "paused";
+      blindJobState.progress = {
+        ...blindJobState.progress,
+        phase: "paused",
+        message: "Paused: Colorizing blind sample",
+      };
+    };
+    window.__UPSCALER_MOCK__.resumePipelineJob = async () => {
+      blindJobState.state = "running";
+      blindJobState.progress = {
+        ...blindJobState.progress,
+        phase: "colorizing",
+        message: "Resumed: Colorizing blind sample",
+      };
+    };
+    window.__UPSCALER_MOCK__.cancelPipelineJob = async () => {
+      blindJobState.state = "cancelled";
+      blindJobState.progress = {
+        ...blindJobState.progress,
+        phase: "failed",
+        message: "Job cancelled by user",
+      };
+    };
+  });
+
+  await page.getByTestId("select-video-button").click();
+  await page.getByTestId("pipeline-toggle-colorization").click();
+  await page.getByTestId("pipeline-toggle-upscale").click();
+  await page.getByTestId("blind-test-panel-toggle").click();
+  await page.getByTestId("run-blind-comparison-button").click();
+
+  await expect(page.getByTestId("top-status-pause-button")).toBeVisible();
+  await expect(page.getByTestId("top-status-stop-button")).toBeVisible();
+
+  await page.getByTestId("top-status-pause-button").click();
+  await expect(page.getByTestId("top-status-panel")).toContainText("Blind Comparison Paused");
+
+  await page.getByTestId("top-status-pause-button").click();
+  await expect(page.getByTestId("top-status-panel")).toContainText("Blind Comparison Running");
+
+  await page.getByTestId("top-status-stop-button").click();
+  await expect(page.locator(".error-text")).toContainText("Job cancelled by user");
+});
+
 test("shows the PyTorch runner selector only for PyTorch image SR models and passes the selection through", async ({ page }) => {
   await page.goto("/");
 
@@ -1397,6 +1621,28 @@ test("warns per job when the interpolation target is not higher than the source 
   expect(confirmMessages[0]).toContain("selected interpolation target of 30 fps is not higher");
   expect(lastRequest?.interpolationMode).toBe("interpolateOnly");
   expect(lastRequest?.interpolationTargetFps).toBe(30);
+});
+
+test("dedupes repeated context imports and allows deleting source context entries", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByTestId("select-video-button").click();
+  await page.getByTestId("pipeline-toggle-colorization").click();
+  await page.getByTestId("colorizer-model-select").selectOption("deepremaster");
+
+  await page.getByTestId("color-context-add-button").click();
+  await expect(page.getByTestId("color-context-entry-list").locator(".color-context-entry")).toHaveCount(1);
+  await expect(page.getByTestId("top-status-panel")).toContainText("Imported 1 context image");
+
+  await page.getByTestId("color-context-add-button").click();
+  await expect(page.getByTestId("color-context-entry-list").locator(".color-context-entry")).toHaveCount(1);
+  await expect(page.getByTestId("top-status-panel")).toContainText("Skipped 1 duplicate context image");
+
+  const deleteButton = page.locator('[data-testid^="color-context-entry-delete-"]');
+  await deleteButton.click();
+
+  await expect(page.getByTestId("top-status-panel")).toContainText("Deleted context image reference-still-a.jpg");
+  await expect(page.getByTestId("color-context-library-card")).toContainText("does not contain any imported reference images yet");
 });
 
 test("keeps export format controls available for interpolation-only jobs and matches supported input settings", async ({ page }) => {
@@ -2123,7 +2369,7 @@ test("shows historical cleanup jobs and runs cleanup actions", async ({ page }) 
   await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Container: mkv");
   await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Average Throughput: 15.0 fps");
   await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Current Throughput: calculating");
-  await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Stage Times: extract 6s, upscale 52s, encode 15s, remux 7s");
+  await expect(page.getByTestId("cleanup-details-historic-pipeline-job")).toContainText("Stage Times: extract 6s, colorize 0s, upscale 52s, encode 15s, remux 7s");
   await expect(page.getByTestId("cleanup-clear-scratch-historic-pipeline-job")).toHaveAttribute("title", /intermediate working files/i);
 
   await page.getByTestId("cleanup-open-output-historic-pipeline-job").click();

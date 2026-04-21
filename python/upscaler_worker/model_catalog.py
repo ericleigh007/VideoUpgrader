@@ -51,6 +51,10 @@ def model_label(model_id: str) -> str:
     return str(get_model_definition(model_id)["label"])
 
 
+def model_task(model_id: str) -> str:
+    return str(get_model_definition(model_id).get("task", "upscale"))
+
+
 def model_backend_id(model_id: str) -> str:
     return str(get_model_definition(model_id)["backendId"])
 
@@ -89,19 +93,48 @@ def model_support_tier(model_id: str) -> str:
     return str(get_model_definition(model_id).get("supportTier", "next"))
 
 
+def model_supports_context_input(model_id: str) -> bool:
+    return bool(get_model_definition(model_id).get("supportsContextInput", False))
+
+
+def model_supported_context_kinds(model_id: str) -> list[str]:
+    supported = get_model_definition(model_id).get("supportedContextKinds", [])
+    if not isinstance(supported, list):
+        return []
+    return [str(kind) for kind in supported]
+
+
 def visible_ui_models() -> list[dict[str, object]]:
-    return [model for model in model_catalog() if bool(model.get("visibleInUi"))]
+    return [model for model in model_catalog() if bool(model.get("visibleInUi")) and str(model.get("task", "upscale")) == "upscale"]
+
+
+def visible_colorizer_models() -> list[dict[str, object]]:
+    return [model for model in model_catalog() if bool(model.get("visibleInUi")) and str(model.get("task", "upscale")) == "colorize"]
 
 
 def comparison_eligible_models() -> list[dict[str, object]]:
     return [
         model for model in model_catalog()
-        if bool(model.get("comparisonEligible")) and str(model.get("executionStatus")) == "runnable"
+        if str(model.get("task", "upscale")) == "upscale"
+        and bool(model.get("comparisonEligible"))
+        and str(model.get("executionStatus")) == "runnable"
+    ]
+
+
+def comparison_eligible_colorizer_models() -> list[dict[str, object]]:
+    return [
+        model for model in model_catalog()
+        if str(model.get("task", "upscale")) == "colorize"
+        and bool(model.get("comparisonEligible"))
+        and str(model.get("executionStatus")) == "runnable"
     ]
 
 
 def top_rated_models() -> list[dict[str, object]]:
-    ranked_models = [model for model in model_catalog() if int(model.get("qualityRank", 999)) <= 6]
+    ranked_models = [
+        model for model in model_catalog()
+        if str(model.get("task", "upscale")) == "upscale" and int(model.get("qualityRank", 999)) <= 6
+    ]
     return sorted(ranked_models, key=lambda model: int(model.get("qualityRank", 999)))
 
 

@@ -503,6 +503,19 @@ def benchmark_fixture(
                     pytorch_runner=pytorch_runner,
                 )
             )
+        elif backend_id == "pytorch-image-colorization":
+            results.append(
+                _benchmark_colorizer_fixture(
+                    degraded_paths=degraded_paths,
+                    width=width,
+                    height=height,
+                    model_id=model_id,
+                    tile_size=tile_size,
+                    repeats=repeats,
+                    gpu_id=gpu_id,
+                    precision=precision_mode,
+                )
+            )
         elif backend_id == "realesrgan-ncnn":
             results.append(
                 _benchmark_ncnn_fixture(
@@ -539,7 +552,7 @@ def benchmark_fixture(
         "modelId": model_id,
         "modelLabel": model_label(model_id),
         "backendId": backend_id,
-        "runner": pytorch_runner if backend_id == "pytorch-image-sr" else "external-executable",
+        "runner": "torch" if backend_id == "pytorch-image-colorization" else pytorch_runner if backend_id == "pytorch-image-sr" else "external-executable",
         "repeats": repeats,
         "precision": precision_mode,
         "results": results,
@@ -781,6 +794,69 @@ def _benchmark_pytorch_fixture(
             "averageInferenceSeconds": round(avg_infer, 4),
             "averageBatchLoadSeconds": round(avg_load, 4),
             "averageSaveSeconds": round(avg_save, 4),
+            "bestImagesPerSecond": round(_safe_images_per_second(len(degraded_paths), best_wall), 3),
+            "bestMegapixelsPerSecond": round(_safe_megapixels_per_second(len(degraded_paths), width, height, best_wall), 3),
+        },
+        "notes": log,
+    }
+
+
+def _benchmark_colorizer_fixture(
+    *,
+    degraded_paths: list[Path],
+    width: int,
+    height: int,
+    model_id: str,
+    tile_size: int,
+    repeats: int,
+    gpu_id: int | None,
+    precision: str,
+) -> dict[str, object]:
+    from upscaler_worker.models.colorizers import colorize_directory, load_runtime_colorizer
+
+    log: list[str] = []
+    load_started = time.perf_counter()
+    _emit_live_status(f"Loading colorizer {model_id} precision={precision}")
+    loaded_model = load_runtime_colorizer(model_id, gpu_id, precision, log)
+    model_load_seconds = time.perf_counter() - load_started
+
+    repeat_metrics: list[dict[str, object]] = []
+    input_dir = degraded_paths[0].parent
+    for repeat_index in range(repeats):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "colorized"
+            wall_started = time.perf_counter()
+            colorized_count = colorize_directory(
+                loaded_model=loaded_model,
+                input_dir=input_dir,
+                output_dir=output_dir,
+                cancel_path=None,
+                pause_path=None,
+            )
+            wall_seconds = time.perf_counter() - wall_started
+            repeat_metrics.append(
+                {
+                    "repeat": repeat_index + 1,
+                    "wallSeconds": wall_seconds,
+                    "imagesPerSecond": _safe_images_per_second(colorized_count, wall_seconds),
+                    "megapixelsPerSecond": _safe_megapixels_per_second(colorized_count, width, height, wall_seconds),
+                    "outputFrameCount": colorized_count,
+                }
+            )
+
+    best_wall = min(metric["wallSeconds"] for metric in repeat_metrics)
+    avg_wall = sum(metric["wallSeconds"] for metric in repeat_metrics) / len(repeat_metrics)
+    return {
+        "tileSize": tile_size,
+        "modelLoadSeconds": round(model_load_seconds, 4),
+        "runner": "torch",
+        "frameBatchSize": 1,
+        "dtype": loaded_model.precision_mode,
+        "device": str(loaded_model.device),
+        "repeatMetrics": repeat_metrics,
+        "summary": {
+            "bestWallSeconds": round(best_wall, 4),
+            "averageWallSeconds": round(avg_wall, 4),
             "bestImagesPerSecond": round(_safe_images_per_second(len(degraded_paths), best_wall), 3),
             "bestMegapixelsPerSecond": round(_safe_megapixels_per_second(len(degraded_paths), width, height, best_wall), 3),
         },

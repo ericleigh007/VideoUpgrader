@@ -20,6 +20,8 @@ if (-not (Test-Path $venvPython)) {
 $env:UPSCALER_PYTHON = $venvPython
 
 $python = Get-UpscalerPython
+$requirementsPath = Join-Path $repoRoot "python\requirements.txt"
+$ddcolorRequirement = "git+https://github.com/piddnad/DDColor.git@master"
 
 $previousPythonPath = $env:PYTHONPATH
 $env:PYTHONPATH = (Join-Path $repoRoot "python")
@@ -28,7 +30,6 @@ Push-Location $repoRoot
 try {
 	Invoke-CheckedCommand -Command { npm install } -FailureMessage "npm install failed."
 	Invoke-CheckedCommand -Command { & $python -m pip install --upgrade pip } -FailureMessage "pip upgrade failed."
-	Invoke-CheckedCommand -Command { & $python -m pip install -r "$PSScriptRoot/../python/requirements.txt" } -FailureMessage "Python dependency installation failed."
 
  	$torchIndexUrl = if ($env:UPSCALER_TORCH_INDEX_URL) {
 		$env:UPSCALER_TORCH_INDEX_URL
@@ -51,6 +52,16 @@ try {
  	Invoke-CheckedCommand -Command {
 		& $python -m pip install --upgrade --force-reinstall --index-url $torchIndexUrl "torch==$torchVersion" "torchvision==$torchVisionVersion"
 	} -FailureMessage "PyTorch GPU runtime installation failed."
+
+	$tempRequirementsPath = [System.IO.Path]::GetTempFileName()
+	try {
+		(Get-Content $requirementsPath) | Where-Object { $_.Trim() -ne $ddcolorRequirement } | Set-Content $tempRequirementsPath
+		Invoke-CheckedCommand -Command { & $python -m pip install --no-build-isolation -r $tempRequirementsPath } -FailureMessage "Python dependency installation failed."
+		Invoke-CheckedCommand -Command { & $python -m pip install --no-build-isolation --no-deps $ddcolorRequirement } -FailureMessage "DDColor dependency installation failed."
+	}
+	finally {
+		Remove-Item $tempRequirementsPath -ErrorAction SilentlyContinue
+	}
 
  	Invoke-CheckedCommand -Command {
 		& $python -m upscaler_worker.cli prefetch-app-assets

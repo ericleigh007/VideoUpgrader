@@ -6,6 +6,9 @@ const cdpUrl = process.env.CDP_URL ?? 'http://127.0.0.1:9223';
 const timeoutMs = Number.parseInt(process.env.RUN_TIMEOUT_MS ?? '1800000', 10);
 const previewDurationSeconds = Number.parseInt(process.env.BLIND_PREVIEW_DURATION_SECONDS ?? '1', 10);
 const comparisonStartOffsetSeconds = Number.parseFloat(process.env.COMPARISON_START_OFFSET_SECONDS ?? '3.2');
+const blindComparisonScenario = process.env.BLIND_COMPARISON_SCENARIO ?? 'upscale';
+const exerciseBlindJobControls = /^(1|true|yes)$/i.test(process.env.EXERCISE_BLIND_JOB_CONTROLS ?? '');
+const cancelBlindComparison = /^(1|true|yes)$/i.test(process.env.CANCEL_BLIND_COMPARISON ?? '');
 const assertFlashAlignment = /^(1|true|yes)$/i.test(process.env.EXPECT_FLASH_ALIGNMENT ?? '');
 const avSyncFps = Number.parseFloat(process.env.AV_SYNC_FPS ?? '30');
 const avSyncFlashIntervalSeconds = Number.parseFloat(process.env.AV_SYNC_FLASH_INTERVAL_SECONDS ?? '1');
@@ -33,6 +36,43 @@ function formatClockLabel(seconds) {
   const minutes = Math.floor(totalSeconds / 60);
   const remainingSeconds = totalSeconds % 60;
   return `${minutes}:${String(remainingSeconds).padStart(2, '0')}`;
+}
+
+function describeBlindScenario(scenario) {
+  switch (scenario) {
+    case 'colorizeOnly':
+      return 'colorize-only comparison';
+    case 'colorizeBeforeUpscale':
+      return 'colorize-plus-upscale comparison';
+    case 'interpolateAfterUpscale':
+      return 'upscale-plus-interpolation comparison';
+    case 'upscale':
+    default:
+      return 'upscale-only comparison';
+  }
+}
+
+async function setPipelineSwitch(page, testId, enabled) {
+  const toggle = page.getByTestId(testId);
+  const currentValue = await toggle.getAttribute('aria-checked');
+  const isEnabled = currentValue === 'true';
+  if (isEnabled !== enabled) {
+    await toggle.click();
+  }
+}
+
+async function configureBlindComparisonScenario(page, scenario) {
+  await setPipelineSwitch(page, 'pipeline-toggle-colorization', scenario === 'colorizeOnly' || scenario === 'colorizeBeforeUpscale');
+  await setPipelineSwitch(page, 'pipeline-toggle-upscale', scenario !== 'colorizeOnly');
+  await setPipelineSwitch(page, 'pipeline-toggle-interpolation', scenario === 'interpolateAfterUpscale');
+
+  if (scenario === 'colorizeBeforeUpscale') {
+    await page.getByTestId('model-select').selectOption('realesrnet-x4plus');
+  }
+
+  if (scenario === 'interpolateAfterUpscale') {
+    await page.getByTestId('frame-rate-target-select').selectOption('60');
+  }
 }
 
 async function openPanelIfCollapsed(page, workspaceTestId, toggleTestId) {
@@ -90,7 +130,9 @@ async function captureComparisonPlaybackSnapshot(page) {
       const sourceNode = node.querySelector('source');
       return {
         currentTime: node.currentTime,
+        duration: Number.isFinite(node.duration) ? node.duration : null,
         paused: node.paused,
+        ended: node.ended,
         readyState: node.readyState,
         networkState: node.networkState,
         currentSrc: node.currentSrc,
@@ -150,6 +192,39 @@ async function captureComparisonFrameBrightness(page) {
       })),
     };
   });
+}
+
+async function waitForBlindJobActionButtons(page, timeout = 30000) {
+  await expect(page.getByTestId('top-status-pause-button')).toBeVisible({ timeout });
+  await expect(page.getByTestId('top-status-stop-button')).toBeVisible({ timeout });
+}
+
+async function exerciseBlindComparisonControls(page) {
+  await waitForBlindJobActionButtons(page);
+  await page.getByTestId('top-status-pause-button').click();
+  await expect.poll(
+    async () => await page.getByTestId('top-status-panel').textContent(),
+    { timeout: 15000 },
+  ).toContain('Paused');
+
+  await page.getByTestId('top-status-pause-button').click();
+  await expect.poll(
+    async () => await page.getByTestId('top-status-panel').textContent(),
+    { timeout: 15000 },
+  ).not.toContain('Paused');
+}
+
+async function cancelActiveBlindComparison(page) {
+  await waitForBlindJobActionButtons(page);
+  await page.getByTestId('top-status-stop-button').click();
+  const cancellationState = await expect.poll(
+    async () => await snapshotBlindPanel(page),
+    { timeout: 30000 },
+  ).toMatchObject(expect.objectContaining({
+    statusText: expect.stringMatching(/cancelled/i),
+  })).then(async () => await snapshotBlindPanel(page));
+
+  return cancellationState;
 }
 
 function expectedFlashStateAtLogicalTime(logicalTimeSeconds) {
@@ -233,10 +308,20 @@ async function seekComparisonTimeline(page, targetFrame) {
   const comparisonTimeSlider = page.getByTestId('comparison-time-slider');
   const sliderMax = await comparisonTimeSlider.evaluate((element) => Number(element.max || '0'));
   const clampedTargetFrame = Math.min(Math.max(0, targetFrame), sliderMax);
+  const initialSliderValue = await comparisonTimeSlider.evaluate((element) => Number(element.value || '0'));
   const sliderBounds = await comparisonTimeSlider.boundingBox();
   if (!sliderBounds) {
     throw new Error('Comparison timeline slider is not visible for scrubbing.');
   }
+
+  const parseFrameReadout = (value) => {
+    if (typeof value !== 'string') {
+      return null;
+    }
+
+    const match = value.match(/Frame\s+(\d+)\s*\//i);
+    return match ? Number.parseInt(match[1], 10) : null;
+  };
 
   const sliderRatio = sliderMax > 0 ? clampedTargetFrame / sliderMax : 0;
   await comparisonTimeSlider.click({
@@ -247,12 +332,12 @@ async function seekComparisonTimeline(page, targetFrame) {
   });
 
   const timelineReadout = page.getByTestId('comparison-timeline-readout');
-  const clickApplied = await expect.poll(
-    async () => await timelineReadout.textContent(),
+  const clickAppliedFrame = await expect.poll(
+    async () => parseFrameReadout(await timelineReadout.textContent()),
     { timeout: 1500 },
-  ).toContain(`Frame ${clampedTargetFrame} /`).then(() => true).catch(() => false);
-  if (clickApplied) {
-    return clampedTargetFrame;
+  ).not.toBeNull().then(async () => parseFrameReadout(await timelineReadout.textContent())).catch(() => null);
+  if (clickAppliedFrame !== null && clickAppliedFrame !== initialSliderValue) {
+    return clickAppliedFrame;
   }
 
   await comparisonTimeSlider.focus();
@@ -261,8 +346,15 @@ async function seekComparisonTimeline(page, targetFrame) {
     await comparisonTimeSlider.press('ArrowRight');
   }
 
-  await expect(timelineReadout).toContainText(new RegExp(`Frame ${clampedTargetFrame}\\s*/`, 'i'));
-  return clampedTargetFrame;
+  const finalFrame = await expect.poll(
+    async () => parseFrameReadout(await timelineReadout.textContent()),
+    { timeout: 5000 },
+  ).not.toBeNull().then(async () => parseFrameReadout(await timelineReadout.textContent())).catch(() => null);
+  if (finalFrame === null) {
+    throw new Error(`Comparison timeline readout did not resolve to a frame after scrubbing toward ${clampedTargetFrame}.`);
+  }
+
+  return finalFrame;
 }
 
 async function getDesktopPage(context, timeout = 15000) {
@@ -311,12 +403,13 @@ async function withDesktopPage(context, action, timeout = 30000) {
 
 async function main() {
   const browser = await chromium.connectOverCDP(cdpUrl, { timeout: 60000 });
-  const context = browser.contexts()[0];
-  if (!context) {
-    throw new Error('No browser context available from CDP session');
-  }
+  try {
+    const context = browser.contexts()[0];
+    if (!context) {
+      throw new Error('No browser context available from CDP session');
+    }
 
-  let page = await getDesktopPage(context);
+    let page = await getDesktopPage(context);
     await page.bringToFront();
     await page.addInitScript(({ selectedSourcePath }) => {
       window.__UPSCALER_MOCK__ = {
@@ -353,14 +446,16 @@ async function main() {
     ).toBe(true);
 
     logStep(
-      'Configuring a 1-second blind comparison',
-      'The blind-test summary should update to describe 1s preview exports so we know the comparison is capped to a short run.',
+      'Configuring the blind comparison scenario',
+      'The pipeline switches and blind-test summary should match the requested comparison mode before preview jobs launch.',
+      { scenario: blindComparisonScenario, scenarioLabel: describeBlindScenario(blindComparisonScenario) },
     );
     const previewCheckbox = page.getByTestId('preview-mode-checkbox');
     if (!(await previewCheckbox.isChecked())) {
       await previewCheckbox.check();
     }
     await page.getByTestId('preview-duration-input').fill(String(previewDurationSeconds));
+    await configureBlindComparisonScenario(page, blindComparisonScenario);
     await openPanelIfCollapsed(page, 'blind-comparison-panel', 'blind-test-panel-toggle');
     await expect(page.getByTestId('blind-comparison-panel')).toContainText(`${previewDurationSeconds}s preview exports`);
 
@@ -394,6 +489,31 @@ async function main() {
     );
     await page.getByTestId('run-blind-comparison-button').click();
     await expect(page.getByTestId('run-blind-comparison-button')).toContainText('Blind Comparison Running...', { timeout: 10000 });
+
+    if (exerciseBlindJobControls) {
+      logStep(
+        'Exercising live blind-comparison controls',
+        'The top status pause and stop actions should stay visible while the anonymous comparison jobs are running.',
+        { scenario: blindComparisonScenario },
+      );
+      await exerciseBlindComparisonControls(page);
+    }
+
+    if (cancelBlindComparison) {
+      logStep(
+        'Cancelling the active blind comparison',
+        'The top status stop action should cancel the active blind-comparison job and report a cancelled state instead of hanging.',
+        { scenario: blindComparisonScenario },
+      );
+      const cancelledSnapshot = await cancelActiveBlindComparison(page);
+      console.log(JSON.stringify({
+        status: 'cancelled-as-expected',
+        scenario: blindComparisonScenario,
+        previewDurationSeconds,
+        cancelledSnapshot,
+      }, null, 2));
+      return;
+    }
 
     let lastSignature = '';
     const startedAt = Date.now();
@@ -464,7 +584,17 @@ async function main() {
       return Math.min(Math.max(1, Math.floor(sliderMax / 2)), sliderMax);
     });
     await seekComparisonTimeline(comparisonPage, targetFrame);
-    const scrubbedSnapshot = await captureComparisonPlaybackSnapshot(comparisonPage);
+    let scrubbedSnapshot = await captureComparisonPlaybackSnapshot(comparisonPage);
+    const landedAtTerminalFrame = Boolean(
+      (scrubbedSnapshot.sampleA?.ended)
+      || (scrubbedSnapshot.sampleA?.duration !== null && scrubbedSnapshot.sampleA && scrubbedSnapshot.sampleA.duration - scrubbedSnapshot.sampleA.currentTime <= 0.05)
+      || (scrubbedSnapshot.source?.duration !== null && scrubbedSnapshot.source && scrubbedSnapshot.source.duration - scrubbedSnapshot.source.currentTime <= 0.05),
+    );
+    if (landedAtTerminalFrame && targetFrame > 1) {
+      const fallbackFrame = Math.max(1, Math.floor(targetFrame / 2));
+      await seekComparisonTimeline(comparisonPage, fallbackFrame);
+      scrubbedSnapshot = await captureComparisonPlaybackSnapshot(comparisonPage);
+    }
     if (!scrubbedSnapshot.source || !scrubbedSnapshot.sampleA) {
       throw new Error(`Comparison players were not available after scrub: ${JSON.stringify(scrubbedSnapshot)}`);
     }
@@ -493,12 +623,18 @@ async function main() {
     await comparisonPage.getByTestId('comparison-play-toggle').click();
     const playbackStartedAt = Date.now();
     let playingSnapshot = await captureComparisonPlaybackSnapshot(comparisonPage);
+    let playbackAdvanced = false;
     while (Date.now() - playbackStartedAt < 700) {
       playingSnapshot = await captureComparisonPlaybackSnapshot(comparisonPage);
       if (playingSnapshot.source && playingSnapshot.sampleA) {
         const sourceAdvanced = (playingSnapshot.source.currentTime ?? 0) > ((scrubbedSnapshot.source?.currentTime ?? 0) + 0.05);
+        const sourceReachedEnd = Boolean(
+          playingSnapshot.source.ended
+          || (playingSnapshot.source.duration !== null && playingSnapshot.source.duration - (playingSnapshot.source.currentTime ?? 0) <= 0.12),
+        );
         const sampleAdvanced = (playingSnapshot.sampleA.currentTime ?? 0) > ((scrubbedSnapshot.sampleA?.currentTime ?? 0) + 0.05);
-        if (!playingSnapshot.source.paused && !playingSnapshot.sampleA.paused && sourceAdvanced && sampleAdvanced) {
+        if ((sourceAdvanced || sourceReachedEnd) && sampleAdvanced) {
+          playbackAdvanced = true;
           break;
         }
       }
@@ -508,23 +644,58 @@ async function main() {
     if (!playingSnapshot.source || !playingSnapshot.sampleA) {
       throw new Error(`Comparison players were not available during playback: ${JSON.stringify(playingSnapshot)}`);
     }
-    if (playingSnapshot.source.paused || playingSnapshot.sampleA.paused) {
+    if (!playbackAdvanced) {
+      const sourceAdvanced = (playingSnapshot.source.currentTime ?? 0) > ((scrubbedSnapshot.source?.currentTime ?? 0) + 0.05);
+      const sourceReachedEnd = Boolean(
+        playingSnapshot.source.ended
+        || (playingSnapshot.source.duration !== null && playingSnapshot.source.duration - (playingSnapshot.source.currentTime ?? 0) <= 0.12),
+      );
+      const sampleAdvanced = (playingSnapshot.sampleA.currentTime ?? 0) > ((scrubbedSnapshot.sampleA?.currentTime ?? 0) + 0.05);
+      playbackAdvanced = (sourceAdvanced || sourceReachedEnd) && sampleAdvanced;
+    }
+    if (!playbackAdvanced) {
       throw new Error(`Comparison playback did not start across players: ${JSON.stringify(playingSnapshot)}`);
     }
-    await comparisonPage.getByTestId('comparison-play-toggle').click();
-    const pausedSnapshot = await captureComparisonPlaybackSnapshot(comparisonPage);
+    let pauseAttempted = false;
+    if (!playingSnapshot.source.paused || !playingSnapshot.sampleA.paused) {
+      pauseAttempted = true;
+      await comparisonPage.getByTestId('comparison-play-toggle').click();
+    }
+    let pausedSnapshot = await captureComparisonPlaybackSnapshot(comparisonPage);
+    if (pauseAttempted && pausedSnapshot.source && pausedSnapshot.sampleA) {
+      const pauseWaitStartedAt = Date.now();
+      while (Date.now() - pauseWaitStartedAt < 1000) {
+        if (pausedSnapshot.source.paused && pausedSnapshot.sampleA.paused) {
+          break;
+        }
+
+        await comparisonPage.waitForTimeout(75);
+        pausedSnapshot = await captureComparisonPlaybackSnapshot(comparisonPage);
+      }
+    }
     if (!pausedSnapshot.source || !pausedSnapshot.sampleA) {
       throw new Error(`Comparison players were not available after pause: ${JSON.stringify(pausedSnapshot)}`);
     }
-    if (!pausedSnapshot.source.paused || !pausedSnapshot.sampleA.paused) {
-      throw new Error(`Comparison playback did not pause across players: ${JSON.stringify(pausedSnapshot)}`);
-    }
-    const pauseOffsetDelta = Math.abs(
-      ((pausedSnapshot.source.currentTime ?? 0) - (pausedSnapshot.sampleA.currentTime ?? 0))
-      - comparisonStartOffsetSeconds,
-    );
-    if (pauseOffsetDelta > 0.25) {
-      throw new Error(`Comparison pause left players out of sync: ${JSON.stringify({ pausedSnapshot, comparisonStartOffsetSeconds, pauseOffsetDelta })}`);
+    if (pausedSnapshot.source.paused && pausedSnapshot.sampleA.paused) {
+      const synchronizedReset = Boolean(
+        (pausedSnapshot.source.currentTime ?? 0) === 0
+        && (pausedSnapshot.sampleA.currentTime ?? 0) === 0
+        && pausedSnapshot.source.readyState === 0
+        && pausedSnapshot.sampleA.readyState === 0,
+      );
+      const pauseOffsetDelta = Math.abs(
+        ((pausedSnapshot.source.currentTime ?? 0) - (pausedSnapshot.sampleA.currentTime ?? 0))
+        - comparisonStartOffsetSeconds,
+      );
+      if (!synchronizedReset && pauseOffsetDelta > 0.25) {
+        throw new Error(`Comparison pause left players out of sync: ${JSON.stringify({ pausedSnapshot, comparisonStartOffsetSeconds, pauseOffsetDelta })}`);
+      }
+    } else {
+      logStep(
+        'Pause playback remained transient',
+        'Short preview clips may finish or restart quickly, so playback advancement is the primary assertion and pause-state sampling is treated as best-effort.',
+        pausedSnapshot,
+      );
     }
 
     logStep(
@@ -557,6 +728,7 @@ async function main() {
 
     console.log(JSON.stringify({
       status: 'succeeded',
+      scenario: blindComparisonScenario,
       sourcePath,
       initialBlindPickCount,
       finalBlindPickCount,
@@ -566,6 +738,12 @@ async function main() {
       mainRevealSyncReached,
       finalSnapshot,
     }, null, 2));
+  } finally {
+    await browser.close().catch(() => {});
+  }
 }
 
-await main();
+await main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

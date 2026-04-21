@@ -1,10 +1,15 @@
 numpy>=2.2.4
+pandas>=2.2,<3
 Pillow>=11.1.0
 imageio-ffmpeg>=0.6.0
+huggingface_hub>=0.31,<1
+fastprogress>=0.1.19,<1
+IPython>=8,<9
 spandrel>=0.4.2,<0.5
 packaging>=24,<27
 psutil>=7,<8
 requests>=2.32,<3
+progressbar2>=4.5,<5
 opencv-python-headless>=4.10,<5
 matplotlib>=3.10,<4
 scipy>=1.15,<2
@@ -15,3 +20,4 @@ addict>=2.4,<3
 future>=1.0,<2
 PyYAML>=6.0,<7
 ninja>=1.11,<2
+git+https://github.com/piddnad/DDColor.git@master

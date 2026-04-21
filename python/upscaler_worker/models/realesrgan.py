@@ -15,6 +15,11 @@ def build_realesrgan_job_plan(
     *,
     source_path: str,
     model_id: str,
+    colorization_mode: str = "off",
+    colorizer_model_id: str | None = None,
+    color_context_library_id: str | None = None,
+    color_reference_images: list[str] | None = None,
+    deepremaster_processing_mode: str = "standard",
     output_mode: str,
     preset: str,
     interpolation_mode: str = "off",
@@ -55,6 +60,11 @@ def build_realesrgan_job_plan(
         [
             source_path,
             model_id,
+            colorization_mode,
+            colorizer_model_id or "",
+            color_context_library_id or "",
+            *(color_reference_images or []),
+            deepremaster_processing_mode,
             output_mode,
             preset,
             interpolation_mode,
@@ -98,6 +108,8 @@ def build_realesrgan_job_plan(
         source_path,
         "--model-id",
         model_id,
+        "--colorization-mode",
+        colorization_mode,
         "--output-mode",
         output_mode,
         "--preset",
@@ -119,6 +131,17 @@ def build_realesrgan_job_plan(
         "--crf",
         str(crf),
     ]
+
+    if colorizer_model_id:
+        command.extend(["--colorizer-model-id", colorizer_model_id])
+
+    command.extend(["--deepremaster-processing-mode", deepremaster_processing_mode])
+
+    if color_context_library_id:
+        command.extend(["--color-context-library-id", color_context_library_id])
+
+    for reference_image_path in color_reference_images or []:
+        command.extend(["--color-reference-image", reference_image_path])
 
     if gpu_id is not None:
         command.extend(["--gpu-id", str(gpu_id)])
@@ -185,6 +208,7 @@ def build_realesrgan_job_plan(
         f"CRF: {crf}",
         f"Precision: {precision_mode}",
     ]
+    notes.append(f"DeepRemaster processing mode: {deepremaster_processing_mode}")
     if custom_aspect_width and custom_aspect_height:
         notes.append(f"Custom aspect ratio: {custom_aspect_width}:{custom_aspect_height}")
     if preview_mode:

@@ -79,6 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser("prepare-realesrgan-job")
     prepare.add_argument("--source", required=True)
     prepare.add_argument("--model-id", default="realesrgan-x4plus")
+    prepare.add_argument("--colorization-mode", choices=["off", "colorizeOnly", "beforeUpscale"], default="off")
+    prepare.add_argument("--colorizer-model-id")
+    prepare.add_argument("--color-context-library-id")
+    prepare.add_argument("--color-reference-image", action="append", default=[])
     prepare.add_argument("--output-mode", required=True)
     prepare.add_argument("--preset", required=True)
     prepare.add_argument("--interpolation-mode", choices=["off", "afterUpscale", "interpolateOnly"], default="off")
@@ -130,6 +134,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_job = subparsers.add_parser("run-realesrgan-pipeline")
     run_job.add_argument("--source", required=True)
     run_job.add_argument("--model-id", default="realesrgan-x4plus")
+    run_job.add_argument("--colorization-mode", choices=["off", "colorizeOnly", "beforeUpscale"], default="off")
+    run_job.add_argument("--colorizer-model-id")
+    run_job.add_argument("--color-context-library-id")
+    run_job.add_argument("--color-reference-image", action="append", default=[])
+    run_job.add_argument("--deepremaster-processing-mode", choices=["standard", "high"], default="standard")
     run_job.add_argument("--output-mode", required=True)
     run_job.add_argument("--preset", required=True)
     run_job.add_argument("--interpolation-mode", choices=["off", "afterUpscale", "interpolateOnly"], default="off")
@@ -257,6 +266,11 @@ def main() -> int:
         result = build_realesrgan_job_plan(
             source_path=args.source,
             model_id=args.model_id,
+            colorization_mode=args.colorization_mode,
+            colorizer_model_id=args.colorizer_model_id,
+            color_context_library_id=args.color_context_library_id,
+            color_reference_images=args.color_reference_image,
+            deepremaster_processing_mode=args.deepremaster_processing_mode,
             output_mode=args.output_mode,
             preset=args.preset,
             interpolation_mode=args.interpolation_mode,
@@ -320,6 +334,11 @@ def main() -> int:
         result = run_realesrgan_pipeline(
             source_path=args.source,
             model_id=args.model_id,
+            colorization_mode=args.colorization_mode,
+            colorizer_model_id=args.colorizer_model_id,
+            color_context_library_id=args.color_context_library_id,
+            color_reference_images=args.color_reference_image,
+            deepremaster_processing_mode=args.deepremaster_processing_mode,
             output_mode=args.output_mode,
             preset=args.preset,
             interpolation_mode=args.interpolation_mode,

@@ -19,6 +19,7 @@ Updated April 12, 2026.
 
 - Load a local video and inspect source metadata.
 - Run multiple upscale jobs against the same source material.
+- Run automatic and reference-guided colorization experiments on grayscale footage.
 - Run interpolation-only jobs on an existing source video.
 - Run a combined pipeline that upscales first and then interpolates to a target frame rate.
 - Compare outputs with a zoomed inspection workflow.
@@ -41,15 +42,90 @@ VideoUpgrader is currently centered on:
 
 The current product direction is quality first, performance second.
 
+Colorization is now part of the workstation, but it is still experimental. The current goal is to make it practical to compare approaches, preserve what worked, and iteratively improve difficult grayscale footage rather than claim one-click historically accurate restoration.
+
+## Current State
+
+The current app is a real desktop pipeline, not just a frontend shell around isolated model demos.
+
+- The Tauri desktop host owns file access, job orchestration, persistence, and native integration.
+- The React UI owns the comparison-first workstation workflow, run configuration, jobs view, and context-library management.
+- The Python worker owns media probing, frame extraction, optional colorization, optional upscaling, optional interpolation, encode, concat, audio remux, and benchmark tooling.
+- The model catalog is task-aware and currently distinguishes `upscale` models from `colorize` models, then routes each model request to the correct backend/runtime path.
+
+Today the app can run automatic grayscale-to-color workflows, reference-guided colorization experiments, frame-based image super-resolution, research video-SR through an external runner contract, and RIFE-based frame interpolation in one managed pipeline.
+
 ## Current Processing Modes
 
-The app now supports three distinct video processing modes:
+The app currently supports these processing combinations:
 
+- Colorize only.
 - Upscale only.
+- Colorize before upscale.
 - Interpolate only.
-- Upscale first, then interpolate in the same pipeline.
+- Upscale first, then interpolate.
+- Colorize before upscale, then interpolate.
 
 Interpolation targets currently support 30 fps and 60 fps outputs through the Windows RIFE NCNN runtime.
+
+The exact stages that run depend on the requested mode, but the worker always treats the job as one managed export pipeline with progress telemetry and final output assembly.
+
+## Pipeline Stages
+
+The current worker pipeline is built from these parts:
+
+1. Probe the source and resolve output dimensions, framing rules, codec/container, and effective runtime settings.
+2. Decode or extract the source into working frames, usually in short internal segments for long-form jobs.
+3. Optionally colorize the extracted frames.
+4. Optionally upscale the colorized or original frames.
+5. Optionally interpolate frame rate after the upstream stage completes.
+6. Encode segment outputs to video.
+7. Concatenate segment outputs when the job ran in multiple parts.
+8. Remux the original audio back onto the final video when the source contains audio.
+9. Persist job metadata, stage timings, logs, and effective settings so the run can be inspected or replayed later.
+
+In current worker telemetry, the major exported phases are `extracting`, `colorizing`, `upscaling`, `interpolating`, `encoding`, and `remuxing`.
+
+## How Models Are Handled
+
+Model execution is driven by the catalog in [config/model_catalog.json](config/model_catalog.json). Each model entry declares:
+
+- its task, such as `upscale` or `colorize`
+- the backend family it belongs to
+- whether it is runnable now or only planned
+- whether it is comparison-eligible in the current UI
+- whether it accepts source-linked context input such as reference images
+- any runtime asset metadata like checkpoint download source
+
+The current backend families are:
+
+- `realesrgan-ncnn`: portable NCNN Vulkan execution for bundled Real-ESRGAN-family models.
+- `pytorch-image-sr`: PyTorch frame-by-frame image super-resolution.
+- `pytorch-video-sr`: PyTorch research video-SR through an external runner contract.
+- `pytorch-video-interpolation`: PyTorch or native interpolation support in the worker ecosystem.
+- `pytorch-image-colorization`: PyTorch automatic and reference-guided colorization.
+
+In practical terms, model handling works like this:
+
+- NCNN models run through a portable executable runtime and are the most self-contained path.
+- PyTorch image-SR models run frame batches through Python/Torch and support GPU selection, precision control, and tiling.
+- Research video-SR models like RVRT use an external command contract rather than an in-repo native implementation.
+- Automatic colorizers like DDColor and DeOldify run through the PyTorch image-colorization path without extra context input.
+- Reference-guided colorizers like DeepRemaster and ColorMNet run through the same colorization pipeline but also consume source-linked reference images from the desktop context library.
+
+The worker decides which runtime path to use from the selected model, not from ad hoc per-screen logic. That is what allows the same job pipeline to support colorize-only, before-upscale colorization, and multiple upscale backends without inventing a separate export path for each model.
+
+## Source Context Libraries
+
+Reference-guided colorization uses source-linked context libraries stored under `artifacts/context-libraries`.
+
+- Each source clip gets its own managed reference library.
+- Imported context images are deduplicated so the same content is not added repeatedly.
+- Entries can be selected, cleared, or deleted from the desktop UI.
+- DeepRemaster can use multiple source-linked reference images.
+- ColorMNet is currently integrated as a single-exemplar workflow even though it uses the same library surface for selection.
+
+This matters because the current app is not just passing a loose file picker result into the worker. It is maintaining source-specific reference state that can be reviewed and reused.
 
 ## Job Controls
 
@@ -82,6 +158,12 @@ The Python worker pause path depends on `psutil` for suspending active subproces
 - `bsrgan-x4`: BSRGAN x4 via PyTorch.
 - `swinir-realworld-x4`: SwinIR Real-World x4 via PyTorch.
 - `rvrt-x4`: RVRT x4 via an external video-SR runner configured through `UPSCALER_RVRT_COMMAND`.
+- `ddcolor-modelscope`: DDColor automatic colorization checkpoint via PyTorch.
+- `ddcolor-paper`: higher-fidelity DDColor checkpoint via PyTorch.
+- `deoldify-stable`: conservative DeOldify colorization checkpoint via PyTorch.
+- `deoldify-video`: DeOldify variant tuned for video stability via PyTorch.
+- `deepremaster`: reference-guided DeepRemaster video colorization via PyTorch.
+- `colormnet`: exemplar-guided ColorMNet video colorization via PyTorch.
 - `realesrgan-x4plus-anime`: compatibility model.
 - `realesr-animevideov3-x4`: compatibility model.
 
@@ -94,6 +176,57 @@ The Python worker pause path depends on `psutil` for suspending active subproces
 - `realesrgan-ncnn`: portable NCNN Vulkan backend.
 - `pytorch-image-sr`: PyTorch frame-by-frame image SR backend.
 - `pytorch-video-sr`: research video-SR backend driven by an external command contract.
+- `pytorch-image-colorization`: PyTorch automatic and reference-guided colorization backend.
+
+## Colorization Models
+
+VideoUpgrader now includes several colorization backends with different strengths and different levels of user guidance.
+
+- `ddcolor-modelscope`: fully automatic photo-realistic colorization for grayscale photos and live-action frames. This is a fast baseline when you want plausible color without managing references.
+- `ddcolor-paper`: a higher-fidelity DDColor checkpoint for local comparisons when you want to test whether the paper-weighted model preserves better detail or tone.
+- `deoldify-stable`: a more conservative DeOldify variant that tends to suit portraits and natural live-action material.
+- `deoldify-video`: the DeOldify variant intended to be steadier across consecutive frames, making it a better default than the portrait-focused model for moving footage.
+- `deepremaster`: a reference-guided video colorizer that can use source-associated context images. It is useful when you have stills, posters, or other look references and want the model to steer toward them.
+- `colormnet`: an exemplar-propagation video colorizer built around one anchor reference image that closely matches a shot. It can produce strong matches when the exemplar is very close to the target shot, but it is not a general semantic recoloring system.
+
+In practice, the automatic models are good for fast exploration, while the reference-guided models are the more promising path when you are willing to curate inputs and review shot by shot.
+
+## Upscaling Models
+
+The current upscale side of the app spans a few different model types.
+
+- `realesrgan-x4plus`: the main NCNN Vulkan baseline for photographic footage and the most portable runnable path.
+- `realesrnet-x4plus`: a more conservative PyTorch image-SR baseline.
+- `bsrgan-x4`: a blind real-world SR model for degraded or compressed inputs.
+- `swinir-realworld-x4`: a transformer-based frame SR model for higher-fidelity inspection.
+- `rvrt-x4`: a research-tier video-native model routed through an external runner contract.
+
+These are not treated as equivalent backends. Some are framewise image models, some are video-native research models, and some are packaged through NCNN rather than PyTorch. The catalog and worker are structured to keep those differences explicit.
+
+## Experimental Shot-Based Colorization Workflow
+
+The likely path to decent quality on difficult grayscale film is not a single end-to-end pass over the whole movie. The expected workflow is closer to a finishing pipeline:
+
+1. Split the source video into shots or short visually coherent sections.
+2. Grab a representative frame, often the first frame, from each shot.
+3. Send that frame to an external AI image editor that supports prompt-guided image colorization or image editing.
+4. Manually describe important colors and materials so the edited frame becomes a stronger target look.
+5. Feed the edited frame back into the colorizer as the exemplar or shot reference.
+6. Review the result shot by shot and accept each shot only when it is good enough.
+7. Reassemble the approved shots into a full video.
+8. Check shot boundaries for color continuity problems and rerender or retouch when transitions feel wrong.
+9. Restore the original audio onto the final colorized output.
+
+This is especially relevant for ColorMNet. In the current integration, ColorMNet uses one selected reference image for one run. That makes it a better fit for a shot or a short coherent sequence than for a whole edited reel with changing lighting, framing, and subject emphasis.
+
+## Colorization Caveat
+
+Colorization in VideoUpgrader should currently be treated as experimental.
+
+- These models can generate visually convincing results without producing historically correct color.
+- Reference-guided workflows can still drift when adjacent shots differ too much in lighting, exposure, costume visibility, or composition.
+- Shot-to-shot blending and continuity review are part of the work, not an implementation detail the current app can guarantee away.
+- The app is meant to help evaluate and iterate on colorization strategies, not to present current colorized output as authoritative restoration.
 
 ## Desktop Workflow
 
@@ -101,10 +234,12 @@ The intended workflow is:
 
 1. Select a local source video.
 2. Inspect source metadata and preview.
-3. Choose a model and output framing mode.
-4. Run one or more upscale jobs.
-5. Compare outputs with zoomed inspection and blind samples.
-6. Export the winning result.
+3. Choose whether the job is colorization, upscaling, interpolation, or a combined pipeline.
+4. Pick the active model or models for the enabled stages.
+5. Attach source-linked reference images when a reference-guided colorizer needs them.
+6. Run one or more jobs.
+7. Compare outputs with zoomed inspection and blind samples.
+8. Export the winning result.
 
 The app is designed to support model-vs-model and settings-vs-settings evaluation on the same source material, not just single-pass transcoding.
 
@@ -112,7 +247,7 @@ The app is designed to support model-vs-model and settings-vs-settings evaluatio
 
 ### Main Workspace
 
-The top of the main workspace keeps the source preview, framing, and core run controls in one place.
+The top of the main workspace keeps the source preview, framing, live pipeline summary, and the first colorization controls in one place.
 
 ![Main page top](docs/images/main-page-top.png)
 
@@ -126,11 +261,11 @@ The blind-test box is where you set the one-second or multi-second sample workfl
 
 ### Model And Pipeline Controls
 
-The right-hand model selector is where you choose among runnable upscale models and switch between evaluation targets quickly.
+The focused colorization panel is where you turn the color stage on, choose the active colorizer, tune model-specific options such as DeepRemaster processing mode, and manage the source-linked reference library for that clip.
 
 ![Right-hand model selector](docs/images/right-hand-model-selector.png)
 
-The encoder and interpolation controls sit beside the model controls so output codec, container, and frame-rate boost decisions stay visible while you configure a run.
+The full processing track keeps colorization, upscaling, interpolation, export settings, and the final run action in one continuous path so you can see the whole configured pipeline before launching it.
 
 ![Right-hand encoder and interpolation controls](docs/images/right-hand-w-encoder-and-interpolation.png)
 
@@ -180,7 +315,7 @@ Probe frame at `00:03:30.000`:
 
 ![Probe 00 03 30](docs/images/showcase/probe-00-03-30_000.png)
 
-## Upscale And Interpolation Instructions
+## Pipeline Instructions
 
 ### Desktop App
 
@@ -192,7 +327,17 @@ Launch the desktop app:
 
 Then use one of these workflows:
 
-1. Upscale only
+1. Colorize only
+
+- Select a source video.
+- Enable the Colorization step.
+- Turn the Upscaler and Frame Rate Booster steps off.
+- Choose a colorizer model.
+- If the selected colorizer supports reference images, add them from the source context panel.
+- Choose output codec, container, GPU, and output path.
+- Click Run.
+
+2. Upscale only
 
 - Select a source video.
 - In the Upscaler section, choose the upscale model you want.
@@ -200,7 +345,16 @@ Then use one of these workflows:
 - Choose output sizing, codec, container, GPU, and quality settings.
 - Click Run Upscale.
 
-2. Interpolate an existing video without upscaling
+3. Colorize before upscale
+
+- Select a source video.
+- Enable Colorization and Upscaler.
+- Choose a colorizer model and an upscale model.
+- Add reference images if the colorizer uses source context.
+- Leave Frame Rate Booster off if you only want colorization plus upscale.
+- Click Run.
+
+4. Interpolate an existing video without upscaling
 
 - Select a source video.
 - In Frame Rate Booster, choose Interpolate Existing Video.
@@ -208,18 +362,22 @@ Then use one of these workflows:
 - Set output codec, container, and GPU.
 - Click Run Interpolation.
 
-3. Run the combined VideoUpgrader pipeline
+5. Run the combined VideoUpgrader pipeline
 
 - Select a source video.
 - Choose the upscale model and output sizing settings.
+- Optionally enable Colorization first if you want grayscale footage colorized before upscale.
 - In Frame Rate Booster, choose Interpolate After Upscale.
 - Choose the target frame rate: 30 fps or 60 fps.
 - Click Run Upscale + Interpolation.
 
 Notes:
 
+- `Colorize only` uses the selected colorizer as the active processing model for the run.
+- `Colorize before upscale` runs colorization on extracted frames before the upscale stage begins.
 - If the source is already at or above the selected target frame rate, the app warns before continuing.
 - Interpolation keeps the original audio track attached to the final export.
+- Full pipeline outputs keep the original audio by remuxing it back onto the final rendered video after processing.
 - The result panel includes interpolation diagnostics in a collapsed details box for segment count, overlap, source fps, and output fps.
 
 ### Python Worker CLI
@@ -231,19 +389,31 @@ $env:UPSCALER_PYTHON = (Resolve-Path .\.venv\Scripts\python.exe).Path
 $env:PYTHONPATH='python'
 ```
 
-1. Run upscale only
+1. Run colorize only
+
+```powershell
+& $env:UPSCALER_PYTHON python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id colormnet --colorization-mode colorizeOnly --colorizer-model-id colormnet --color-reference-image path/to/reference.png --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode off --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/colorized-only.mp4 --codec h264 --container mp4
+```
+
+2. Run upscale only
 
 ```powershell
 & $env:UPSCALER_PYTHON python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrgan-x4plus --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode off --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/upscaled-only.mp4 --codec h264 --container mp4
 ```
 
-2. Run interpolation only
+3. Run colorize before upscale
+
+```powershell
+& $env:UPSCALER_PYTHON python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrnet-x4plus --colorization-mode beforeUpscale --colorizer-model-id deepremaster --color-reference-image path/to/reference-a.png --color-reference-image path/to/reference-b.png --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode off --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/colorized-and-upscaled.mp4 --codec h264 --container mp4
+```
+
+4. Run interpolation only
 
 ```powershell
 & $env:UPSCALER_PYTHON python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrgan-x4plus --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode interpolateOnly --interpolation-target-fps 60 --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/interpolated-only.mp4 --codec h264 --container mp4
 ```
 
-3. Run upscale and interpolation together
+5. Run upscale and interpolation together
 
 ```powershell
 & $env:UPSCALER_PYTHON python/upscaler_worker/cli.py run-realesrgan-pipeline --source input.mp4 --model-id realesrgan-x4plus --output-mode preserveAspect4k --preset qualityBalanced --interpolation-mode afterUpscale --interpolation-target-fps 60 --aspect-ratio-preset 16:9 --resolution-basis exact --target-width 3840 --target-height 2160 --output-path artifacts/output/upscaled-and-interpolated.mp4 --codec h264 --container mp4
@@ -251,11 +421,16 @@ $env:PYTHONPATH='python'
 
 CLI notes:
 
+- `--colorization-mode off` disables colorization.
+- `--colorization-mode colorizeOnly` runs the selected colorizer as the main processing stage.
+- `--colorization-mode beforeUpscale` colorizes frames before they enter the upscale stage.
+- `--colorizer-model-id` selects the colorization model when colorization is enabled.
+- `--color-reference-image` can be repeated for models that consume reference images.
 - `--interpolation-mode off` means upscale only.
 - `--interpolation-mode interpolateOnly` skips the upscale stage and runs interpolation on the source video.
 - `--interpolation-mode afterUpscale` runs interpolation after the upscale stage completes.
 - The worker lazily downloads the RIFE runtime the first time an interpolation job runs.
-- Add `--gpu-id`, `--tile-size`, `--precision`, or `--pytorch-runner` if you need to pin a device or tune runtime behavior.
+- Add `--gpu-id`, `--tile-size`, `--precision`, `--pytorch-runner`, or `--deepremaster-processing-mode` if you need to pin a device or tune runtime behavior.
 
 ## Prerequisites
 

@@ -39,6 +39,22 @@ export const desktopApi: DesktopApi = {
     return selected && !Array.isArray(selected) ? selected : null;
   },
 
+  async selectContextFiles() {
+    const mock = mockApi();
+    if (mock?.selectContextFiles) {
+      return mock.selectContextFiles();
+    }
+
+    const selected = await open({
+      multiple: true,
+      filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "bmp"] }]
+    });
+    if (!selected) {
+      return [];
+    }
+    return Array.isArray(selected) ? selected.filter((entry): entry is string => typeof entry === "string") : [selected];
+  },
+
   async selectOutputFile(defaultPath: string, container: OutputContainer) {
     const mock = mockApi();
     if (mock?.selectOutputFile) {
@@ -68,6 +84,33 @@ export const desktopApi: DesktopApi = {
     }
 
     return invoke<SourceVideoSummary>("probe_source_video", { sourcePath });
+  },
+
+  async getSourceContextLibrary(sourcePath: string) {
+    const mock = mockApi();
+    if (mock?.getSourceContextLibrary) {
+      return mock.getSourceContextLibrary(sourcePath);
+    }
+
+    return invoke("get_source_context_library", { sourcePath });
+  },
+
+  async importSourceContextFiles(sourcePath: string, importPaths: string[]) {
+    const mock = mockApi();
+    if (mock?.importSourceContextFiles) {
+      return mock.importSourceContextFiles(sourcePath, importPaths);
+    }
+
+    return invoke("import_source_context_files", { sourcePath, importPaths });
+  },
+
+  async removeSourceContextEntry(sourcePath: string, entryId: string) {
+    const mock = mockApi();
+    if (mock?.removeSourceContextEntry) {
+      return mock.removeSourceContextEntry(sourcePath, entryId);
+    }
+
+    return invoke("remove_source_context_entry", { sourcePath, entryId });
   },
 
   async startSourceConversionToMp4(sourcePath: string) {

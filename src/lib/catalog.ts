@@ -24,6 +24,8 @@ export interface ModelRuntimeAssetDefinition {
   downloadUrl: string;
 }
 
+export type ModelContextKind = "referenceImages";
+
 export interface ModelResearchRuntimeDefinition {
   kind: "external-command";
   commandEnvVar: string;
@@ -40,11 +42,14 @@ export interface ModelDefinition {
   runtimeModelName: string;
   label: string;
   summary: string;
+  task: "upscale" | "colorize";
   visibleInUi: boolean;
   comparisonEligible: boolean;
   executionStatus: ModelExecutionStatus;
   supportTier: ModelSupportTier;
   qualityRank: number;
+  supportsContextInput?: boolean;
+  supportedContextKinds?: ModelContextKind[];
   videoNative: boolean;
   mediaSuitability: string[];
   nativeScale: number;
@@ -62,11 +67,14 @@ interface CatalogData {
     runtimeModelName: string;
     label: string;
     summary: string;
+    task: "upscale" | "colorize";
     visibleInUi: boolean;
     comparisonEligible: boolean;
     executionStatus: ModelExecutionStatus;
     supportTier: ModelSupportTier;
     qualityRank: number;
+    supportsContextInput?: boolean;
+    supportedContextKinds?: ModelContextKind[];
     videoNative: boolean;
     mediaSuitability: string[];
     nativeScale: number;
@@ -87,11 +95,14 @@ export const modelCatalog: ModelDefinition[] = typedCatalogData.models.map((mode
   runtimeModelName: model.runtimeModelName,
   label: model.label,
   summary: model.summary,
+  task: model.task,
   visibleInUi: model.visibleInUi,
   comparisonEligible: model.comparisonEligible,
   executionStatus: model.executionStatus,
   supportTier: model.supportTier,
   qualityRank: model.qualityRank,
+  supportsContextInput: model.supportsContextInput ?? false,
+  supportedContextKinds: model.supportedContextKinds ?? [],
   videoNative: model.videoNative,
   mediaSuitability: model.mediaSuitability,
   nativeScale: model.nativeScale,
@@ -102,7 +113,7 @@ export const modelCatalog: ModelDefinition[] = typedCatalogData.models.map((mode
 
 export function getUiModels(): ModelDefinition[] {
   return modelCatalog
-    .filter((model) => model.visibleInUi || model.executionStatus === "planned")
+    .filter((model) => model.task === "upscale" && (model.visibleInUi || model.executionStatus === "planned"))
     .sort((left, right) => {
       if (left.qualityRank !== right.qualityRank) {
         return left.qualityRank - right.qualityRank;
@@ -112,16 +123,35 @@ export function getUiModels(): ModelDefinition[] {
 }
 
 export function getVisibleModels(): ModelDefinition[] {
-  return modelCatalog.filter((model) => model.visibleInUi);
+  return modelCatalog.filter((model) => model.task === "upscale" && model.visibleInUi);
 }
 
 export function getBlindComparisonModels(): ModelDefinition[] {
-  return modelCatalog.filter((model) => model.comparisonEligible && model.executionStatus === "runnable");
+  return modelCatalog.filter((model) => model.task === "upscale" && model.comparisonEligible && model.executionStatus === "runnable");
+}
+
+export function getUiColorizerModels(): ModelDefinition[] {
+  return modelCatalog
+    .filter((model) => model.task === "colorize" && (model.visibleInUi || model.executionStatus === "planned"))
+    .sort((left, right) => {
+      if (left.qualityRank !== right.qualityRank) {
+        return left.qualityRank - right.qualityRank;
+      }
+      return left.label.localeCompare(right.label);
+    });
+}
+
+export function getVisibleColorizerModels(): ModelDefinition[] {
+  return modelCatalog.filter((model) => model.task === "colorize" && model.visibleInUi);
+}
+
+export function getBlindComparisonColorizerModels(): ModelDefinition[] {
+  return modelCatalog.filter((model) => model.task === "colorize" && model.comparisonEligible && model.executionStatus === "runnable");
 }
 
 export function getTopRatedModels(): ModelDefinition[] {
   return modelCatalog
-    .filter((model) => model.qualityRank <= 6)
+    .filter((model) => model.task === "upscale" && model.qualityRank <= 6)
     .sort((left, right) => left.qualityRank - right.qualityRank);
 }
 

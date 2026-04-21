@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getBackendDefinition, getBlindComparisonModels, getModelDefinition, getTopRatedModels, getVisibleModels, modelCatalog } from "./catalog";
+import { getBackendDefinition, getBlindComparisonColorizerModels, getBlindComparisonModels, getModelDefinition, getTopRatedModels, getVisibleColorizerModels, getVisibleModels, modelCatalog } from "./catalog";
 
 describe("modelCatalog", () => {
   it("surfaces the runnable serious models in the current UI", () => {
@@ -55,6 +55,26 @@ describe("modelCatalog", () => {
       "realesrnet-x4plus",
       "bsrgan-x4",
       "swinir-realworld-x4"
+    ]);
+  });
+
+  it("surfaces runnable colorizers for UI and blind comparison", () => {
+    expect(getVisibleColorizerModels().map((model) => model.value)).toEqual([
+      "ddcolor-modelscope",
+      "ddcolor-paper",
+      "deoldify-stable",
+      "deoldify-video",
+      "deepremaster",
+      "colormnet"
+    ]);
+
+    expect(getBlindComparisonColorizerModels().map((model) => model.value)).toEqual([
+      "ddcolor-modelscope",
+      "ddcolor-paper",
+      "deoldify-stable",
+      "deoldify-video",
+      "deepremaster",
+      "colormnet"
     ]);
   });
 

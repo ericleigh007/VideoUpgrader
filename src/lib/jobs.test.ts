@@ -11,6 +11,10 @@ import type { RealesrganJobRequest } from "../types";
 const baseRequest: RealesrganJobRequest = {
   sourcePath: "C:/fixtures/input.mov",
   modelId: "realesrgan-x4plus",
+  colorizationMode: "off",
+  colorizerModelId: null,
+  colorizationContext: null,
+  deepremasterProcessingMode: "standard",
   outputMode: "cropTo4k",
   qualityPreset: "qualityMax",
   interpolationMode: "off",

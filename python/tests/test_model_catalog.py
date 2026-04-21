@@ -1,6 +1,7 @@
 import unittest
 
 from upscaler_worker.model_catalog import (
+    comparison_eligible_colorizer_models,
     comparison_eligible_models,
     ensure_benchmarkable_model,
     ensure_runnable_model,
@@ -14,6 +15,7 @@ from upscaler_worker.model_catalog import (
     model_runtime_name,
     model_special_handling,
     top_rated_models,
+    visible_colorizer_models,
     visible_ui_models,
 )
 
@@ -58,6 +60,36 @@ class ModelCatalogTests(unittest.TestCase):
                 "realesrnet-x4plus",
                 "bsrgan-x4",
                 "swinir-realworld-x4",
+            ],
+        )
+
+    def test_visible_colorizer_models_include_runnable_colorizer_entries(self) -> None:
+        visible_colorizers = visible_colorizer_models()
+
+        self.assertEqual(
+            [model["id"] for model in visible_colorizers],
+            [
+                "ddcolor-modelscope",
+                "ddcolor-paper",
+                "deoldify-stable",
+                "deoldify-video",
+                "deepremaster",
+                "colormnet",
+            ],
+        )
+
+    def test_comparison_eligible_colorizers_only_include_runnable_entries(self) -> None:
+        compare_ready = comparison_eligible_colorizer_models()
+
+        self.assertEqual(
+            [model["id"] for model in compare_ready],
+            [
+                "ddcolor-modelscope",
+                "ddcolor-paper",
+                "deoldify-stable",
+                "deoldify-video",
+                "deepremaster",
+                "colormnet",
             ],
         )
 

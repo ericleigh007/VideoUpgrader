@@ -4,6 +4,7 @@ import functools
 import shutil
 import os
 import re
+import ssl
 import subprocess
 import time
 import urllib.error
@@ -28,6 +29,10 @@ RIFE_ZIP_URL = (
     "https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/"
     "rife-ncnn-vulkan-20221029-windows.zip"
 )
+DEOLDIFY_REPO_ZIP_URL = "https://codeload.github.com/jantic/DeOldify/zip/refs/heads/master"
+DEEPREMASTER_REPO_ZIP_URL = "https://codeload.github.com/satoshiiizuka/siggraphasia2019_remastering/zip/refs/heads/master"
+COLORMNET_REPO_ZIP_URL = "https://codeload.github.com/yyang181/colormnet/zip/refs/heads/main"
+DEEPREMASTER_MODEL_URL = "http://iizuka.cs.tsukuba.ac.jp/data/remasternet.pth.tar"
 GPU_LINE_PATTERN = re.compile(r"^\[(\d+)\s+([^\]]+)\]")
 TRANSIENT_DOWNLOAD_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 DOWNLOAD_RETRY_ATTEMPTS = 4
@@ -56,7 +61,17 @@ def download_file_with_retries(url: str, destination: Path, *, attempts: int = D
     for attempt_index in range(max(1, attempts)):
         partial_path.unlink(missing_ok=True)
         try:
-            urllib.request.urlretrieve(url, partial_path)
+            try:
+                urllib.request.urlretrieve(url, partial_path)
+            except urllib.error.URLError as error:
+                reason = getattr(error, "reason", None)
+                if not isinstance(reason, ssl.SSLCertVerificationError):
+                    raise
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(url, context=ssl_context) as response, partial_path.open("wb") as destination_handle:
+                    shutil.copyfileobj(response, destination_handle)
             partial_path.replace(destination)
             return destination
         except BaseException as error:
@@ -190,6 +205,95 @@ def ensure_rvrt_model_weights(task_name: str = RVRT_DEFAULT_TASK) -> dict[str, s
     return {
         "task": task_name,
         "modelPath": str(model_path),
+    }
+
+
+def _ensure_deoldify_dummy_assets(dummy_root: Path) -> Path:
+    dummy_root.mkdir(parents=True, exist_ok=True)
+    for image_index in range(10):
+        placeholder = dummy_root / f"placeholder_{image_index:02d}.png"
+        if placeholder.exists():
+            continue
+        placeholder.write_bytes(
+            bytes.fromhex(
+                "89504E470D0A1A0A0000000D4948445200000001000000010802000000907753DE"
+                "0000000C49444154789C636060000000040001F61738550000000049454E44AE426082"
+            )
+        )
+    return dummy_root
+
+
+def ensure_deoldify_runtime() -> dict[str, str]:
+    install_dir = runtime_root() / "deoldify"
+    source_root = install_dir / "src"
+    entrypoint = source_root / "deoldify" / "__init__.py"
+    if not entrypoint.exists():
+        archive_path = runtime_root() / "deoldify-master.zip"
+        _download_file(DEOLDIFY_REPO_ZIP_URL, archive_path)
+        if source_root.exists():
+            shutil.rmtree(source_root)
+        source_root.mkdir(parents=True, exist_ok=True)
+        _extract_archive_with_optional_root_strip(archive_path, source_root)
+        archive_path.unlink(missing_ok=True)
+        if not entrypoint.exists():
+            raise RuntimeError("DeOldify bootstrap archive did not contain the expected source tree")
+
+    dummy_root = _ensure_deoldify_dummy_assets(repo_root() / "dummy")
+    model_root = install_dir / "models"
+    model_root.mkdir(parents=True, exist_ok=True)
+    return {
+        "deoldifySourceRoot": str(source_root),
+        "deoldifyModelRoot": str(model_root),
+        "deoldifyDummyRoot": str(dummy_root),
+    }
+
+
+def ensure_deepremaster_runtime() -> dict[str, str]:
+    install_dir = runtime_root() / "deepremaster"
+    source_root = install_dir / "src"
+    model_root = install_dir / "model"
+    entrypoint = source_root / "model" / "remasternet.py"
+    checkpoint_path = model_root / "remasternet.pth.tar"
+    if not entrypoint.exists():
+        archive_path = runtime_root() / "deepremaster-master.zip"
+        _download_file(DEEPREMASTER_REPO_ZIP_URL, archive_path)
+        if source_root.exists():
+            shutil.rmtree(source_root)
+        source_root.mkdir(parents=True, exist_ok=True)
+        _extract_archive_with_optional_root_strip(archive_path, source_root)
+        archive_path.unlink(missing_ok=True)
+        if not entrypoint.exists():
+            raise RuntimeError("DeepRemaster bootstrap archive did not contain model/remasternet.py")
+
+    model_root.mkdir(parents=True, exist_ok=True)
+    if not checkpoint_path.exists():
+        _download_file(DEEPREMASTER_MODEL_URL, checkpoint_path)
+
+    return {
+        "deepremasterSourceRoot": str(source_root),
+        "deepremasterModelRoot": str(model_root),
+        "deepremasterCheckpointPath": str(checkpoint_path),
+    }
+
+
+def ensure_colormnet_runtime() -> dict[str, str]:
+    install_dir = runtime_root() / "colormnet"
+    source_root = install_dir / "src"
+    entrypoint = source_root / "test_app.py"
+    if not entrypoint.exists():
+        archive_path = runtime_root() / "colormnet-main.zip"
+        _download_file(COLORMNET_REPO_ZIP_URL, archive_path)
+        if source_root.exists():
+            shutil.rmtree(source_root)
+        source_root.mkdir(parents=True, exist_ok=True)
+        _extract_archive_with_optional_root_strip(archive_path, source_root)
+        archive_path.unlink(missing_ok=True)
+        if not entrypoint.exists():
+            raise RuntimeError("ColorMNet bootstrap archive did not contain test_app.py")
+
+    return {
+        "colormnetSourceRoot": str(source_root),
+        "colormnetEntryPoint": str(entrypoint),
     }
 
 

@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from upscaler_worker.runtime import download_file_with_retries, ensure_runtime_assets, ensure_rvrt_model_weights, ensure_rvrt_repo
+from upscaler_worker.runtime import download_file_with_retries, ensure_colormnet_runtime, ensure_runtime_assets, ensure_rvrt_model_weights, ensure_rvrt_repo
 
 
 class RuntimeStatusTests(unittest.TestCase):
@@ -84,6 +84,31 @@ class RuntimeStatusTests(unittest.TestCase):
             self.assertTrue((temp_root / "tmp" / "RVRT" / "main_test_rvrt.py").exists())
             self.assertTrue((temp_root / "tmp" / "RVRT" / "requirements.txt").exists())
             self.assertEqual(result["rvrtRoot"], str(temp_root / "tmp" / "RVRT"))
+
+    def test_ensure_colormnet_runtime_extracts_test_app(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            temp_runtime = temp_root / "artifacts" / "runtime"
+
+            def fake_urlretrieve(_url: str, destination: Path) -> tuple[str, object]:
+                archive_path = Path(destination)
+                archive_path.parent.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    archive.writestr("colormnet-main/test_app.py", "def run_cli(args_list=None):\n    return args_list\n")
+                    archive.writestr("colormnet-main/model/network.py", "class ColorMNet: pass\n")
+                return str(archive_path), None
+
+            with patch("upscaler_worker.runtime.repo_root", return_value=temp_root), patch(
+                "upscaler_worker.runtime.runtime_root",
+                return_value=temp_runtime,
+            ), patch(
+                "upscaler_worker.runtime.urllib.request.urlretrieve",
+                side_effect=fake_urlretrieve,
+            ):
+                result = ensure_colormnet_runtime()
+
+            self.assertTrue((temp_runtime / "colormnet" / "src" / "test_app.py").exists())
+            self.assertEqual(result["colormnetSourceRoot"], str(temp_runtime / "colormnet" / "src"))
 
     def test_download_file_with_retries_retries_transient_http_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

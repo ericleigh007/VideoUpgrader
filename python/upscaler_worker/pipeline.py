@@ -23,7 +23,7 @@ from upscaler_worker.interpolation import (
     validate_interpolation_request,
 )
 from upscaler_worker.media import probe_video
-from upscaler_worker.model_catalog import ensure_runnable_model, model_backend_id
+from upscaler_worker.model_catalog import ensure_runnable_model, model_backend_id, model_label, model_task
 from upscaler_worker.models.pytorch_video_sr import build_external_video_sr_command, validate_external_video_sr_outputs
 from upscaler_worker.precision import resolve_precision_mode
 from upscaler_worker.models.realesrgan import model_label
@@ -98,6 +98,7 @@ class InterpolationEncodeTask:
 @dataclass
 class PipelineProgressState:
     extracted_frames: int = 0
+    colorized_frames: int = 0
     upscaled_frames: int = 0
     interpolated_frames: int = 0
     encoded_frames: int = 0
@@ -147,6 +148,7 @@ class PipelineTelemetryState:
     batch_index: int | None = None
     batch_count: int | None = None
     extract_stage_seconds: float = 0.0
+    colorize_stage_seconds: float = 0.0
     upscale_stage_seconds: float = 0.0
     interpolate_stage_seconds: float = 0.0
     encode_stage_seconds: float = 0.0
@@ -514,6 +516,7 @@ def _sample_progress_telemetry(
         "scratchSizeBytes": resources.scratch_size_bytes,
         "outputSizeBytes": resources.output_size_bytes,
         "extractStageSeconds": telemetry_state.extract_stage_seconds,
+        "colorizeStageSeconds": telemetry_state.colorize_stage_seconds,
         "upscaleStageSeconds": telemetry_state.upscale_stage_seconds,
         "interpolateStageSeconds": telemetry_state.interpolate_stage_seconds,
         "encodeStageSeconds": telemetry_state.encode_stage_seconds,
@@ -526,6 +529,9 @@ def _record_stage_duration(telemetry_state: PipelineTelemetryState, stage: str, 
         return
     if stage == "extract":
         telemetry_state.extract_stage_seconds += duration_seconds
+        return
+    if stage == "colorize":
+        telemetry_state.colorize_stage_seconds += duration_seconds
         return
     if stage == "upscale":
         telemetry_state.upscale_stage_seconds += duration_seconds
@@ -567,6 +573,7 @@ def _write_progress(
     processed_frames: int,
     total_frames: int,
     extracted_frames: int = 0,
+    colorized_frames: int = 0,
     upscaled_frames: int = 0,
     interpolated_frames: int = 0,
     encoded_frames: int = 0,
@@ -585,6 +592,7 @@ def _write_progress(
         "processedFrames": processed_frames,
         "totalFrames": total_frames,
         "extractedFrames": extracted_frames,
+        "colorizedFrames": colorized_frames,
         "upscaledFrames": upscaled_frames,
         "interpolatedFrames": interpolated_frames,
         "encodedFrames": encoded_frames,
@@ -616,6 +624,7 @@ def _run_ffmpeg_with_frame_progress(
     total_frames: int,
     message_prefix: str,
     extracted_frames: int,
+    colorized_frames: int,
     upscaled_frames: int,
     interpolated_frames: int,
     encoded_frames: int,
@@ -661,6 +670,7 @@ def _run_ffmpeg_with_frame_progress(
                 processed_frames=stage_progress_frames,
                 total_frames=total_frames,
                 extracted_frames=extracted_frames,
+                colorized_frames=colorized_frames,
                 upscaled_frames=upscaled_frames,
                 interpolated_frames=interpolated_frames,
                 encoded_frames=stage_progress_frames if phase == "encoding" else encoded_frames,
@@ -685,6 +695,7 @@ def _run_ffmpeg_with_frame_progress(
                     processed_frames=min(total_frames, stage_frame_offset + state["current_frame"]),
                     total_frames=total_frames,
                     extracted_frames=extracted_frames,
+                    colorized_frames=colorized_frames,
                     upscaled_frames=upscaled_frames,
                     interpolated_frames=interpolated_frames,
                     encoded_frames=min(total_frames, stage_frame_offset + state["current_frame"]) if phase == "encoding" else encoded_frames,
@@ -699,6 +710,7 @@ def _run_ffmpeg_with_frame_progress(
                     processed_frames=min(total_frames, stage_frame_offset + state["current_frame"]),
                     total_frames=total_frames,
                     extracted_frames=extracted_frames,
+                    colorized_frames=colorized_frames,
                     upscaled_frames=upscaled_frames,
                     interpolated_frames=interpolated_frames,
                     encoded_frames=min(total_frames, stage_frame_offset + state["current_frame"]) if phase == "encoding" else encoded_frames,
@@ -1052,22 +1064,33 @@ def _pipeline_percent(
     *,
     source_total_frames: int | None = None,
     interpolation_mode: str = "off",
+    colorization_mode: str = "off",
 ) -> int:
     if interpolation_mode == "interpolateOnly":
         extract_weight = 10
+        colorize_weight = 0
         upscale_weight = 0
         interpolate_weight = 70
         encode_weight = 15
         remux_weight = 5
+    elif colorization_mode == "colorizeOnly":
+        extract_weight = 10
+        colorize_weight = 70
+        upscale_weight = 0
+        interpolate_weight = 0
+        encode_weight = 15
+        remux_weight = 5
     elif interpolation_mode == "afterUpscale":
         extract_weight = 10
-        upscale_weight = 35
+        colorize_weight = 15 if colorization_mode == "beforeUpscale" else 0
+        upscale_weight = 20 if colorization_mode == "beforeUpscale" else 35
         interpolate_weight = 35
         encode_weight = 15
         remux_weight = 5
     else:
         extract_weight = 10
-        upscale_weight = 70
+        colorize_weight = 20 if colorization_mode == "beforeUpscale" else 0
+        upscale_weight = 50 if colorization_mode == "beforeUpscale" else 70
         interpolate_weight = 0
         encode_weight = 15
         remux_weight = 5
@@ -1075,13 +1098,16 @@ def _pipeline_percent(
     effective_source_total_frames = source_total_frames if source_total_frames is not None and source_total_frames > 0 else total_frames
     if interpolation_mode == "off":
         effective_extracted_frames = progress_state.extracted_frames
+        effective_colorized_frames = progress_state.colorized_frames
         effective_upscaled_frames = progress_state.upscaled_frames
     else:
         effective_extracted_frames = _scaled_pipeline_frames(progress_state.extracted_frames, effective_source_total_frames, total_frames)
+        effective_colorized_frames = _scaled_pipeline_frames(progress_state.colorized_frames, effective_source_total_frames, total_frames)
         effective_upscaled_frames = _scaled_pipeline_frames(progress_state.upscaled_frames, effective_source_total_frames, total_frames)
 
     aggregate = (
         _pipeline_ratio(effective_extracted_frames, total_frames) * extract_weight
+        + _pipeline_ratio(effective_colorized_frames, total_frames) * colorize_weight
         + _pipeline_ratio(effective_upscaled_frames, total_frames) * upscale_weight
         + _pipeline_ratio(progress_state.interpolated_frames, total_frames) * interpolate_weight
         + _pipeline_ratio(progress_state.encoded_frames, total_frames) * encode_weight
@@ -1099,14 +1125,17 @@ def _emit_pipeline_progress(
     progress_state: PipelineProgressState,
     source_total_frames: int | None = None,
     interpolation_mode: str = "off",
+    colorization_mode: str = "off",
     telemetry_state: PipelineTelemetryState | None = None,
 ) -> None:
     effective_source_total_frames = source_total_frames if source_total_frames is not None and source_total_frames > 0 else total_frames
     if interpolation_mode == "off":
         effective_extracted_frames = progress_state.extracted_frames
+        effective_colorized_frames = progress_state.colorized_frames
         effective_upscaled_frames = progress_state.upscaled_frames
     else:
         effective_extracted_frames = _scaled_pipeline_frames(progress_state.extracted_frames, effective_source_total_frames, total_frames)
+        effective_colorized_frames = _scaled_pipeline_frames(progress_state.colorized_frames, effective_source_total_frames, total_frames)
         effective_upscaled_frames = _scaled_pipeline_frames(progress_state.upscaled_frames, effective_source_total_frames, total_frames)
 
     _write_progress(
@@ -1117,10 +1146,12 @@ def _emit_pipeline_progress(
             progress_state,
             source_total_frames=effective_source_total_frames,
             interpolation_mode=interpolation_mode,
+            colorization_mode=colorization_mode,
         ),
         message=message,
         processed_frames=max(
             effective_extracted_frames,
+            effective_colorized_frames,
             effective_upscaled_frames,
             progress_state.interpolated_frames,
             progress_state.encoded_frames,
@@ -1128,6 +1159,7 @@ def _emit_pipeline_progress(
         ),
         total_frames=total_frames,
         extracted_frames=progress_state.extracted_frames,
+        colorized_frames=progress_state.colorized_frames,
         upscaled_frames=progress_state.upscaled_frames,
         interpolated_frames=progress_state.interpolated_frames,
         encoded_frames=progress_state.encoded_frames,
@@ -1644,6 +1676,7 @@ def _encode_segment_video(
     pause_path: str | None,
     total_frames: int,
     extracted_frames: int,
+    colorized_frames: int,
     upscaled_frames: int,
     interpolated_frames: int,
     encoded_frames_before_segment: int,
@@ -1711,6 +1744,7 @@ def _encode_segment_video(
         total_frames=total_frames,
         message_prefix=f"Encoding segment video {output_file.name}",
         extracted_frames=extracted_frames,
+        colorized_frames=colorized_frames,
         upscaled_frames=upscaled_frames,
         interpolated_frames=interpolated_frames,
         encoded_frames=encoded_frames_before_segment,
@@ -1732,6 +1766,7 @@ def _concat_segment_videos(
     pause_path: str | None,
     total_frames: int,
     extracted_frames: int,
+    colorized_frames: int,
     upscaled_frames: int,
     interpolated_frames: int,
     encoded_frames: int,
@@ -1768,6 +1803,7 @@ def _concat_segment_videos(
         total_frames=total_frames,
         message_prefix="Concatenating encoded segments",
         extracted_frames=extracted_frames,
+        colorized_frames=colorized_frames,
         upscaled_frames=upscaled_frames,
         interpolated_frames=interpolated_frames,
         encoded_frames=encoded_frames,
@@ -2228,6 +2264,11 @@ def run_realesrgan_pipeline(
     *,
     source_path: str,
     model_id: str,
+    colorization_mode: str = "off",
+    colorizer_model_id: str | None = None,
+    color_context_library_id: str | None = None,
+    color_reference_images: list[str] | None = None,
+    deepremaster_processing_mode: str = "standard",
     output_mode: str,
     preset: str,
     interpolation_mode: str = "off",
@@ -2269,10 +2310,39 @@ def run_realesrgan_pipeline(
 ) -> dict[str, object]:
     ensure_not_cancelled(cancel_path)
     wait_if_paused(pause_path, cancel_path=cancel_path)
-    ensure_runnable_model(model_id)
-    backend_id = model_backend_id(model_id)
+    colorization_enabled = colorization_mode != "off"
+    selected_color_reference_images = [str(path) for path in (color_reference_images or [])]
+    colorizer_backend_id: str | None = None
+    if colorization_enabled:
+        if not colorizer_model_id:
+            raise ValueError("Colorization was requested but no colorizer model id was provided")
+        ensure_runnable_model(colorizer_model_id)
+        if model_task(colorizer_model_id) != "colorize":
+            raise ValueError(f"Model '{colorizer_model_id}' is not cataloged as a colorizer")
+        colorizer_backend_id = model_backend_id(colorizer_model_id)
+        if colorizer_backend_id != "pytorch-image-colorization":
+            raise NotImplementedError(
+                f"Colorizer backend '{colorizer_backend_id}' is cataloged but not implemented in the worker pipeline"
+            )
+        if selected_color_reference_images:
+            missing_reference_images = [path for path in selected_color_reference_images if not Path(path).is_file()]
+            if missing_reference_images:
+                raise ValueError(
+                    "Selected color reference images do not exist: " + ", ".join(missing_reference_images)
+                )
+
+    active_model_id = colorizer_model_id if colorization_mode == "colorizeOnly" and colorizer_model_id else model_id
+    if colorization_mode != "colorizeOnly":
+        ensure_runnable_model(model_id)
+    ensure_runnable_model(active_model_id)
+    backend_id = model_backend_id(active_model_id)
+    if backend_id == "pytorch-image-colorization" and colorization_mode != "colorizeOnly":
+        colorization_mode = "colorizeOnly"
+        colorization_enabled = True
+        colorizer_model_id = colorizer_model_id or active_model_id
+        colorizer_backend_id = backend_id
     quality_policy = _resolve_quality_policy(
-        model_id,
+        active_model_id,
         preset,
         tile_size,
         fp16=fp16,
@@ -2285,10 +2355,12 @@ def run_realesrgan_pipeline(
     effective_precision_mode = selected_precision_mode
     fp16_enabled = selected_precision_mode == "fp16"
     bf16_enabled = selected_precision_mode == "bf16"
-    resolved_pytorch_execution_path = _resolve_pytorch_execution_path(model_id, pytorch_execution_path)
+    resolved_pytorch_execution_path = _resolve_pytorch_execution_path(active_model_id, pytorch_execution_path)
     runtime = ensure_runtime_assets()
     metadata = probe_video(source_path)
     validate_interpolation_request(interpolation_mode, interpolation_target_fps)
+    if colorization_enabled and interpolation_mode != "off":
+        raise NotImplementedError("Colorization with interpolation is not implemented yet. Run colorization with interpolation disabled for now.")
     requested_output = Path(output_path)
     if not requested_output.is_absolute():
         requested_output = repo_root() / requested_output
@@ -2303,6 +2375,11 @@ def run_realesrgan_pipeline(
             [
                 source_path,
                 model_id,
+                colorization_mode,
+                colorizer_model_id or "",
+                color_context_library_id or "",
+                *selected_color_reference_images,
+                deepremaster_processing_mode,
                 output_mode,
                 preset,
                 interpolation_mode,
@@ -2342,9 +2419,15 @@ def run_realesrgan_pipeline(
 
     output_file = normalized_output
     silent_video = encoded_dir / f"video_no_audio.{PIPELINE_INTERMEDIATE_CONTAINER}"
-    model_name = model_label(model_id)
+    model_name = model_label(active_model_id)
 
     log: list[str] = []
+    if color_context_library_id:
+        log.append(f"Color context library: {color_context_library_id}")
+    if selected_color_reference_images:
+        log.append(
+            "Selected color references: " + ", ".join(Path(path).name for path in selected_color_reference_images)
+        )
     model_runtime: dict[str, object] | None = None
     ffmpeg = runtime["ffmpegPath"]
     video_encoder_config = _resolve_video_encoder_config(
@@ -2411,6 +2494,11 @@ def run_realesrgan_pipeline(
         crop_width,
         crop_height,
     )
+    if colorization_mode == "colorizeOnly":
+        resolved_width = int(metadata["width"])
+        resolved_height = int(metadata["height"])
+        resolved_aspect_ratio = float(resolved_width / max(1, resolved_height))
+        filter_chain = None
 
     if interpolation_mode != "off":
         runtime.update(ensure_rife_runtime())
@@ -2864,6 +2952,7 @@ def run_realesrgan_pipeline(
                         pause_path=pause_path,
                         total_frames=total_output_frames,
                         extracted_frames=item.extracted_frames,
+                        colorized_frames=0,
                         upscaled_frames=item.upscaled_frames,
                         interpolated_frames=item.interpolated_frames,
                         encoded_frames_before_segment=encoded_before_segment,
@@ -2916,8 +3005,10 @@ def run_realesrgan_pipeline(
                 output_file=silent_video,
                 progress_path=progress_path,
                 cancel_path=cancel_path,
+                pause_path=pause_path,
                 total_frames=total_output_frames,
                 extracted_frames=progress_state.extracted_frames,
+                colorized_frames=0,
                 upscaled_frames=progress_state.upscaled_frames,
                 interpolated_frames=progress_state.interpolated_frames,
                 encoded_frames=progress_state.encoded_frames,
@@ -2953,7 +3044,7 @@ def run_realesrgan_pipeline(
                 "-metadata",
                 "upscaler_audio_source=original",
                 "-metadata",
-                f"upscaler_model={model_id}",
+                f"upscaler_model={active_model_id}",
                 "-metadata",
                 f"upscaler_codec={codec}",
                 "-metadata",
@@ -2977,6 +3068,7 @@ def run_realesrgan_pipeline(
                 total_frames=total_output_frames,
                 message_prefix="Remuxing original audio",
                 extracted_frames=progress_state.extracted_frames,
+                colorized_frames=progress_state.colorized_frames,
                 upscaled_frames=progress_state.upscaled_frames,
                 interpolated_frames=progress_state.interpolated_frames,
                 encoded_frames=progress_state.encoded_frames,
@@ -3007,6 +3099,7 @@ def run_realesrgan_pipeline(
                 total_frames=total_output_frames,
                 message_prefix="Finalizing video output",
                 extracted_frames=progress_state.extracted_frames,
+                colorized_frames=progress_state.colorized_frames,
                 upscaled_frames=progress_state.upscaled_frames,
                 interpolated_frames=progress_state.interpolated_frames,
                 encoded_frames=progress_state.encoded_frames,
@@ -3024,6 +3117,7 @@ def run_realesrgan_pipeline(
             processed_frames=total_output_frames,
             total_frames=total_output_frames,
             extracted_frames=progress_state.extracted_frames,
+            colorized_frames=progress_state.colorized_frames,
             upscaled_frames=progress_state.upscaled_frames,
             interpolated_frames=progress_state.interpolated_frames,
             encoded_frames=progress_state.encoded_frames,
@@ -3187,6 +3281,7 @@ def run_realesrgan_pipeline(
                 message=message,
                 total_frames=total_frames,
                 progress_state=progress_state,
+                colorization_mode=colorization_mode,
                 telemetry_state=telemetry_state,
             )
 
@@ -3241,7 +3336,33 @@ def run_realesrgan_pipeline(
 
     def upscaler_worker() -> None:
         loaded_model = None
+        loaded_colorizer = None
+        colorizer_runtime: dict[str, object] | None = None
         try:
+            if colorization_enabled:
+                from upscaler_worker.models.colorizers import colorize_directory, load_runtime_colorizer
+
+                loaded_colorizer = load_runtime_colorizer(
+                    colorizer_model_id,
+                    gpu_id,
+                    selected_precision_mode,
+                    log,
+                    reference_image_paths=selected_color_reference_images,
+                    deepremaster_processing_mode=deepremaster_processing_mode,
+                )
+                colorizer_model_ref = getattr(loaded_colorizer, "repo_id", None)
+                if colorizer_model_ref is None:
+                    colorizer_model_ref = str(getattr(loaded_colorizer, "checkpoint_path", "")) or None
+                colorizer_runtime = {
+                    "runner": "torch",
+                    "precision": loaded_colorizer.precision_mode,
+                    "repoId": colorizer_model_ref,
+                    "inputSize": getattr(loaded_colorizer, "input_size", None),
+                }
+                if colorization_mode == "colorizeOnly":
+                    model_runtime = dict(colorizer_runtime)
+                    effective_precision_mode = loaded_colorizer.precision_mode
+
             if backend_id == "pytorch-image-sr":
                 if resolved_pytorch_execution_path == PYTORCH_EXECUTION_PATH_STREAMING:
                     raise NotImplementedError(
@@ -3277,12 +3398,16 @@ def run_realesrgan_pipeline(
                     "torchCompileMode": loaded_model.torch_compile_mode,
                     "torchCompileCudagraphs": loaded_model.torch_compile_cudagraphs,
                 }
+                if colorizer_runtime is not None:
+                    model_runtime["colorizer"] = colorizer_runtime
             elif backend_id == "pytorch-video-sr":
                 model_runtime = {
                     "runner": "external-command",
                     "precision": selected_precision_mode,
                 }
                 effective_precision_mode = selected_precision_mode
+                if colorizer_runtime is not None:
+                    model_runtime["colorizer"] = colorizer_runtime
 
             while True:
                 item = _queue_get(extract_queue)
@@ -3294,55 +3419,184 @@ def run_realesrgan_pipeline(
 
                 segment_dir = segment_root / f"segment_{segment.index:04d}"
                 segment_input_dir = segment_dir / "in"
+                segment_colorized_dir = segment_dir / "colorized"
                 segment_output_dir = segment_dir / "out"
+                stage_input_dir = segment_input_dir
                 stage_started_at = time.time()
-                with progress_lock:
-                    upscaled_before_segment = progress_state.upscaled_frames
-                with progress_lock:
-                    _set_segment_progress(
-                        telemetry_state,
-                        segment_index=segment.index + 1,
-                        segment_count=len(segments),
-                        segment_processed_frames=0,
-                        segment_total_frames=segment.frame_count,
-                    )
-                _publish_progress(
-                    "upscaling",
-                    f"Upscaling segment {segment.index + 1}/{len(segments)} (0/{segment.frame_count} frames)",
-                )
 
-                if backend_id == "realesrgan-ncnn":
-                    def report_upscale_progress(processed_in_segment: int, total_in_segment: int, batch_index: int | None = None, batch_count: int | None = None) -> None:
+                if colorization_enabled:
+                    with progress_lock:
+                        colorized_before_segment = progress_state.colorized_frames
+                        _set_segment_progress(
+                            telemetry_state,
+                            segment_index=segment.index + 1,
+                            segment_count=len(segments),
+                            segment_processed_frames=0,
+                            segment_total_frames=segment.frame_count,
+                        )
+                    _publish_progress(
+                        "colorizing",
+                        f"Colorizing segment {segment.index + 1}/{len(segments)} (0/{segment.frame_count} frames)",
+                    )
+
+                    def report_colorize_progress(processed_in_segment: int, total_in_segment: int) -> None:
                         with progress_lock:
-                            progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + processed_in_segment)
+                            progress_state.colorized_frames = min(total_frames, colorized_before_segment + processed_in_segment)
                             _set_segment_progress(
                                 telemetry_state,
                                 segment_index=segment.index + 1,
                                 segment_count=len(segments),
                                 segment_processed_frames=processed_in_segment,
                                 segment_total_frames=total_in_segment,
-                                batch_index=batch_index,
-                                batch_count=batch_count,
                             )
-                        batch_label = f" batch {batch_index}/{batch_count}" if batch_index is not None and batch_count is not None else ""
                         _publish_progress(
-                            "upscaling",
-                            f"Upscaling segment {segment.index + 1}/{len(segments)}{batch_label} ({processed_in_segment}/{total_in_segment} frames)",
+                            "colorizing",
+                            f"Colorizing segment {segment.index + 1}/{len(segments)} ({processed_in_segment}/{total_in_segment} frames)",
                         )
 
-                    upscaled_count = _upscale_ncnn_segment(
-                        runtime=runtime,
+                    colorize_stage_started_at = time.time()
+                    colorized_count = colorize_directory(
+                        loaded_model=loaded_colorizer,
                         input_dir=segment_input_dir,
-                        output_dir=segment_output_dir,
-                        model_id=model_id,
-                        gpu_id=gpu_id,
-                        effective_tile=effective_tile,
-                        log=log,
+                        output_dir=segment_colorized_dir,
                         cancel_path=cancel_path,
                         pause_path=pause_path,
-                        progress_callback=report_upscale_progress,
+                        progress_callback=report_colorize_progress,
                     )
                     with progress_lock:
+                        _record_stage_duration(telemetry_state, "colorize", time.time() - colorize_stage_started_at)
+                        progress_state.colorized_frames = min(total_frames, colorized_before_segment + colorized_count)
+                        _set_segment_progress(
+                            telemetry_state,
+                            segment_index=segment.index + 1,
+                            segment_count=len(segments),
+                            segment_processed_frames=colorized_count,
+                            segment_total_frames=segment.frame_count,
+                        )
+                    _publish_progress(
+                        "colorizing",
+                        f"Colorized segment {segment.index + 1}/{len(segments)} ({progress_state.colorized_frames}/{total_frames} frames)",
+                    )
+                    stage_input_dir = segment_colorized_dir
+
+                if colorization_mode != "colorizeOnly":
+                    upscale_stage_started_at = time.time()
+                    with progress_lock:
+                        upscaled_before_segment = progress_state.upscaled_frames
+                        _set_segment_progress(
+                            telemetry_state,
+                            segment_index=segment.index + 1,
+                            segment_count=len(segments),
+                            segment_processed_frames=0,
+                            segment_total_frames=segment.frame_count,
+                        )
+                    _publish_progress(
+                        "upscaling",
+                        f"Upscaling segment {segment.index + 1}/{len(segments)} (0/{segment.frame_count} frames)",
+                    )
+
+                    if backend_id == "realesrgan-ncnn":
+                        def report_upscale_progress(processed_in_segment: int, total_in_segment: int, batch_index: int | None = None, batch_count: int | None = None) -> None:
+                            with progress_lock:
+                                progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + processed_in_segment)
+                                _set_segment_progress(
+                                    telemetry_state,
+                                    segment_index=segment.index + 1,
+                                    segment_count=len(segments),
+                                    segment_processed_frames=processed_in_segment,
+                                    segment_total_frames=total_in_segment,
+                                    batch_index=batch_index,
+                                    batch_count=batch_count,
+                                )
+                            batch_label = f" batch {batch_index}/{batch_count}" if batch_index is not None and batch_count is not None else ""
+                            _publish_progress(
+                                "upscaling",
+                                f"Upscaling segment {segment.index + 1}/{len(segments)}{batch_label} ({processed_in_segment}/{total_in_segment} frames)",
+                            )
+
+                        upscaled_count = _upscale_ncnn_segment(
+                            runtime=runtime,
+                            input_dir=stage_input_dir,
+                            output_dir=segment_output_dir,
+                            model_id=model_id,
+                            gpu_id=gpu_id,
+                            effective_tile=effective_tile,
+                            log=log,
+                            cancel_path=cancel_path,
+                            pause_path=pause_path,
+                            progress_callback=report_upscale_progress,
+                        )
+                    elif backend_id == "pytorch-image-sr":
+                        def report_upscale_progress(processed_in_segment: int, total_in_segment: int, batch_index: int | None = None, batch_count: int | None = None) -> None:
+                            with progress_lock:
+                                progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + processed_in_segment)
+                                _set_segment_progress(
+                                    telemetry_state,
+                                    segment_index=segment.index + 1,
+                                    segment_count=len(segments),
+                                    segment_processed_frames=processed_in_segment,
+                                    segment_total_frames=total_in_segment,
+                                    batch_index=batch_index,
+                                    batch_count=batch_count,
+                                )
+                            batch_label = f" batch {batch_index}/{batch_count}" if batch_index is not None and batch_count is not None else ""
+                            _publish_progress(
+                                "upscaling",
+                                f"Upscaling segment {segment.index + 1}/{len(segments)}{batch_label} ({processed_in_segment}/{total_in_segment} frames)",
+                            )
+
+                        def report_upscale_batch(batch_index: int, batch_count: int, processed_in_segment: int, total_in_segment: int) -> None:
+                            report_upscale_progress(processed_in_segment, total_in_segment, batch_index, batch_count)
+
+                        upscaled_count = _upscale_pytorch_segment(
+                            loaded_model=loaded_model,
+                            input_dir=stage_input_dir,
+                            output_dir=segment_output_dir,
+                            effective_tile=effective_tile,
+                            cancel_path=cancel_path,
+                            pause_path=pause_path,
+                            progress_callback=report_upscale_batch,
+                        )
+                    elif backend_id == "pytorch-video-sr":
+                        def report_upscale_progress(processed_in_segment: int, total_in_segment: int, batch_index: int | None = None, batch_count: int | None = None) -> None:
+                            with progress_lock:
+                                progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + processed_in_segment)
+                                _set_segment_progress(
+                                    telemetry_state,
+                                    segment_index=segment.index + 1,
+                                    segment_count=len(segments),
+                                    segment_processed_frames=processed_in_segment,
+                                    segment_total_frames=total_in_segment,
+                                    batch_index=batch_index,
+                                    batch_count=batch_count,
+                                )
+                            batch_label = f" batch {batch_index}/{batch_count}" if batch_index is not None and batch_count is not None else ""
+                            _publish_progress(
+                                "upscaling",
+                                f"Upscaling segment {segment.index + 1}/{len(segments)}{batch_label} ({processed_in_segment}/{total_in_segment} frames)",
+                            )
+
+                        upscaled_count, external_runtime = _upscale_external_video_segment(
+                            input_dir=stage_input_dir,
+                            output_dir=segment_output_dir,
+                            model_id=model_id,
+                            effective_tile=effective_tile,
+                            gpu_id=gpu_id,
+                            precision_mode=selected_precision_mode,
+                            log=log,
+                            cancel_path=cancel_path,
+                            pause_path=pause_path,
+                            progress_callback=report_upscale_progress,
+                        )
+                        model_runtime = external_runtime
+                        effective_precision_mode = str(external_runtime.get("precision", selected_precision_mode))
+                        if colorizer_runtime is not None:
+                            model_runtime["colorizer"] = colorizer_runtime
+                    else:
+                        raise RuntimeError(f"Backend '{backend_id}' is cataloged but not runnable in the current app build")
+
+                    with progress_lock:
+                        _record_stage_duration(telemetry_state, "upscale", time.time() - upscale_stage_started_at)
                         progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + upscaled_count)
                         _set_segment_progress(
                             telemetry_state,
@@ -3350,91 +3604,19 @@ def run_realesrgan_pipeline(
                             segment_count=len(segments),
                             segment_processed_frames=upscaled_count,
                             segment_total_frames=segment.frame_count,
+                            batch_index=None,
+                            batch_count=None,
                         )
-                elif backend_id == "pytorch-image-sr":
-                    def report_upscale_progress(processed_in_segment: int, total_in_segment: int, batch_index: int | None = None, batch_count: int | None = None) -> None:
-                        with progress_lock:
-                            progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + processed_in_segment)
-                            _set_segment_progress(
-                                telemetry_state,
-                                segment_index=segment.index + 1,
-                                segment_count=len(segments),
-                                segment_processed_frames=processed_in_segment,
-                                segment_total_frames=total_in_segment,
-                                batch_index=batch_index,
-                                batch_count=batch_count,
-                            )
-                        batch_label = f" batch {batch_index}/{batch_count}" if batch_index is not None and batch_count is not None else ""
-                        _publish_progress(
-                            "upscaling",
-                            f"Upscaling segment {segment.index + 1}/{len(segments)}{batch_label} ({processed_in_segment}/{total_in_segment} frames)",
-                        )
-
-                    def report_upscale_batch(batch_index: int, batch_count: int, processed_in_segment: int, total_in_segment: int) -> None:
-                        report_upscale_progress(processed_in_segment, total_in_segment, batch_index, batch_count)
-
-                    upscaled_count = _upscale_pytorch_segment(
-                        loaded_model=loaded_model,
-                        input_dir=segment_input_dir,
-                        output_dir=segment_output_dir,
-                        effective_tile=effective_tile,
-                        cancel_path=cancel_path,
-                        pause_path=pause_path,
-                        progress_callback=report_upscale_batch,
+                    _publish_progress(
+                        "upscaling",
+                        f"Upscaled segment {segment.index + 1}/{len(segments)} ({progress_state.upscaled_frames}/{total_frames} frames)",
                     )
-                elif backend_id == "pytorch-video-sr":
-                    def report_upscale_progress(processed_in_segment: int, total_in_segment: int, batch_index: int | None = None, batch_count: int | None = None) -> None:
-                        with progress_lock:
-                            progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + processed_in_segment)
-                            _set_segment_progress(
-                                telemetry_state,
-                                segment_index=segment.index + 1,
-                                segment_count=len(segments),
-                                segment_processed_frames=processed_in_segment,
-                                segment_total_frames=total_in_segment,
-                                batch_index=batch_index,
-                                batch_count=batch_count,
-                            )
-                        batch_label = f" batch {batch_index}/{batch_count}" if batch_index is not None and batch_count is not None else ""
-                        _publish_progress(
-                            "upscaling",
-                            f"Upscaling segment {segment.index + 1}/{len(segments)}{batch_label} ({processed_in_segment}/{total_in_segment} frames)",
-                        )
-
-                    upscaled_count, external_runtime = _upscale_external_video_segment(
-                        input_dir=segment_input_dir,
-                        output_dir=segment_output_dir,
-                        model_id=model_id,
-                        effective_tile=effective_tile,
-                        gpu_id=gpu_id,
-                        precision_mode=selected_precision_mode,
-                        log=log,
-                        cancel_path=cancel_path,
-                        pause_path=pause_path,
-                        progress_callback=report_upscale_progress,
-                    )
-                    model_runtime = external_runtime
-                    effective_precision_mode = str(external_runtime.get("precision", selected_precision_mode))
                 else:
-                    raise RuntimeError(f"Backend '{backend_id}' is cataloged but not runnable in the current app build")
+                    segment_output_dir = stage_input_dir
 
                 shutil.rmtree(segment_input_dir, ignore_errors=True)
-                with progress_lock:
-                    _record_stage_duration(telemetry_state, "upscale", time.time() - stage_started_at)
-                    progress_state.upscaled_frames = min(total_frames, upscaled_before_segment + upscaled_count)
-                    _set_segment_progress(
-                        telemetry_state,
-                        segment_index=segment.index + 1,
-                        segment_count=len(segments),
-                        segment_processed_frames=upscaled_count,
-                        segment_total_frames=segment.frame_count,
-                        batch_index=None,
-                        batch_count=None,
-                    )
-                _publish_progress(
-                    "upscaling",
-                    f"Upscaled segment {segment.index + 1}/{len(segments)} ({progress_state.upscaled_frames}/{total_frames} frames)",
-                )
+                if stage_input_dir != segment_input_dir and colorization_mode != "colorizeOnly":
+                    shutil.rmtree(stage_input_dir, ignore_errors=True)
                 _queue_put(encode_queue, (segment, segment_output_dir))
         except BaseException as error:  # noqa: BLE001
             _record_error(error)
@@ -3443,6 +3625,10 @@ def run_realesrgan_pipeline(
                 import torch
 
                 torch.cuda.synchronize(loaded_model.device)
+            if loaded_colorizer is not None and getattr(loaded_colorizer.device, "type", "cpu") == "cuda":
+                import torch
+
+                torch.cuda.synchronize(loaded_colorizer.device)
             _queue_put(encode_queue, sentinel)
 
     def encoder_worker() -> None:
@@ -3490,6 +3676,7 @@ def run_realesrgan_pipeline(
                         pause_path=pause_path,
                     total_frames=total_frames,
                     extracted_frames=progress_state.extracted_frames,
+                    colorized_frames=progress_state.colorized_frames,
                     upscaled_frames=progress_state.upscaled_frames,
                     interpolated_frames=progress_state.interpolated_frames,
                     encoded_frames_before_segment=progress_state.encoded_frames,
@@ -3514,7 +3701,12 @@ def run_realesrgan_pipeline(
         except BaseException as error:  # noqa: BLE001
             _record_error(error)
 
-    _publish_progress("extracting", "Starting overlapped extract/upscale/encode pipeline")
+    if colorization_mode == "colorizeOnly":
+        _publish_progress("extracting", "Starting overlapped extract/colorize/encode pipeline")
+    elif colorization_enabled:
+        _publish_progress("extracting", "Starting overlapped extract/colorize/upscale/encode pipeline")
+    else:
+        _publish_progress("extracting", "Starting overlapped extract/upscale/encode pipeline")
 
     concat_manifest: Path | None = None
     if backend_id == "pytorch-image-sr" and resolved_pytorch_execution_path == PYTORCH_EXECUTION_PATH_STREAMING:
@@ -3618,6 +3810,7 @@ def run_realesrgan_pipeline(
             pause_path=pause_path,
             total_frames=total_frames,
             extracted_frames=progress_state.extracted_frames,
+            colorized_frames=progress_state.colorized_frames,
             upscaled_frames=progress_state.upscaled_frames,
             interpolated_frames=progress_state.interpolated_frames,
             encoded_frames=progress_state.encoded_frames,
@@ -3653,7 +3846,7 @@ def run_realesrgan_pipeline(
                 "-metadata",
                 "upscaler_audio_source=original",
                 "-metadata",
-                f"upscaler_model={model_id}",
+                f"upscaler_model={active_model_id}",
                 "-metadata",
                 f"upscaler_codec={codec}",
                 "-metadata",
@@ -3673,6 +3866,7 @@ def run_realesrgan_pipeline(
             total_frames=total_frames,
             message_prefix="Remuxing original audio",
             extracted_frames=progress_state.extracted_frames,
+            colorized_frames=progress_state.colorized_frames,
             upscaled_frames=progress_state.upscaled_frames,
             interpolated_frames=progress_state.interpolated_frames,
             encoded_frames=progress_state.encoded_frames,
@@ -3704,6 +3898,7 @@ def run_realesrgan_pipeline(
             total_frames=total_frames,
             message_prefix="Finalizing video output",
             extracted_frames=progress_state.extracted_frames,
+            colorized_frames=progress_state.colorized_frames,
             upscaled_frames=progress_state.upscaled_frames,
             interpolated_frames=progress_state.interpolated_frames,
             encoded_frames=progress_state.encoded_frames,
@@ -3722,6 +3917,7 @@ def run_realesrgan_pipeline(
         processed_frames=total_frames,
         total_frames=total_frames,
         extracted_frames=progress_state.extracted_frames,
+        colorized_frames=progress_state.colorized_frames,
         upscaled_frames=progress_state.upscaled_frames,
         encoded_frames=progress_state.encoded_frames,
         remuxed_frames=progress_state.remuxed_frames,
@@ -3767,10 +3963,10 @@ def run_realesrgan_pipeline(
     return {
         "outputPath": str(output_file),
         "workDir": str(work_dir),
-        "executionPath": resolved_pytorch_execution_path or ("realesrgan-ncnn-vulkan" if backend_id == "realesrgan-ncnn" else "external-command"),
+        "executionPath": resolved_pytorch_execution_path or ("realesrgan-ncnn-vulkan" if backend_id == "realesrgan-ncnn" else "file-io" if backend_id == "pytorch-image-colorization" else "external-command"),
         "videoEncoder": video_encoder_config.encoder,
         "videoEncoderLabel": video_encoder_config.label,
-        "runner": str(model_runtime.get("runner")) if isinstance(model_runtime, dict) and model_runtime.get("runner") else ("ncnn-vulkan" if backend_id == "realesrgan-ncnn" else pytorch_runner or "torch"),
+        "runner": str(model_runtime.get("runner")) if isinstance(model_runtime, dict) and model_runtime.get("runner") else ("ncnn-vulkan" if backend_id == "realesrgan-ncnn" else "torch" if backend_id == "pytorch-image-colorization" else pytorch_runner or "torch"),
         "precision": effective_precision_mode,
         "torchCompileEnabled": torch_compile_enabled,
         "torchCompileMode": torch_compile_mode,
@@ -3785,6 +3981,7 @@ def run_realesrgan_pipeline(
         "runtime": runtime,
         "stageTimings": {
             "extractSeconds": telemetry_state.extract_stage_seconds,
+            "colorizeSeconds": telemetry_state.colorize_stage_seconds,
             "upscaleSeconds": telemetry_state.upscale_stage_seconds,
             "interpolateSeconds": telemetry_state.interpolate_stage_seconds,
             "encodeSeconds": telemetry_state.encode_stage_seconds,
@@ -3802,9 +3999,10 @@ def run_realesrgan_pipeline(
         "segmentCount": len(segments),
         "segmentFrameLimit": segment_frame_limit,
         "log": log + [
-            f"Model: {model_name} ({model_id})",
-            f"Execution path: {resolved_pytorch_execution_path or ('realesrgan-ncnn-vulkan' if backend_id == 'realesrgan-ncnn' else 'external-command')}",
-            f"Runner: {str(model_runtime.get('runner')) if isinstance(model_runtime, dict) and model_runtime.get('runner') else ('ncnn-vulkan' if backend_id == 'realesrgan-ncnn' else pytorch_runner or 'torch')}",
+            f"Model: {model_name} ({active_model_id})",
+            *( [f"Colorizer: {model_label(colorizer_model_id)} ({colorizer_model_id})"] if colorization_enabled and colorizer_model_id else [] ),
+            f"Execution path: {resolved_pytorch_execution_path or ('realesrgan-ncnn-vulkan' if backend_id == 'realesrgan-ncnn' else 'file-io' if backend_id == 'pytorch-image-colorization' else 'external-command')}",
+            f"Runner: {str(model_runtime.get('runner')) if isinstance(model_runtime, dict) and model_runtime.get('runner') else ('ncnn-vulkan' if backend_id == 'realesrgan-ncnn' else 'torch' if backend_id == 'pytorch-image-colorization' else pytorch_runner or 'torch')}",
             f"Precision: {effective_precision_mode}",
             f"Quality policy: tile {effective_tile}, precision {effective_precision_mode} ({precision_source})",
             f"Resolved output canvas: {resolved_width}x{resolved_height} ({resolved_aspect_ratio:.4f}:1)",
@@ -3815,6 +4013,6 @@ def run_realesrgan_pipeline(
             f"Processed duration: {effective_duration:.2f}s",
             f"Average throughput: {average_throughput:.2f} fps",
             f"Rolling throughput: {(telemetry_state.resources.rolling_frames_per_second or 0.0):.2f} fps",
-            f"Stage timings: extract {telemetry_state.extract_stage_seconds:.2f}s, upscale {telemetry_state.upscale_stage_seconds:.2f}s, interpolate {telemetry_state.interpolate_stage_seconds:.2f}s, encode {telemetry_state.encode_stage_seconds:.2f}s, remux {telemetry_state.remux_stage_seconds:.2f}s",
+            f"Stage timings: extract {telemetry_state.extract_stage_seconds:.2f}s, colorize {telemetry_state.colorize_stage_seconds:.2f}s, upscale {telemetry_state.upscale_stage_seconds:.2f}s, interpolate {telemetry_state.interpolate_stage_seconds:.2f}s, encode {telemetry_state.encode_stage_seconds:.2f}s, remux {telemetry_state.remux_stage_seconds:.2f}s",
         ],
     }

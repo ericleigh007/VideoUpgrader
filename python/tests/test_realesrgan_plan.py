@@ -71,6 +71,46 @@ class RealesrganPlanTests(unittest.TestCase):
         self.assertIn("PyTorch runner: tensorrt", plan["notes"])
         self.assertEqual(len(plan["cacheKey"]), 64)
 
+    def test_includes_deepremaster_processing_mode_in_plan(self) -> None:
+        plan = build_realesrgan_job_plan(
+            source_path="C:/videos/input.mp4",
+            model_id="realesrgan-x4plus",
+            colorization_mode="colorizeOnly",
+            colorizer_model_id="deepremaster",
+            deepremaster_processing_mode="high",
+            output_mode="preserveAspect4k",
+            preset="qualityBalanced",
+            interpolation_mode="off",
+            interpolation_target_fps=None,
+            gpu_id=0,
+            aspect_ratio_preset="source",
+            custom_aspect_width=None,
+            custom_aspect_height=None,
+            resolution_basis="exact",
+            target_width=1280,
+            target_height=720,
+            crop_left=None,
+            crop_top=None,
+            crop_width=None,
+            crop_height=None,
+            segment_duration_seconds=10,
+            output_path="artifacts/outputs/output.mp4",
+            codec="h264",
+            container="mp4",
+            tile_size=0,
+            fp16=False,
+            precision="fp32",
+            torch_compile_enabled=False,
+            pytorch_execution_path=None,
+            pytorch_runner="torch",
+            crf=18,
+        )
+
+        self.assertIn("--deepremaster-processing-mode", plan["command"])
+        self.assertIn("high", plan["command"])
+        self.assertIn("DeepRemaster processing mode: high", plan["notes"])
+
+
 
 if __name__ == "__main__":
     unittest.main()
