@@ -8,12 +8,12 @@ The project combines a Tauri desktop shell, a React comparison-first UI, and a P
 
 ## What's New
 
-Updated April 12, 2026.
+Updated April 21, 2026.
 
-- The detached comparison window now keeps the Source reference and all blind-comparison players frame-synced in real desktop validation, so you can inspect the same logical frame instead of guessing whether offsets are coming from the tool.
-- The comparison Source pane now uses a valid full-length playable reference instead of falling back to a short browser clip, which removes the black-source and wrong-timestamp failures that made blind comparisons untrustworthy.
-- Comparison controls are now clearer during review: `Shift + wheel` resizes the comparison panes, `Ctrl + wheel` zooms the video content in sync across players, and drag pans the crop only after a real drag starts.
-- The comparison workflow was validated with deterministic AV-sync fixtures and the desktop smoke harness, which matters because it proves the separate comparison window is doing the same job in the native app that it appears to do in the browser tests.
+- Colorization is now a first-class part of the workstation instead of an implied future path.
+- The app can now run automatic colorizers and reference-guided colorizers in `colorize only` or `colorize before upscale` workflows.
+- Source-linked context libraries and model-specific controls are now exposed in the main pipeline UI for reference-driven runs.
+- See [Colorization Models](README.md#colorization-models) and [Experimental Shot-Based Colorization Workflow](README.md#experimental-shot-based-colorization-workflow) for the current model lineup, constraints, and expected workflow.
 
 ## What VideoUpgrader Does
 
@@ -182,6 +182,20 @@ The Python worker pause path depends on `psutil` for suspending active subproces
 
 VideoUpgrader now includes several colorization backends with different strengths and different levels of user guidance.
 
+The practical workflow is easier to understand with a concrete example. The source frame below comes from the `Over the Rainbow` clip, the matching output frame shows the result from the saved DeepRemaster preview run, and the separate Dorothy reference still shows the kind of source-linked guidance image a reference-driven model can use.
+
+Rainbow source frame:
+
+![Rainbow source frame](docs/images/showcase/rainbow-colorization-before.png)
+
+Rainbow colorized output frame:
+
+![Rainbow colorized output](docs/images/showcase/rainbow-colorization-after.png)
+
+Reference still for guided colorization:
+
+![Dorothy colorization reference](docs/images/showcase/dorothy-colorization-reference.png)
+
 - `ddcolor-modelscope`: fully automatic photo-realistic colorization for grayscale photos and live-action frames. This is a fast baseline when you want plausible color without managing references.
 - `ddcolor-paper`: a higher-fidelity DDColor checkpoint for local comparisons when you want to test whether the paper-weighted model preserves better detail or tone.
 - `deoldify-stable`: a more conservative DeOldify variant that tends to suit portraits and natural live-action material.
@@ -189,7 +203,7 @@ VideoUpgrader now includes several colorization backends with different strength
 - `deepremaster`: a reference-guided video colorizer that can use source-associated context images. It is useful when you have stills, posters, or other look references and want the model to steer toward them.
 - `colormnet`: an exemplar-propagation video colorizer built around one anchor reference image that closely matches a shot. It can produce strong matches when the exemplar is very close to the target shot, but it is not a general semantic recoloring system.
 
-In practice, the automatic models are good for fast exploration, while the reference-guided models are the more promising path when you are willing to curate inputs and review shot by shot.
+In practice, the automatic models are good for fast exploration, while the reference-guided models are the more promising path when you are willing to curate inputs and review shot by shot. The important distinction is that automatic models try to infer a plausible palette on their own, while reference-guided models let you push the result toward a chosen look from your source context library.
 
 ## Upscaling Models
 
