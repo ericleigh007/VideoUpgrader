@@ -7,8 +7,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::{ProcessesToUpdate, System};
+
+#[cfg(windows)]
+use windows_sys::Win32::System::Power::{
+    SetThreadExecutionState, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_SYSTEM_REQUIRED,
+};
 
 const DIRECTORY_STATS_CACHE_TTL_MS: u128 = 5_000;
 
@@ -16,11 +22,21 @@ fn default_deepremaster_processing_mode() -> String {
     "standard".to_string()
 }
 
+fn default_denoise_mode() -> String {
+    "off".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RealesrganJobRequest {
     source_path: String,
     model_id: String,
+    #[serde(default)]
+    resume_from_job_id: Option<String>,
+    #[serde(default = "default_denoise_mode")]
+    denoise_mode: String,
+    #[serde(default)]
+    denoiser_model_id: Option<String>,
     colorization_mode: String,
     colorizer_model_id: Option<String>,
     colorization_context: Option<SelectedColorizationContext>,
@@ -100,6 +116,8 @@ struct PipelineEffectiveSettings {
 struct PipelineStageTimings {
     #[serde(default)]
     extract_seconds: f64,
+    #[serde(default)]
+    denoise_seconds: f64,
     #[serde(default)]
     colorize_seconds: f64,
     #[serde(default)]
@@ -336,6 +354,8 @@ struct PipelineProgress {
     total_frames: usize,
     extracted_frames: usize,
     #[serde(default)]
+    denoised_frames: usize,
+    #[serde(default)]
     colorized_frames: usize,
     upscaled_frames: usize,
     #[serde(default)]
@@ -374,6 +394,8 @@ struct PipelineProgress {
     output_size_bytes: Option<u64>,
     #[serde(default)]
     extract_stage_seconds: Option<f64>,
+    #[serde(default)]
+    denoise_stage_seconds: Option<f64>,
     #[serde(default)]
     colorize_stage_seconds: Option<f64>,
     #[serde(default)]
@@ -525,6 +547,89 @@ struct AppState {
     jobs: Arc<Mutex<HashMap<String, PipelineJobRecord>>>,
     source_conversion_jobs: Arc<Mutex<HashMap<String, SourceConversionJobRecord>>>,
     path_stats_cache: Arc<Mutex<HashMap<String, CachedPathStatsEntry>>>,
+    power_inhibit: Arc<Mutex<PowerInhibitState>>,
+}
+
+#[derive(Debug, Default)]
+struct PowerInhibitState {
+    active_jobs: usize,
+    worker_running: bool,
+}
+
+#[cfg(windows)]
+fn refresh_system_awake() {
+    unsafe {
+        let previous_state = SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED);
+        if previous_state == 0 {
+            eprintln!("Failed to request Windows system-awake execution state for active job.");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn refresh_system_awake() {}
+
+#[cfg(windows)]
+fn release_system_awake() {
+    unsafe {
+        SetThreadExecutionState(ES_CONTINUOUS);
+    }
+}
+
+#[cfg(not(windows))]
+fn release_system_awake() {}
+
+fn acquire_power_inhibit(power_inhibit: Arc<Mutex<PowerInhibitState>>) {
+    let should_spawn = {
+        let mut state = match power_inhibit.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.active_jobs = state.active_jobs.saturating_add(1);
+        if state.worker_running {
+            false
+        } else {
+            state.worker_running = true;
+            true
+        }
+    };
+
+    if !should_spawn {
+        refresh_system_awake();
+        return;
+    }
+
+    refresh_system_awake();
+
+    thread::spawn(move || {
+        loop {
+            let should_stop = match power_inhibit.lock() {
+                Ok(mut state) => {
+                    if state.active_jobs == 0 {
+                        state.worker_running = false;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => true,
+            };
+            if should_stop {
+                break;
+            }
+
+            refresh_system_awake();
+            thread::sleep(Duration::from_secs(45));
+        }
+
+        release_system_awake();
+    });
+}
+
+fn release_power_inhibit(power_inhibit: &Arc<Mutex<PowerInhibitState>>) {
+    if let Ok(mut state) = power_inhibit.lock() {
+        state.active_jobs = state.active_jobs.saturating_sub(1);
+    }
 }
 
 fn repo_root() -> PathBuf {
@@ -552,6 +657,10 @@ fn source_previews_root() -> PathBuf {
 
 fn managed_job_summary_path(job_id: &str) -> PathBuf {
     jobs_root().join(format!("job_{job_id}_summary.json"))
+}
+
+fn managed_job_progress_path(job_id: &str) -> PathBuf {
+    jobs_root().join(format!("job_{job_id}_progress.json"))
 }
 
 fn python_command() -> String {
@@ -888,6 +997,8 @@ fn build_cache_key(request: &RealesrganJobRequest) -> String {
     let mut hasher = Sha256::new();
     hasher.update(request.source_path.as_bytes());
     hasher.update(request.model_id.as_bytes());
+    hasher.update(request.denoise_mode.as_bytes());
+    hasher.update(request.denoiser_model_id.as_deref().unwrap_or_default().as_bytes());
     hasher.update(request.colorization_mode.as_bytes());
     hasher.update(request.colorizer_model_id.as_deref().unwrap_or_default().as_bytes());
     hasher.update(request.deepremaster_processing_mode.as_bytes());
@@ -947,6 +1058,7 @@ fn default_progress(phase: &str, percent: u32, message: &str) -> PipelineProgres
         processed_frames: 0,
         total_frames: 0,
         extracted_frames: 0,
+        denoised_frames: 0,
         upscaled_frames: 0,
         colorized_frames: 0,
         interpolated_frames: 0,
@@ -968,6 +1080,7 @@ fn default_progress(phase: &str, percent: u32, message: &str) -> PipelineProgres
         scratch_size_bytes: None,
         output_size_bytes: None,
         extract_stage_seconds: None,
+        denoise_stage_seconds: None,
         colorize_stage_seconds: None,
         upscale_stage_seconds: None,
         interpolate_stage_seconds: None,
@@ -1346,6 +1459,21 @@ fn build_managed_job_summary(
 }
 
 fn refresh_summary_path_stats(summary: &mut ManagedJobSummary, state: &AppState, infer_interrupted_state: bool) {
+    let progress_path = managed_job_progress_path(&summary.job_id);
+    let mut progress = read_progress(&progress_path, &summary.progress);
+    apply_live_state_to_progress(&summary.state, &mut progress, "Job paused");
+    summary.progress = progress;
+
+    if summary.source_path.is_none() {
+        summary.source_path = summary.progress.source_path.clone();
+    }
+    if summary.scratch_path.is_none() {
+        summary.scratch_path = summary.progress.scratch_path.clone();
+    }
+    if summary.output_path.is_none() {
+        summary.output_path = summary.progress.output_path.clone();
+    }
+
     let scratch_stats = summary
         .scratch_path
         .as_ref()
@@ -1365,6 +1493,7 @@ fn refresh_summary_path_stats(summary: &mut ManagedJobSummary, state: &AppState,
     summary.recorded_count = summary.progress.total_frames;
     summary.scratch_stats = scratch_stats;
     summary.output_stats = output_stats;
+    summary.updated_at = path_modified_timestamp(&progress_path);
     if infer_interrupted_state {
         summary.state = derive_interrupted_state(&summary.state, &summary.progress);
     }
@@ -1610,6 +1739,8 @@ fn prepare_realesrgan_job(request: RealesrganJobRequest) -> RealesrganJobPlan {
         request.source_path.clone(),
         "--model-id".to_string(),
         request.model_id.clone(),
+        "--denoise-mode".to_string(),
+        request.denoise_mode.clone(),
         "--colorization-mode".to_string(),
         request.colorization_mode.clone(),
         "--output-mode".to_string(),
@@ -1620,8 +1751,6 @@ fn prepare_realesrgan_job(request: RealesrganJobRequest) -> RealesrganJobPlan {
         request.interpolation_mode.clone(),
         "--pytorch-runner".to_string(),
         request.pytorch_runner.clone(),
-        "--gpu-id".to_string(),
-        request.gpu_id.unwrap_or_default().to_string(),
         "--aspect-ratio-preset".to_string(),
         request.aspect_ratio_preset.clone(),
         "--resolution-basis".to_string(),
@@ -1641,6 +1770,16 @@ fn prepare_realesrgan_job(request: RealesrganJobRequest) -> RealesrganJobPlan {
     if let Some(colorizer_model_id) = &request.colorizer_model_id {
         command.push("--colorizer-model-id".to_string());
         command.push(colorizer_model_id.clone());
+    }
+
+    if let Some(denoiser_model_id) = &request.denoiser_model_id {
+        command.push("--denoiser-model-id".to_string());
+        command.push(denoiser_model_id.clone());
+    }
+
+    if let Some(gpu_id) = request.gpu_id {
+        command.push("--gpu-id".to_string());
+        command.push(gpu_id.to_string());
     }
 
     command.push("--deepremaster-processing-mode".to_string());
@@ -1718,10 +1857,6 @@ fn prepare_realesrgan_job(request: RealesrganJobRequest) -> RealesrganJobPlan {
         command.push("--fp16".to_string());
     }
 
-    if request.gpu_id.is_none() {
-        command.drain(8..10);
-    }
-
     RealesrganJobPlan {
         model: model_label(&request.model_id).to_string(),
         cache_key: build_cache_key(&request),
@@ -1780,6 +1915,8 @@ fn start_source_conversion_to_mp4(state: tauri::State<AppState>, source_path: St
     }
 
     let jobs = Arc::clone(&state.source_conversion_jobs);
+    let power_inhibit = Arc::clone(&state.power_inhibit);
+    acquire_power_inhibit(Arc::clone(&power_inhibit));
     let job_id_for_thread = job_id.clone();
     std::thread::spawn(move || {
         if let Ok(mut job_store) = jobs.lock() {
@@ -1830,6 +1967,7 @@ fn start_source_conversion_to_mp4(state: tauri::State<AppState>, source_path: St
                                 processed_frames: 0,
                                 total_frames: 0,
                                 extracted_frames: 0,
+                                denoised_frames: 0,
                                 colorized_frames: 0,
                                 upscaled_frames: 0,
                                 interpolated_frames: 0,
@@ -1851,6 +1989,7 @@ fn start_source_conversion_to_mp4(state: tauri::State<AppState>, source_path: St
                                 scratch_size_bytes: None,
                                 output_size_bytes: None,
                                 extract_stage_seconds: None,
+                                denoise_stage_seconds: None,
                                 colorize_stage_seconds: None,
                                 upscale_stage_seconds: None,
                                 interpolate_stage_seconds: None,
@@ -1881,6 +2020,7 @@ fn start_source_conversion_to_mp4(state: tauri::State<AppState>, source_path: St
                 let _ = clear_signal_file(&record.pause_path);
             }
         }
+        release_power_inhibit(&power_inhibit);
     });
 
     Ok(job_id)
@@ -2100,7 +2240,13 @@ fn remove_source_context_entry(source_path: String, entry_id: String) -> Result<
 
 #[tauri::command]
 fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJobRequest) -> Result<String, String> {
-    let job_id = generate_job_id(&request);
+    let job_id = request
+        .resume_from_job_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| generate_job_id(&request));
     let progress_path = jobs_root().join(format!("job_{job_id}_progress.json"));
     let cancel_path = jobs_root().join(format!("job_{job_id}_cancel.signal"));
     let pause_path = jobs_root().join(format!("job_{job_id}_pause.signal"));
@@ -2152,6 +2298,8 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
         request.source_path.clone(),
         "--model-id".to_string(),
         request.model_id.clone(),
+        "--denoise-mode".to_string(),
+        request.denoise_mode.clone(),
         "--colorization-mode".to_string(),
         request.colorization_mode.clone(),
         "--output-mode".to_string(),
@@ -2162,8 +2310,6 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
         request.interpolation_mode.clone(),
         "--pytorch-runner".to_string(),
         request.pytorch_runner.clone(),
-        "--gpu-id".to_string(),
-        request.gpu_id.unwrap_or_default().to_string(),
         "--aspect-ratio-preset".to_string(),
         request.aspect_ratio_preset.clone(),
         "--resolution-basis".to_string(),
@@ -2225,6 +2371,16 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
         owned_args.push(colorizer_model_id.clone());
     }
 
+    if let Some(denoiser_model_id) = &request.denoiser_model_id {
+        owned_args.push("--denoiser-model-id".to_string());
+        owned_args.push(denoiser_model_id.clone());
+    }
+
+    if let Some(gpu_id) = request.gpu_id {
+        owned_args.push("--gpu-id".to_string());
+        owned_args.push(gpu_id.to_string());
+    }
+
     owned_args.push("--deepremaster-processing-mode".to_string());
     owned_args.push(request.deepremaster_processing_mode.clone());
 
@@ -2239,6 +2395,12 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
 
     owned_args.push("--job-id".to_string());
     owned_args.push(job_id.clone());
+    if let Some(resume_from_job_id) = &request.resume_from_job_id {
+        if !resume_from_job_id.trim().is_empty() {
+            owned_args.push("--resume-from-job-id".to_string());
+            owned_args.push(resume_from_job_id.clone());
+        }
+    }
     owned_args.push("--progress-path".to_string());
     owned_args.push(progress_path.display().to_string());
     owned_args.push("--cancel-path".to_string());
@@ -2274,16 +2436,14 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
         owned_args.push("--fp16".to_string());
     }
 
-    if request.gpu_id.is_none() {
-        owned_args.drain(11..13);
-    }
-
     let owned_args_for_thread = owned_args;
     let job_id_for_thread = job_id.clone();
     let model_id_for_summary = request.model_id.clone();
     let codec_for_summary = request.codec.clone();
     let container_for_summary = request.container.clone();
     let jobs = Arc::clone(&state.jobs);
+    let power_inhibit = Arc::clone(&state.power_inhibit);
+    acquire_power_inhibit(Arc::clone(&power_inhibit));
 
     std::thread::spawn(move || {
         let borrowed_args = owned_args_for_thread.iter().map(String::as_str).collect::<Vec<_>>();
@@ -2316,6 +2476,7 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
                                 processed_frames: 0,
                                 total_frames: 0,
                                 extracted_frames: 0,
+                                denoised_frames: 0,
                                 colorized_frames: 0,
                                 upscaled_frames: 0,
                                 interpolated_frames: 0,
@@ -2337,6 +2498,7 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
                                 scratch_size_bytes: None,
                                 output_size_bytes: None,
                                 extract_stage_seconds: None,
+                                denoise_stage_seconds: None,
                                 colorize_stage_seconds: None,
                                 upscale_stage_seconds: None,
                                 interpolate_stage_seconds: None,
@@ -2377,6 +2539,7 @@ fn start_realesrgan_pipeline(state: tauri::State<AppState>, request: RealesrganJ
                 let _ = clear_signal_file(&record.pause_path);
             }
         }
+        release_power_inhibit(&power_inhibit);
     });
 
     Ok(job_id)
@@ -2542,6 +2705,7 @@ pub fn run() {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             source_conversion_jobs: Arc::new(Mutex::new(HashMap::new())),
             path_stats_cache: Arc::new(Mutex::new(HashMap::new())),
+            power_inhibit: Arc::new(Mutex::new(PowerInhibitState::default())),
         })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -2584,6 +2748,9 @@ mod tests {
         RealesrganJobRequest {
             source_path: "C:/fixtures/input.mp4".to_string(),
             model_id: "realesrgan-x4plus".to_string(),
+            resume_from_job_id: None,
+            denoise_mode: "off".to_string(),
+            denoiser_model_id: None,
             colorization_mode: "off".to_string(),
             colorizer_model_id: None,
             colorization_context: None,
@@ -2648,6 +2815,7 @@ mod tests {
             processed_frames: 2396,
             total_frames: 28491,
             extracted_frames: 2396,
+            denoised_frames: 0,
             colorized_frames: 0,
             upscaled_frames: 0,
             interpolated_frames: 0,
@@ -2669,6 +2837,7 @@ mod tests {
             scratch_size_bytes: None,
             output_size_bytes: None,
             extract_stage_seconds: None,
+            denoise_stage_seconds: None,
             colorize_stage_seconds: None,
             upscale_stage_seconds: None,
             interpolate_stage_seconds: None,
@@ -2693,6 +2862,7 @@ mod tests {
             processed_frames: 256,
             total_frames: 28491,
             extracted_frames: 599,
+            denoised_frames: 0,
             colorized_frames: 0,
             upscaled_frames: 256,
             interpolated_frames: 0,
@@ -2714,6 +2884,7 @@ mod tests {
             scratch_size_bytes: None,
             output_size_bytes: None,
             extract_stage_seconds: None,
+            denoise_stage_seconds: None,
             colorize_stage_seconds: None,
             upscale_stage_seconds: None,
             interpolate_stage_seconds: None,
@@ -2743,11 +2914,127 @@ mod tests {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             source_conversion_jobs: Arc::new(Mutex::new(HashMap::new())),
             path_stats_cache: Arc::new(Mutex::new(HashMap::new())),
+            power_inhibit: Arc::new(Mutex::new(PowerInhibitState::default())),
         };
 
         refresh_summary_path_stats(&mut summary, &state, false);
 
         assert_eq!(summary.state, "running");
+    }
+
+    #[test]
+    fn persisted_managed_jobs_refresh_live_progress_from_progress_file() {
+        let job_id = format!(
+            "refresh{:x}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        );
+        let progress_path = managed_job_progress_path(&job_id);
+        let summary_path = managed_job_summary_path(&job_id);
+        let scratch_path = jobs_root().join(format!("job_{job_id}"));
+        let output_path = artifacts_root().join("outputs").join(format!("{job_id}.mp4"));
+        let state = AppState {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            source_conversion_jobs: Arc::new(Mutex::new(HashMap::new())),
+            path_stats_cache: Arc::new(Mutex::new(HashMap::new())),
+            power_inhibit: Arc::new(Mutex::new(PowerInhibitState::default())),
+        };
+
+        fs::create_dir_all(jobs_root()).expect("jobs directory should be created for test");
+
+        let stale_summary = ManagedJobSummary {
+            job_id: job_id.clone(),
+            job_kind: "pipeline".to_string(),
+            label: "Upscale Job".to_string(),
+            state: "interrupted".to_string(),
+            source_path: None,
+            model_id: Some("realesrgan-x4plus".to_string()),
+            codec: Some("h264".to_string()),
+            container: Some("mp4".to_string()),
+            progress: default_progress("queued", 0, "Job running"),
+            recorded_count: 0,
+            scratch_path: None,
+            scratch_stats: None,
+            output_path: None,
+            output_stats: None,
+            pipeline_run_details: None,
+            updated_at: "0".to_string(),
+        };
+
+        let live_progress = PipelineProgress {
+            phase: "upscaling".to_string(),
+            percent: 13,
+            message: "Upscaling segment 7/45 (181/250 frames)".to_string(),
+            job_id: Some(job_id.clone()),
+            source_path: Some("C:/fixtures/input.mp4".to_string()),
+            scratch_path: Some(scratch_path.display().to_string()),
+            output_path: Some(output_path.display().to_string()),
+            processed_frames: 4200,
+            total_frames: 26976,
+            extracted_frames: 1750,
+            denoised_frames: 1750,
+            colorized_frames: 1750,
+            upscaled_frames: 1500,
+            interpolated_frames: 3600,
+            encoded_frames: 3600,
+            remuxed_frames: 0,
+            segment_index: Some(7),
+            segment_count: Some(45),
+            segment_processed_frames: Some(181),
+            segment_total_frames: Some(250),
+            batch_index: None,
+            batch_count: None,
+            elapsed_seconds: Some(2432.95),
+            average_frames_per_second: Some(1.72),
+            rolling_frames_per_second: Some(0.0),
+            estimated_remaining_seconds: Some(13193.58),
+            process_rss_bytes: Some(3_624_144_896),
+            gpu_memory_used_bytes: Some(7_355_760_640),
+            gpu_memory_total_bytes: Some(102_641_958_912),
+            scratch_size_bytes: Some(3_363_078_078),
+            output_size_bytes: Some(0),
+            extract_stage_seconds: Some(20.85),
+            denoise_stage_seconds: Some(31.25),
+            colorize_stage_seconds: Some(212.29),
+            upscale_stage_seconds: Some(704.41),
+            interpolate_stage_seconds: Some(1403.99),
+            encode_stage_seconds: Some(50.09),
+            remux_stage_seconds: Some(0.0),
+        };
+
+        write_managed_job_summary(&stale_summary).expect("stale summary should be written");
+        fs::write(
+            &progress_path,
+            serde_json::to_string(&live_progress).expect("progress should serialize"),
+        )
+        .expect("live progress should be written");
+
+        let summaries = list_managed_jobs_internal(&state).expect("managed jobs should list");
+        let summary = summaries
+            .iter()
+            .find(|entry| entry.job_id == job_id)
+            .expect("refreshed job should be present");
+
+        assert_eq!(summary.progress.phase, "upscaling");
+        assert_eq!(summary.progress.percent, 13);
+        assert_eq!(summary.progress.processed_frames, 4200);
+        assert_eq!(summary.progress.colorized_frames, 1750);
+        assert_eq!(summary.progress.interpolate_stage_seconds, Some(1403.99));
+        assert_eq!(summary.recorded_count, 26976);
+        assert_eq!(summary.source_path.as_deref(), Some("C:/fixtures/input.mp4"));
+        assert_eq!(
+            summary.scratch_path.as_deref(),
+            Some(scratch_path.display().to_string().as_str())
+        );
+        assert_eq!(
+            summary.output_path.as_deref(),
+            Some(output_path.display().to_string().as_str())
+        );
+
+        let _ = fs::remove_file(summary_path);
+        let _ = fs::remove_file(progress_path);
     }
 
     #[test]
@@ -2784,6 +3071,7 @@ mod tests {
                 processed_frames: 0,
                 total_frames: 0,
                 extracted_frames: 0,
+                denoised_frames: 0,
                 colorized_frames: 0,
                 upscaled_frames: 0,
                 interpolated_frames: 0,
@@ -2805,6 +3093,7 @@ mod tests {
                 scratch_size_bytes: None,
                 output_size_bytes: None,
                 extract_stage_seconds: None,
+                denoise_stage_seconds: None,
                 colorize_stage_seconds: None,
                 upscale_stage_seconds: None,
                 interpolate_stage_seconds: None,

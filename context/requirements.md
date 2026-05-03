@@ -10,7 +10,7 @@ It replaces the inconsistent placeholder naming and prior carry-over text. It is
 
 VideoUpgrader is a Windows-first desktop application for:
 
-- Creating video upgrade pipelines including, but not limited to Colorization, Upscaling, frame interpolation
+- Creating video upgrade pipelines including, but not limited to denoising, Colorization, Upscaling, frame interpolation
 - Comparing multiple pipeilne combinations of models on the same source content.
 - Exporting full-length processed video while preserving or reattaching the original audio.
 - Analyzing output quality at the frame, pixel, and temporal level.
@@ -75,6 +75,32 @@ The first deliverable must support:
 - The app should surface that shot-to-shot color continuity is an experimental review problem and may require manual correction or rerendering when adjacent shots do not blend acceptably.
 - The app should preserve enough metadata for shot-based runs that the user can inspect which exemplar, prompt, or context assets were used for each shot.
 - The app should treat prompt-driven or exemplar-driven colorization as experimental quality-assist workflows rather than guaranteed deterministic restoration.
+
+### Hard-Caption Removal
+
+- The app should support fully automatic removal of hard-coded captions and subtitles from local video.
+- Hard-caption removal must not require manual mask painting, manual mask movement, frame-by-frame correction, or external editor round-trips as the primary workflow.
+- The caption-removal pipeline should automatically detect subtitle-like overlays, segment caption pixels and outlines, remove the caption region, and preserve temporal stability.
+- The caption detector should distinguish subtitles/captions from hard negatives such as timestamps, bodycam overlays, signs, reflections, clothing logos, and unrelated scene text.
+- The app should preserve diagnostic mask overlays and comparison outputs for review and regression testing.
+- The app should include synthetic caption-removal fixtures with clean targets, captioned inputs, exact ground-truth masks, and hard-negative distractors.
+- The app should evaluate caption removal with residual text, scene damage, temporal stability, false-positive, and runtime metrics.
+- The first production implementation may run in the desktop worker using CUDA/PyTorch or equivalent local GPU acceleration.
+- The project should investigate browser-side realtime caption-removal inference using WebGPU, WebNN, WebCodecs, or WASM SIMD.
+- Browser realtime caption removal should start with automatic mask inference and mask overlay preview before attempting browser-side neural inpainting.
+
+### Denoising
+
+- The app must treat denoising as the first optional enhancement stage when it is enabled.
+- The app must apply denoising before colorization so color models do not infer color from noise, chroma crawl, or tape artifacts.
+- The app must apply denoising before upscaling so spatial restoration models do not magnify analog noise, compression shimmer, or tape grain as detail.
+- The app must apply denoising before frame interpolation so motion models do not synthesize intermediate noisy frames from unstable source frames.
+- The app must catalog denoising models and filters with analog-noise suitability, temporal-stability, detail-retention, speed, VRAM, target-noise, and known-risk metadata.
+- The app should include fast classical denoise baselines and AI denoise candidates so quality and performance can be compared on the same source intervals.
+- The first runnable denoise baseline should support local/offline operation and avoid requiring additional model downloads.
+- AI denoisers should default to repo-provided runners that provision official source/checkpoint assets on first use, while still allowing explicit external command overrides for alternate local runtimes.
+- AI denoise execution should preserve efficient overlap behavior: framewise models should use overlapped spatial tiles, and temporal models should process chunks with enough neighboring-frame context to avoid boundary artifacts.
+- The app should provide repeatable denoise comparison samples that render an original-plus-three-output quad preview for fast visual review.
 
 ### Upscaling
 

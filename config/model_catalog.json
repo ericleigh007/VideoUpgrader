@@ -39,9 +39,292 @@
       "runtime": "python-torch",
       "supportsGpuSelection": true,
       "frameTransport": "directory-batch"
+    },
+    {
+      "id": "ffmpeg-video-denoise",
+      "label": "FFmpeg Video Denoise",
+      "loader": "built-in-filter",
+      "runtime": "ffmpeg",
+      "supportsGpuSelection": false,
+      "frameTransport": "directory-batch"
+    },
+    {
+      "id": "pytorch-image-denoise",
+      "label": "PyTorch Image Denoise",
+      "loader": "pytorch-checkpoint",
+      "runtime": "python-torch",
+      "supportsGpuSelection": true,
+      "frameTransport": "directory-batch"
+    },
+    {
+      "id": "pytorch-video-denoise",
+      "label": "PyTorch Video Denoise",
+      "loader": "pytorch-checkpoint",
+      "runtime": "python-torch",
+      "supportsGpuSelection": true,
+      "frameTransport": "sequence-native"
     }
   ],
   "models": [
+    {
+      "id": "ffmpeg-hqdn3d-balanced",
+      "backendId": "ffmpeg-video-denoise",
+      "loader": "built-in-filter",
+      "runtimeModelName": "hqdn3d=2.5:2.5:6.0:6.0",
+      "label": "FFmpeg hqdn3d Balanced",
+      "summary": "Fast spatial-temporal denoise baseline for noisy analog and VHS-like sources before colorization, upscaling, or interpolation.",
+      "task": "denoise",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "production",
+      "qualityRank": 1,
+      "videoNative": true,
+      "mediaSuitability": ["analog-tv", "vhs", "compressed-video", "live-action"],
+      "nativeScale": 1,
+      "qualityStats": {
+        "analogNoiseScore": 7,
+        "temporalStabilityScore": 7,
+        "detailRetentionScore": 6,
+        "speedClass": "realtime-plus",
+        "vramClass": "none",
+        "strength": "balanced",
+        "noiseTargets": ["luma noise", "mild chroma crawl", "compression shimmer", "sensor-like grain"],
+        "knownRisks": ["can soften fine texture", "not content-aware", "limited dropout repair"]
+      },
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": false,
+        "prefersFixedScaleModelOutput": false
+      }
+    },
+    {
+      "id": "ffmpeg-hqdn3d-strong",
+      "backendId": "ffmpeg-video-denoise",
+      "loader": "built-in-filter",
+      "runtimeModelName": "hqdn3d=4.0:3.0:8.0:6.0",
+      "label": "FFmpeg hqdn3d Strong",
+      "summary": "Aggressive fast denoise preset for very noisy tapes where suppressing noise matters more than preserving fine grain.",
+      "task": "denoise",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "production",
+      "qualityRank": 2,
+      "videoNative": true,
+      "mediaSuitability": ["vhs", "analog-tv", "low-bitrate-video"],
+      "nativeScale": 1,
+      "qualityStats": {
+        "analogNoiseScore": 8,
+        "temporalStabilityScore": 8,
+        "detailRetentionScore": 4,
+        "speedClass": "realtime-plus",
+        "vramClass": "none",
+        "strength": "strong",
+        "noiseTargets": ["heavy luma noise", "temporal shimmer", "coarse analog grain"],
+        "knownRisks": ["visible smoothing", "texture loss", "motion trails on some footage"]
+      },
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": false,
+        "prefersFixedScaleModelOutput": false
+      }
+    },
+    {
+      "id": "ffmpeg-nlmeans-quality",
+      "backendId": "ffmpeg-video-denoise",
+      "loader": "built-in-filter",
+      "runtimeModelName": "nlmeans=s=2.5:p=7:r=15",
+      "label": "FFmpeg NLMeans Quality",
+      "summary": "Slower classical non-local means denoise baseline with better detail preservation than hqdn3d on some analog sources.",
+      "task": "denoise",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "production",
+      "qualityRank": 3,
+      "videoNative": true,
+      "mediaSuitability": ["analog-tv", "vhs", "film-transfer", "live-action"],
+      "nativeScale": 1,
+      "qualityStats": {
+        "analogNoiseScore": 8,
+        "temporalStabilityScore": 6,
+        "detailRetentionScore": 7,
+        "speedClass": "slow",
+        "vramClass": "none",
+        "strength": "quality",
+        "noiseTargets": ["fine luma noise", "mild chroma noise", "compression texture"],
+        "knownRisks": ["slow on long clips", "can leave temporal noise behind", "parameter-sensitive"]
+      },
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": false,
+        "prefersFixedScaleModelOutput": false
+      }
+    },
+    {
+      "id": "fastdvdnet",
+      "backendId": "pytorch-video-denoise",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "fastdvdnet",
+      "label": "FastDVDnet",
+      "summary": "Video-native neural denoiser and the preferred first PyTorch temporal denoise target for noisy home-video sources.",
+      "task": "denoise",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "next",
+      "qualityRank": 4,
+      "videoNative": true,
+      "mediaSuitability": ["analog-tv", "vhs", "live-action", "compressed-video"],
+      "nativeScale": 1,
+      "qualityStats": {
+        "analogNoiseScore": 8,
+        "temporalStabilityScore": 9,
+        "detailRetentionScore": 7,
+        "speedClass": "medium",
+        "vramClass": "moderate",
+        "strength": "temporal-neural",
+        "noiseTargets": ["temporal noise", "sensor-like grain", "compression shimmer"],
+        "knownRisks": ["checkpoint/license validation required", "less targeted at chroma crawl", "needs sequence batching"]
+      },
+      "researchRuntime": {
+        "kind": "external-command",
+        "commandEnvVar": "UPSCALER_FASTDVDNET_COMMAND",
+        "defaultRunner": "upscaler_worker.ai_denoise_runner",
+        "provisionsRuntime": true
+      },
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "temporalContextRadiusFrames": 2,
+        "prefersFixedScaleModelOutput": false
+      }
+    },
+    {
+      "id": "swinir-denoise-real",
+      "backendId": "pytorch-image-denoise",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "swinir-denoise-real",
+      "label": "SwinIR Real Denoise",
+      "summary": "Transformer image denoiser candidate for high-detail framewise cleanup before the existing SwinIR/Real-ESR upscalers.",
+      "task": "denoise",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "next",
+      "qualityRank": 5,
+      "videoNative": false,
+      "mediaSuitability": ["analog-tv", "vhs", "live-action", "photo"],
+      "nativeScale": 1,
+      "qualityStats": {
+        "analogNoiseScore": 7,
+        "temporalStabilityScore": 4,
+        "detailRetentionScore": 8,
+        "speedClass": "slow",
+        "vramClass": "high",
+        "strength": "frame-transformer",
+        "noiseTargets": ["fine luma noise", "compressed texture", "frame-level grain"],
+        "knownRisks": ["framewise temporal shimmer", "slower than CNN denoisers", "may need post-stability checks"]
+      },
+      "researchRuntime": {
+        "kind": "external-command",
+        "commandEnvVar": "UPSCALER_SWINIR_DENOISE_COMMAND",
+        "defaultRunner": "upscaler_worker.ai_denoise_runner",
+        "provisionsRuntime": true
+      },
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "tileOverlapPixels": 32,
+        "prefersFixedScaleModelOutput": false
+      }
+    },
+    {
+      "id": "scunet-real-denoise",
+      "backendId": "pytorch-image-denoise",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "scunet-real-denoise",
+      "label": "SCUNet Real Denoise",
+      "summary": "Blind real-world image denoiser candidate for unknown VHS and broadcast-noise levels.",
+      "task": "denoise",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "next",
+      "qualityRank": 6,
+      "videoNative": false,
+      "mediaSuitability": ["analog-tv", "vhs", "compressed-video", "live-action"],
+      "nativeScale": 1,
+      "qualityStats": {
+        "analogNoiseScore": 8,
+        "temporalStabilityScore": 4,
+        "detailRetentionScore": 7,
+        "speedClass": "medium",
+        "vramClass": "moderate",
+        "strength": "blind-frame-neural",
+        "noiseTargets": ["unknown real-world noise", "compression noise", "mixed luma/chroma noise"],
+        "knownRisks": ["framewise instability", "model packaging required", "may over-smooth low-detail shots"]
+      },
+      "researchRuntime": {
+        "kind": "external-command",
+        "commandEnvVar": "UPSCALER_SCUNET_DENOISE_COMMAND",
+        "defaultRunner": "upscaler_worker.ai_denoise_runner",
+        "provisionsRuntime": true
+      },
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "tileOverlapPixels": 32,
+        "prefersFixedScaleModelOutput": false
+      }
+    },
+    {
+      "id": "drunet-gray-color-denoise",
+      "backendId": "pytorch-image-denoise",
+      "loader": "pytorch-checkpoint",
+      "runtimeModelName": "drunet",
+      "label": "DRUNet Controllable Denoise",
+      "summary": "Controllable CNN denoiser candidate for sweep testing explicit noise strengths against analog-video fixtures.",
+      "task": "denoise",
+      "visibleInUi": true,
+      "comparisonEligible": true,
+      "executionStatus": "runnable",
+      "supportTier": "next",
+      "qualityRank": 7,
+      "videoNative": false,
+      "mediaSuitability": ["analog-tv", "vhs", "benchmark-fixtures", "live-action"],
+      "nativeScale": 1,
+      "qualityStats": {
+        "analogNoiseScore": 7,
+        "temporalStabilityScore": 4,
+        "detailRetentionScore": 7,
+        "speedClass": "medium",
+        "vramClass": "moderate",
+        "strength": "controllable-frame-neural",
+        "noiseTargets": ["known-strength luma noise", "synthetic benchmark noise", "mild chroma noise"],
+        "knownRisks": ["requires strength selection", "framewise instability", "less VHS-specific"]
+      },
+      "researchRuntime": {
+        "kind": "external-command",
+        "commandEnvVar": "UPSCALER_DRUNET_DENOISE_COMMAND",
+        "defaultRunner": "upscaler_worker.ai_denoise_runner",
+        "provisionsRuntime": true
+      },
+      "specialHandling": {
+        "cropMath": "identity",
+        "requiresVulkan": false,
+        "supportsGpuId": true,
+        "tileOverlapPixels": 32,
+        "prefersFixedScaleModelOutput": false
+      }
+    },
     {
       "id": "realesrgan-x4plus",
       "backendId": "realesrgan-ncnn",

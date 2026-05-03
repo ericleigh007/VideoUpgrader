@@ -33,6 +33,16 @@ LIVE_PROGRESS_POLL_SECONDS = 1.0
 LIVE_PROGRESS_HEARTBEAT_SECONDS = 5.0
 GPU_ACTIVITY_UTILIZATION_THRESHOLD = 5
 GPU_ACTIVITY_MEMORY_DELTA_BYTES = 256 * 1024 * 1024
+STAGE_ORDER = ("extract", "denoise", "colorize", "upscale", "interpolate", "encode", "remux")
+STAGE_TIMING_KEYS = {
+    "extract": "extractSeconds",
+    "denoise": "denoiseSeconds",
+    "colorize": "colorizeSeconds",
+    "upscale": "upscaleSeconds",
+    "interpolate": "interpolateSeconds",
+    "encode": "encodeSeconds",
+    "remux": "remuxSeconds",
+}
 
 
 @dataclass
@@ -248,6 +258,7 @@ def _summarize_completed_runs(runs: list[dict[str, object]]) -> dict[str, object
     throughput = [float(run["averageThroughputFps"]) for run in completed]
     peak_rss = [float(run["resourcePeaks"]["processRssBytes"]) for run in completed if run.get("resourcePeaks", {}).get("processRssBytes") is not None]
     peak_gpu = [float(run["resourcePeaks"]["gpuMemoryUsedBytes"]) for run in completed if run.get("resourcePeaks", {}).get("gpuMemoryUsedBytes") is not None]
+    stage_fps_summary = _summarize_stage_effective_fps(completed)
     return {
         "completedRuns": len(completed),
         "medianWallSeconds": round(statistics.median(wall_seconds), 6),
@@ -256,7 +267,114 @@ def _summarize_completed_runs(runs: list[dict[str, object]]) -> dict[str, object
         "averageThroughputFps": round(statistics.fmean(throughput), 6),
         "medianPeakProcessRssBytes": round(statistics.median(peak_rss), 2) if peak_rss else None,
         "medianPeakGpuMemoryUsedBytes": round(statistics.median(peak_gpu), 2) if peak_gpu else None,
+        "stageEffectiveFps": stage_fps_summary,
     }
+
+
+def _safe_fps(frame_count: int | float | None, seconds: int | float | None) -> float | None:
+    if frame_count is None or seconds is None:
+        return None
+    seconds_value = float(seconds)
+    if seconds_value <= 0:
+        return None
+    return round(float(frame_count) / seconds_value, 6)
+
+
+def _positive_frame_count(frame_count: object) -> int | None:
+    try:
+        value = int(frame_count)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _source_frame_count_from_result(result: dict[str, object], fallback_frame_count: int) -> int:
+    interpolation_diagnostics = result.get("interpolationDiagnostics")
+    if isinstance(interpolation_diagnostics, dict):
+        source_frame_count = _positive_frame_count(interpolation_diagnostics.get("sourceFrameCount"))
+        if source_frame_count is not None:
+            return source_frame_count
+
+    source_media = result.get("sourceMedia")
+    if isinstance(source_media, dict):
+        source_frame_count = _positive_frame_count(source_media.get("frameCount"))
+        if source_frame_count is not None:
+            return source_frame_count
+
+    return fallback_frame_count
+
+
+def _output_frame_count_from_result(result: dict[str, object], fallback_frame_count: int) -> int:
+    output_frame_count = _positive_frame_count(result.get("frameCount"))
+    if output_frame_count is not None:
+        return output_frame_count
+
+    interpolation_diagnostics = result.get("interpolationDiagnostics")
+    if isinstance(interpolation_diagnostics, dict):
+        output_frame_count = _positive_frame_count(interpolation_diagnostics.get("outputFrameCount"))
+        if output_frame_count is not None:
+            return output_frame_count
+
+    return fallback_frame_count
+
+
+def _derive_stage_frame_counts(result: dict[str, object], fallback_frame_count: int) -> dict[str, int]:
+    stage_timings = result.get("stageTimings")
+    if not isinstance(stage_timings, dict):
+        return {}
+
+    source_frame_count = _source_frame_count_from_result(result, fallback_frame_count)
+    output_frame_count = _output_frame_count_from_result(result, fallback_frame_count)
+    counts = {
+        "extract": source_frame_count,
+        "denoise": source_frame_count,
+        "colorize": source_frame_count,
+        "upscale": source_frame_count,
+        "interpolate": output_frame_count,
+        "encode": output_frame_count,
+        "remux": output_frame_count,
+    }
+    active_counts: dict[str, int] = {}
+    for stage in STAGE_ORDER:
+        seconds = stage_timings.get(STAGE_TIMING_KEYS[stage])
+        try:
+            seconds_value = float(seconds)
+        except (TypeError, ValueError):
+            continue
+        if seconds_value > 0:
+            active_counts[stage] = counts[stage]
+    return active_counts
+
+
+def _derive_stage_effective_fps(result: dict[str, object], fallback_frame_count: int) -> dict[str, float]:
+    stage_timings = result.get("stageTimings")
+    if not isinstance(stage_timings, dict):
+        return {}
+
+    stage_frame_counts = _derive_stage_frame_counts(result, fallback_frame_count)
+    stage_fps: dict[str, float] = {}
+    for stage, frame_count in stage_frame_counts.items():
+        fps_value = _safe_fps(frame_count, stage_timings.get(STAGE_TIMING_KEYS[stage]))
+        if fps_value is not None:
+            stage_fps[f"{stage}Fps"] = fps_value
+    return stage_fps
+
+
+def _summarize_stage_effective_fps(completed_runs: list[dict[str, object]]) -> dict[str, dict[str, float]]:
+    summary: dict[str, dict[str, float]] = {}
+    for stage in STAGE_ORDER:
+        values = []
+        metric_name = f"{stage}Fps"
+        for run in completed_runs:
+            stage_fps = run.get("stageEffectiveFps")
+            if isinstance(stage_fps, dict) and stage_fps.get(metric_name) is not None:
+                values.append(float(stage_fps[metric_name]))
+        if values:
+            summary[metric_name] = {
+                "median": round(statistics.median(values), 6),
+                "average": round(statistics.fmean(values), 6),
+            }
+    return summary
 
 
 def benchmark_pytorch_pipeline_paths(
@@ -392,6 +510,9 @@ def benchmark_pytorch_pipeline_paths(
                         gpu_activity = _assess_gpu_activity(monitor_state)
                         if gpu_activity["warning"]:
                             _emit_live_status(f"[{execution_path} run {repeat_index + 1}] WARNING | {gpu_activity['warning']}")
+                        fallback_frame_count = int(round(duration_seconds * fps))
+                        stage_frame_counts = _derive_stage_frame_counts(result, fallback_frame_count)
+                        stage_effective_fps = _derive_stage_effective_fps(result, fallback_frame_count)
                         path_runs.append(
                             {
                                 "repeat": repeat_index + 1,
@@ -402,6 +523,8 @@ def benchmark_pytorch_pipeline_paths(
                                 "segmentCount": int(result["segmentCount"]),
                                 "segmentFrameLimit": int(result["segmentFrameLimit"]),
                                 "stageTimings": result["stageTimings"],
+                                "stageFrameCounts": stage_frame_counts,
+                                "stageEffectiveFps": stage_effective_fps,
                                 "resourcePeaks": result.get("resourcePeaks", {}),
                                 "modelRuntime": result.get("modelRuntime"),
                                 "gpuActivity": gpu_activity,

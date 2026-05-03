@@ -5,6 +5,7 @@ playwright-report/
 test-results/
 .vscode/
 tmp/
+.tmp/
 .venv/
 __pycache__/
 *.pyc
@@ -13,3 +14,5 @@ python/.cache/
 artifacts/
 workspace/
 src-tauri/target/
+model_zoo/
+dummy/

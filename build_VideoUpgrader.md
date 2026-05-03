@@ -89,6 +89,33 @@ Generate synthetic benchmark fixtures:
 ./scripts/generate-benchmarks.ps1
 ```
 
+Generate a denoiser quad comparison sample from a real source interval:
+
+```powershell
+$env:PYTHONPATH = "python"
+.\.venv\Scripts\python.exe -m upscaler_worker.cli compare-denoisers `
+	--source "C:\path\to\noisy-source.webm" `
+	--start-seconds 120 `
+	--duration-seconds 4 `
+	--fps 12 `
+	--output-dir artifacts/outputs `
+	--control-safe-bottom-pixels 120 `
+	--work-dir artifacts/runtime/denoise-comparison
+```
+
+The quad layout is original, then the first three successful denoiser outputs in model order. By default this compares the local FFmpeg baselines. Add `--include-ai` to also attempt AI denoisers. The generated MP4 reserves a bottom control-safe strip, defaulting to 120 pixels, so native player controls do not cover the lower comparison panes. Set `--control-safe-bottom-pixels 0` when you need an exact video frame with no reserved player area.
+
+AI denoisers default to the repo-provided `upscaler_worker.ai_denoise_runner`, which downloads the official source/checkpoint assets on first use under `artifacts/runtime` and `artifacts/runtime/pytorch-models`. Configure any of these only when you want to override the built-in runner:
+
+- `UPSCALER_FASTDVDNET_COMMAND`
+- `UPSCALER_SWINIR_DENOISE_COMMAND`
+- `UPSCALER_SCUNET_DENOISE_COMMAND`
+- `UPSCALER_DRUNET_DENOISE_COMMAND`
+
+Each command may use `{input_dir}`, `{output_dir}`, `{model_id}`, `{frame_count}`, `{gpu_id}`, and `{precision}` placeholders, and must write `frame_*.png` outputs matching the input frame count.
+
+The built-in AI denoise runner keeps the efficient overlap strategy local to the model path: framewise models use overlapped tiles, and FastDVDnet processes chunks with a two-frame temporal overlap. Useful tuning variables are `UPSCALER_AI_DENOISE_TILE_SIZE`, `UPSCALER_AI_DENOISE_TILE_OVERLAP`, `UPSCALER_FASTDVDNET_CHUNK_FRAMES`, `UPSCALER_FASTDVDNET_DENOISE_SIGMA`, and `UPSCALER_DRUNET_DENOISE_SIGMA`.
+
 Run the desktop smoke test:
 
 ```powershell
@@ -111,6 +138,7 @@ VideoUpgrader is no longer just a scaffold. The current repository includes:
 - Native video file selection and source probing
 - Upscale-only, interpolate-only, and upscale-then-interpolate processing modes
 - Real-ESRGAN-family and PyTorch image super-resolution model support in the current catalog
+- First-stage denoising with local FFmpeg baselines and repo-provisioned AI denoiser runners
 - RIFE-based frame interpolation targeting 30 fps and 60 fps
 - Progress telemetry surfaced across extract, upscale, interpolation, encode, and remux stages
 - Synthetic benchmark generation and worker-side benchmarking tools

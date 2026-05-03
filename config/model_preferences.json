@@ -599,6 +599,76 @@
         "bsrgan-x4"
       ],
       "createdAt": "1776554569"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"off\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"bsrgan-x4\",\"realesrgan-x4plus\",\"realesrnet-x4plus\",\"swinir-realworld-x4\"],\"deepremasterProcessingMode\":\"standard\",\"colorizationContext\":null}",
+      "winnerModelId": "realesrnet-x4plus",
+      "candidateModelIds": [
+        "realesrnet-x4plus",
+        "bsrgan-x4",
+        "swinir-realworld-x4",
+        "realesrgan-x4plus"
+      ],
+      "createdAt": "1777811378"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"off\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"bsrgan-x4\",\"realesrgan-x4plus\",\"realesrnet-x4plus\",\"swinir-realworld-x4\"],\"deepremasterProcessingMode\":\"standard\",\"colorizationContext\":null}",
+      "winnerModelId": "realesrnet-x4plus",
+      "candidateModelIds": [
+        "realesrnet-x4plus",
+        "bsrgan-x4",
+        "swinir-realworld-x4",
+        "realesrgan-x4plus"
+      ],
+      "createdAt": "1777812615"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"colorizeOnly\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"ddcolor-modelscope\",\"ddcolor-paper\",\"deoldify-stable\",\"deoldify-video\"],\"deepremasterProcessingMode\":\"standard\",\"colorizationContext\":null}",
+      "winnerModelId": "deoldify-stable",
+      "candidateModelIds": [
+        "deoldify-stable",
+        "deoldify-video",
+        "ddcolor-paper",
+        "ddcolor-modelscope"
+      ],
+      "createdAt": "1777812709"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"beforeUpscale\",\"interpolationMode\":\"off\",\"upscaleModelId\":\"realesrnet-x4plus\",\"candidateModelIds\":[\"ddcolor-modelscope\",\"ddcolor-paper\",\"deoldify-stable\",\"deoldify-video\"],\"deepremasterProcessingMode\":\"standard\",\"colorizationContext\":null}",
+      "winnerModelId": "ddcolor-modelscope",
+      "candidateModelIds": [
+        "ddcolor-modelscope",
+        "ddcolor-paper",
+        "deoldify-stable",
+        "deoldify-video"
+      ],
+      "createdAt": "1777812869"
+    },
+    {
+      "sourcePath": "C:\\Users\\ericl\\Documents\\Upscaler\\public\\fixtures\\gui-progress-sample.mp4",
+      "previewDurationSeconds": 3,
+      "previewStartOffsetSeconds": 3.25,
+      "comparisonSignature": "{\"sourcePath\":\"C:\\\\Users\\\\ericl\\\\Documents\\\\Upscaler\\\\public\\\\fixtures\\\\gui-progress-sample.mp4\",\"previewDurationSeconds\":3,\"previewStartOffsetSeconds\":3.25,\"colorizationMode\":\"off\",\"interpolationMode\":\"afterUpscale\",\"upscaleModelId\":\"realesrgan-x4plus\",\"candidateModelIds\":[\"bsrgan-x4\",\"realesrgan-x4plus\",\"realesrnet-x4plus\",\"swinir-realworld-x4\"],\"deepremasterProcessingMode\":\"standard\",\"colorizationContext\":null}",
+      "winnerModelId": "bsrgan-x4",
+      "candidateModelIds": [
+        "bsrgan-x4",
+        "swinir-realworld-x4",
+        "realesrnet-x4plus",
+        "realesrgan-x4plus"
+      ],
+      "createdAt": "1777812962"
     }
   ]
 }

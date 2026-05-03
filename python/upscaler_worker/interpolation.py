@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
 SUPPORTED_INTERPOLATION_MODES = {"off", "afterUpscale", "interpolateOnly"}
 SUPPORTED_INTERPOLATION_TARGET_FPS = {30, 60}
 RIFE_MODEL_DIRECTORY = "rife-v4.6"
+RIFE_UHD_THREADING = "8:4:8"
+RIFE_THREADING_ENV_VAR = "UPSCALER_RIFE_THREADS"
 
 
 def validate_interpolation_request(interpolation_mode: str, interpolation_target_fps: int | None) -> None:
@@ -67,4 +70,7 @@ def build_rife_command(
         command.extend(["-g", str(gpu_id)])
     if uhd_mode:
         command.append("-u")
+        rife_threads = os.environ.get(RIFE_THREADING_ENV_VAR, RIFE_UHD_THREADING).strip()
+        if rife_threads.lower() not in {"", "default", "none", "off"}:
+            command.extend(["-j", rife_threads])
     return command

@@ -10,6 +10,8 @@ The project combines a Tauri desktop shell, a React comparison-first UI, and a P
 
 Updated April 21, 2026.
 
+- Denoising is now a first-stage pipeline option for cleaning noisy analog and VHS-like sources before colorization, upscaling, or interpolation.
+- The worker can generate reproducible quad-corner denoiser comparison samples from real source intervals.
 - Colorization is now a first-class part of the workstation instead of an implied future path.
 - The app can now run automatic colorizers and reference-guided colorizers in `colorize only` or `colorize before upscale` workflows.
 - Source-linked context libraries and model-specific controls are now exposed in the main pipeline UI for reference-driven runs.
@@ -19,6 +21,7 @@ Updated April 21, 2026.
 
 - Load a local video and inspect source metadata.
 - Run multiple upscale jobs against the same source material.
+- Run local FFmpeg and repo-provisioned AI denoising experiments before downstream enhancement.
 - Run automatic and reference-guided colorization experiments on grayscale footage.
 - Run interpolation-only jobs on an existing source video.
 - Run a combined pipeline that upscales first and then interpolates to a target frame rate.
@@ -50,16 +53,17 @@ The current app is a real desktop pipeline, not just a frontend shell around iso
 
 - The Tauri desktop host owns file access, job orchestration, persistence, and native integration.
 - The React UI owns the comparison-first workstation workflow, run configuration, jobs view, and context-library management.
-- The Python worker owns media probing, frame extraction, optional colorization, optional upscaling, optional interpolation, encode, concat, audio remux, and benchmark tooling.
-- The model catalog is task-aware and currently distinguishes `upscale` models from `colorize` models, then routes each model request to the correct backend/runtime path.
+- The Python worker owns media probing, frame extraction, optional denoising, optional colorization, optional upscaling, optional interpolation, encode, concat, audio remux, and benchmark tooling.
+- The model catalog is task-aware and currently distinguishes `denoise`, `upscale`, and `colorize` models, then routes each model request to the correct backend/runtime path.
 
-Today the app can run automatic grayscale-to-color workflows, reference-guided colorization experiments, frame-based image super-resolution, research video-SR through an external runner contract, and RIFE-based frame interpolation in one managed pipeline.
+Today the app can run first-stage denoise workflows, automatic grayscale-to-color workflows, reference-guided colorization experiments, frame-based image super-resolution, research video-SR through an external runner contract, and RIFE-based frame interpolation in one managed pipeline.
 
 ## Current Processing Modes
 
 The app currently supports these processing combinations:
 
 - Colorize only.
+- Denoise before downstream enhancement.
 - Upscale only.
 - Colorize before upscale.
 - Interpolate only.
@@ -76,21 +80,22 @@ The current worker pipeline is built from these parts:
 
 1. Probe the source and resolve output dimensions, framing rules, codec/container, and effective runtime settings.
 2. Decode or extract the source into working frames, usually in short internal segments for long-form jobs.
-3. Optionally colorize the extracted frames.
-4. Optionally upscale the colorized or original frames.
-5. Optionally interpolate frame rate after the upstream stage completes.
-6. Encode segment outputs to video.
-7. Concatenate segment outputs when the job ran in multiple parts.
-8. Remux the original audio back onto the final video when the source contains audio.
-9. Persist job metadata, stage timings, logs, and effective settings so the run can be inspected or replayed later.
+3. Optionally denoise the extracted frames.
+4. Optionally colorize the denoised or original frames.
+5. Optionally upscale the current frame sequence.
+6. Optionally interpolate frame rate after the upstream stage completes.
+7. Encode segment outputs to video.
+8. Concatenate segment outputs when the job ran in multiple parts.
+9. Remux the original audio back onto the final video when the source contains audio.
+10. Persist job metadata, stage timings, logs, and effective settings so the run can be inspected or replayed later.
 
-In current worker telemetry, the major exported phases are `extracting`, `colorizing`, `upscaling`, `interpolating`, `encoding`, and `remuxing`.
+In current worker telemetry, the major exported phases are `extracting`, `denoising`, `colorizing`, `upscaling`, `interpolating`, `encoding`, and `remuxing`.
 
 ## How Models Are Handled
 
 Model execution is driven by the catalog in [config/model_catalog.json](config/model_catalog.json). Each model entry declares:
 
-- its task, such as `upscale` or `colorize`
+- its task, such as `denoise`, `upscale`, or `colorize`
 - the backend family it belongs to
 - whether it is runnable now or only planned
 - whether it is comparison-eligible in the current UI
@@ -103,6 +108,8 @@ The current backend families are:
 - `pytorch-image-sr`: PyTorch frame-by-frame image super-resolution.
 - `pytorch-video-sr`: PyTorch research video-SR through an external runner contract.
 - `pytorch-video-interpolation`: PyTorch or native interpolation support in the worker ecosystem.
+- `ffmpeg-video-denoise`: local FFmpeg denoise filters for fast baseline cleanup.
+- `pytorch-image-denoise` and `pytorch-video-denoise`: repo-provisioned AI denoiser runners with external command overrides.
 - `pytorch-image-colorization`: PyTorch automatic and reference-guided colorization.
 
 In practical terms, model handling works like this:
@@ -110,6 +117,7 @@ In practical terms, model handling works like this:
 - NCNN models run through a portable executable runtime and are the most self-contained path.
 - PyTorch image-SR models run frame batches through Python/Torch and support GPU selection, precision control, and tiling.
 - Research video-SR models like RVRT use an external command contract rather than an in-repo native implementation.
+- AI denoisers such as FastDVDnet, SwinIR denoise, SCUNet, and DRUNet default to the repo-provided `upscaler_worker.ai_denoise_runner`, which downloads the official source/checkpoint assets on first use. Their `UPSCALER_*_DENOISE_COMMAND` variables remain available as overrides.
 - Automatic colorizers like DDColor and DeOldify run through the PyTorch image-colorization path without extra context input.
 - Reference-guided colorizers like DeepRemaster and ColorMNet run through the same colorization pipeline but also consume source-linked reference images from the desktop context library.
 
@@ -158,6 +166,13 @@ The Python worker pause path depends on `psutil` for suspending active subproces
 - `bsrgan-x4`: BSRGAN x4 via PyTorch.
 - `swinir-realworld-x4`: SwinIR Real-World x4 via PyTorch.
 - `rvrt-x4`: RVRT x4 via an external video-SR runner configured through `UPSCALER_RVRT_COMMAND`.
+- `ffmpeg-hqdn3d-balanced`: fast first-stage denoise baseline for analog and VHS-like noise.
+- `ffmpeg-hqdn3d-strong`: more aggressive first-stage denoise baseline for very noisy sources.
+- `ffmpeg-nlmeans-quality`: slower detail-preserving denoise baseline.
+- `fastdvdnet`: AI video denoiser with a repo-provided runner, chunked temporal overlap, and `UPSCALER_FASTDVDNET_COMMAND` override support.
+- `swinir-denoise-real`: AI image denoiser with a repo-provided runner, tiled spatial overlap, and `UPSCALER_SWINIR_DENOISE_COMMAND` override support.
+- `scunet-real-denoise`: AI image denoiser with a repo-provided runner, tiled spatial overlap, and `UPSCALER_SCUNET_DENOISE_COMMAND` override support.
+- `drunet-gray-color-denoise`: controllable AI image denoiser with a repo-provided runner, tiled spatial overlap, and `UPSCALER_DRUNET_DENOISE_COMMAND` override support.
 - `ddcolor-modelscope`: DDColor automatic colorization checkpoint via PyTorch.
 - `ddcolor-paper`: higher-fidelity DDColor checkpoint via PyTorch.
 - `deoldify-stable`: conservative DeOldify colorization checkpoint via PyTorch.
@@ -176,6 +191,9 @@ The Python worker pause path depends on `psutil` for suspending active subproces
 - `realesrgan-ncnn`: portable NCNN Vulkan backend.
 - `pytorch-image-sr`: PyTorch frame-by-frame image SR backend.
 - `pytorch-video-sr`: research video-SR backend driven by an external command contract.
+- `ffmpeg-video-denoise`: local FFmpeg denoise filter backend.
+- `pytorch-image-denoise`: framewise AI denoise backend driven by the repo runner or an external command override.
+- `pytorch-video-denoise`: video-native AI denoise backend driven by the repo runner or an external command override.
 - `pytorch-image-colorization`: PyTorch automatic and reference-guided colorization backend.
 
 ## Colorization Models
@@ -613,6 +631,8 @@ The worker also enables CUDA fast-paths for this hardware:
 - TF32 matmul
 - high float32 matmul precision
 
+The desktop host keeps Windows awake while source conversion or pipeline jobs are active, then releases the sleep inhibitor when the last managed job exits. This protects long 4K exports from the machine sleeping while the worker is still processing.
+
 ## Benchmark Snapshot
 
 The following numbers are verified benchmark artifacts from this repository, using the 10-second SwinIR streaming proof case:
@@ -633,6 +653,23 @@ The following numbers are verified benchmark artifacts from this repository, usi
 | bf16 + torch.compile + cudagraphs | 0.522266 | 459.55 | 9.10 GB | best measured PyTorch result so far |
 | TensorRT fp32, cached engine, dedicated stream | 0.544173 | 441.15 | 8.30 GB | current best measured long-run SwinIR result |
 
+### Full Desktop 4K Pipeline Snapshot
+
+The full desktop app can also be benchmarked through the real Tauri UI. The following May 1, 2026 run used the same source clip for every scenario, enabled preview mode for a 1-second slice, targeted `3840x2160`, and enabled both upscale and RIFE interpolation to 60 fps in every row. The run used the app-selected NVIDIA GPU (`1`) where the UI exposes GPU selection.
+
+Report artifact: `artifacts/benchmarks/gui-pipeline-benchmark-4k-high-memory.json`
+
+| Scenario | Output | Wall Time (s) | Avg Pipeline FPS | Stage Highlights | Final GPU Memory Snapshot |
+| --- | --- | ---: | ---: | --- | ---: |
+| Real-ESRGAN x4 Plus + RIFE | H.264 MP4 | 18.28 | 9.18 | upscale 4.62 fps, interpolate 25.16 fps | 0.83 GiB |
+| Real-ESRGAN x4 Plus + RIFE | H.265 MP4 | 17.69 | 9.93 | upscale 4.65 fps, interpolate 25.26 fps | final snapshot released |
+| FFmpeg hqdn3d + Real-ESRGAN + RIFE | H.265 MP4 | 18.24 | 9.51 | denoise 44.11 fps, upscale 4.65 fps, interpolate 25.18 fps | final snapshot released |
+| DRUNet + Real-ESRGAN + RIFE | H.265 MP4 | 26.14 | 5.29 | denoise 2.26 fps, upscale 4.65 fps, interpolate 25.40 fps | final snapshot released |
+| PyTorch Real-ESRNet + RIFE | H.264 MP4 | 21.75 | 7.49 | upscale 2.94 fps, interpolate 28.99 fps | 3.11 GiB |
+| DeepRemaster + Real-ESRGAN + RIFE | H.264 MP4 | 22.84 | 7.20 | colorize 10.90 fps, upscale 4.66 fps, interpolate 22.84 fps | 4.67 GiB |
+
+These GUI numbers are short-run desktop workflow measurements, not long-run model-only throughput claims. They include UI-driven job launch, extraction, optional denoise or colorize stages, 4K upscale, interpolation, encode, and remux. GPU memory is the value captured in the final progress snapshot; some completed native jobs had already released GPU memory by the time the report was written.
+
 ### What These Results Mean
 
 - `bf16` is the first big win for the PyTorch SwinIR path.
@@ -641,6 +678,7 @@ The following numbers are verified benchmark artifacts from this repository, usi
 - Cached TensorRT fp32 is now slightly faster than the best PyTorch path on the same 10-second SwinIR streaming case.
 - Compile startup overhead is still real, so short clips and smoke tests can understate steady-state gains.
 - TensorRT still has a large first-run engine build cost, so cold runs remain much slower than cached runs.
+- In the full desktop 4K pipeline, NCNN Real-ESRGAN plus RIFE is currently the fastest broad path in this short preview test, while DRUNet and PyTorch Real-ESRNet show the expected extra cost for heavier preprocessing or PyTorch image-SR.
 
 ## Quality Snapshot
 
@@ -669,6 +707,7 @@ Relevant benchmark outputs generated in this workspace include:
 - `pytorch-pipeline-swinir-streaming-t128-10s-720p-to-4k-bf16-compile.json`
 - `pytorch-pipeline-swinir-streaming-t128-10s-720p-to-4k-bf16-compile-cudagraphs.json`
 - `swinir-precision-quality-fp32-vs-bf16-4f.json`
+- `gui-pipeline-benchmark-4k-high-memory.json`
 
 ## Repository Layout
 

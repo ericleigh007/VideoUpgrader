@@ -24,6 +24,17 @@ export interface ModelRuntimeAssetDefinition {
   downloadUrl: string;
 }
 
+export interface ModelQualityStatsDefinition {
+  analogNoiseScore: number;
+  temporalStabilityScore: number;
+  detailRetentionScore: number;
+  speedClass: string;
+  vramClass: string;
+  strength: string;
+  noiseTargets: string[];
+  knownRisks: string[];
+}
+
 export type ModelContextKind = "referenceImages";
 
 export interface ModelResearchRuntimeDefinition {
@@ -42,7 +53,7 @@ export interface ModelDefinition {
   runtimeModelName: string;
   label: string;
   summary: string;
-  task: "upscale" | "colorize";
+  task: "upscale" | "colorize" | "denoise";
   visibleInUi: boolean;
   comparisonEligible: boolean;
   executionStatus: ModelExecutionStatus;
@@ -53,6 +64,7 @@ export interface ModelDefinition {
   videoNative: boolean;
   mediaSuitability: string[];
   nativeScale: number;
+  qualityStats?: ModelQualityStatsDefinition;
   runtimeAsset?: ModelRuntimeAssetDefinition;
   researchRuntime?: ModelResearchRuntimeDefinition;
   specialHandling: ModelHandlingDefinition;
@@ -67,7 +79,7 @@ interface CatalogData {
     runtimeModelName: string;
     label: string;
     summary: string;
-    task: "upscale" | "colorize";
+    task: "upscale" | "colorize" | "denoise";
     visibleInUi: boolean;
     comparisonEligible: boolean;
     executionStatus: ModelExecutionStatus;
@@ -78,6 +90,7 @@ interface CatalogData {
     videoNative: boolean;
     mediaSuitability: string[];
     nativeScale: number;
+    qualityStats?: ModelQualityStatsDefinition;
     runtimeAsset?: ModelRuntimeAssetDefinition;
     researchRuntime?: ModelResearchRuntimeDefinition;
     specialHandling: ModelHandlingDefinition;
@@ -106,6 +119,7 @@ export const modelCatalog: ModelDefinition[] = typedCatalogData.models.map((mode
   videoNative: model.videoNative,
   mediaSuitability: model.mediaSuitability,
   nativeScale: model.nativeScale,
+  qualityStats: model.qualityStats,
   runtimeAsset: model.runtimeAsset,
   researchRuntime: model.researchRuntime,
   specialHandling: model.specialHandling,
@@ -147,6 +161,25 @@ export function getVisibleColorizerModels(): ModelDefinition[] {
 
 export function getBlindComparisonColorizerModels(): ModelDefinition[] {
   return modelCatalog.filter((model) => model.task === "colorize" && model.comparisonEligible && model.executionStatus === "runnable");
+}
+
+export function getUiDenoiserModels(): ModelDefinition[] {
+  return modelCatalog
+    .filter((model) => model.task === "denoise" && (model.visibleInUi || model.executionStatus === "planned"))
+    .sort((left, right) => {
+      if (left.qualityRank !== right.qualityRank) {
+        return left.qualityRank - right.qualityRank;
+      }
+      return left.label.localeCompare(right.label);
+    });
+}
+
+export function getVisibleDenoiserModels(): ModelDefinition[] {
+  return modelCatalog.filter((model) => model.task === "denoise" && model.visibleInUi);
+}
+
+export function getBlindComparisonDenoiserModels(): ModelDefinition[] {
+  return modelCatalog.filter((model) => model.task === "denoise" && model.comparisonEligible && model.executionStatus === "runnable");
 }
 
 export function getTopRatedModels(): ModelDefinition[] {

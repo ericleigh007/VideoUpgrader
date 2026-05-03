@@ -438,7 +438,7 @@ h1 {
 
 .source-detail-summary {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: auto auto minmax(0, 1fr);
   align-items: center;
   gap: 12px;
   list-style: none;
@@ -581,6 +581,8 @@ input {
 }
 
 .interactive-preview {
+  display: grid;
+  grid-template-rows: minmax(0, auto) auto;
   cursor: default;
 }
 
@@ -616,6 +618,13 @@ input {
   margin-bottom: 0;
 }
 
+.source-preview-frame {
+  position: relative;
+  min-height: 240px;
+  overflow: hidden;
+  background: #120f0c;
+}
+
 .source-preview {
   display: block;
   width: 100%;
@@ -625,13 +634,11 @@ input {
 }
 
 .source-preview-toolbar {
-  position: absolute;
-  left: 12px;
-  right: 12px;
-  bottom: 12px;
   display: grid;
   gap: 8px;
-  z-index: 2;
+  padding: 10px 12px 12px;
+  border-top: 1px solid rgba(255, 247, 242, 0.08);
+  background: #120f0c;
 }
 
 .source-preview-transport-row {
@@ -649,13 +656,12 @@ input {
   font-size: 12px;
   font-weight: 700;
   color: #fff7f2;
-  background: rgba(18, 15, 12, 0.76);
-  backdrop-filter: blur(6px);
+  background: rgba(255, 247, 242, 0.14);
   cursor: pointer;
 }
 
 .source-preview-toolbar-button-secondary {
-  background: rgba(116, 49, 24, 0.72);
+  background: rgba(176, 74, 47, 0.45);
 }
 
 .source-preview-timecode {
@@ -663,7 +669,7 @@ input {
   padding: 6px 10px;
   border-radius: 999px;
   color: #fff7f2;
-  background: rgba(18, 15, 12, 0.76);
+  background: rgba(255, 247, 242, 0.12);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
@@ -2079,8 +2085,11 @@ input {
 
 .result-preview {
   width: 100%;
+  aspect-ratio: 16 / 9;
+  display: block;
   border-radius: 16px;
   background: #120f0c;
+  object-fit: contain;
 }
 
 .path-readonly-input {

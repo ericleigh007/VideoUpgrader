@@ -1,7 +1,7 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { Fragment, useEffect, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent as ReactWheelEvent } from "react";
 import { desktopApi } from "./lib/desktopApi";
-import { getBackendDefinition, getBlindComparisonColorizerModels, getBlindComparisonModels, getModelDefinition, getUiColorizerModels, getUiModels, getVisibleColorizerModels, getVisibleModels, type ModelDefinition } from "./lib/catalog";
+import { getBackendDefinition, getBlindComparisonColorizerModels, getBlindComparisonModels, getModelDefinition, getUiColorizerModels, getUiDenoiserModels, getUiModels, getVisibleColorizerModels, getVisibleModels, type ModelDefinition } from "./lib/catalog";
 import { defaultCropRect, planOutputFraming, resolveAspectRatio, resolveCropRect, type NormalizedCropRect } from "./lib/framing";
 import { buildInterpolationWarning, interpolationTargetFpsOptions, isInterpolationEnabled } from "./lib/interpolation";
 import {
@@ -19,6 +19,7 @@ import type {
   AppConfig,
   AspectRatioPreset,
   ColorizationMode,
+  DenoiseMode,
   DeepRemasterProcessingMode,
   InterpolationMode,
   InterpolationTargetFps,
@@ -50,6 +51,7 @@ import type {
 
 const models = getUiModels();
 const colorizerModels = getUiColorizerModels();
+const denoiserModels = getUiDenoiserModels();
 const blindComparisonUpscaleDefaultCandidates = getBlindComparisonModels();
 const blindComparisonUpscaleAvailableModels = getVisibleModels().filter((model) => model.executionStatus === "runnable");
 const blindComparisonColorizerDefaultCandidates = getBlindComparisonColorizerModels();
@@ -58,6 +60,8 @@ const runnableModels = models.filter((model) => model.executionStatus === "runna
 const plannedModels = models.filter((model) => model.executionStatus !== "runnable");
 const runnableColorizerModels = colorizerModels.filter((model) => model.executionStatus === "runnable");
 const plannedColorizerModels = colorizerModels.filter((model) => model.executionStatus !== "runnable");
+const runnableDenoiserModels = denoiserModels.filter((model) => model.executionStatus === "runnable");
+const plannedDenoiserModels = denoiserModels.filter((model) => model.executionStatus !== "runnable");
 
 const outputModes: Array<{ value: OutputMode; label: string }> = [
   { value: "preserveAspect4k", label: "Preserve Aspect In Target" },
@@ -538,6 +542,7 @@ function createQueuedJob(jobId: string): PipelineJobStatus {
       processedFrames: 0,
       totalFrames: 0,
       extractedFrames: 0,
+      denoisedFrames: 0,
       colorizedFrames: 0,
       upscaledFrames: 0,
       interpolatedFrames: 0,
@@ -560,6 +565,7 @@ function createPendingComparisonJob(): PipelineJobStatus {
       processedFrames: 0,
       totalFrames: 0,
       extractedFrames: 0,
+      denoisedFrames: 0,
       colorizedFrames: 0,
       upscaledFrames: 0,
       interpolatedFrames: 0,
@@ -602,6 +608,7 @@ function createQueuedConversionJob(jobId: string): SourceConversionJobStatus {
       processedFrames: 0,
       totalFrames: 0,
       extractedFrames: 0,
+      denoisedFrames: 0,
       colorizedFrames: 0,
       upscaledFrames: 0,
       interpolatedFrames: 0,
@@ -737,6 +744,7 @@ function formatStageTimingsSummary(timings: PipelineStageTimings | null | undefi
 
   const values = [
     { label: "extract", value: timings.extractSeconds },
+    { label: "denoise", value: timings.denoiseSeconds ?? 0 },
     { label: "colorize", value: timings.colorizeSeconds },
     { label: "upscale", value: timings.upscaleSeconds },
     { label: "interpolate", value: timings.interpolateSeconds },
@@ -757,6 +765,7 @@ function formatStageTimingsSummary(timings: PipelineStageTimings | null | undefi
 function formatStageTimings(progress: PipelineProgress): string {
   return formatStageTimingsSummary({
     extractSeconds: progress.extractStageSeconds ?? 0,
+    denoiseSeconds: progress.denoiseStageSeconds ?? 0,
     colorizeSeconds: progress.colorizeStageSeconds ?? 0,
     upscaleSeconds: progress.upscaleStageSeconds ?? 0,
     interpolateSeconds: progress.interpolateStageSeconds ?? 0,
@@ -981,6 +990,9 @@ function buildPipelineActivityTitle(progress: PipelineProgress): string {
   if (progress.phase === "extracting") {
     return "Extracting source frames";
   }
+  if (progress.phase === "denoising") {
+    return "Denoising extracted frames";
+  }
   if (progress.phase === "colorizing") {
     return "Colorizing extracted frames";
   }
@@ -1011,6 +1023,9 @@ function formatPipelinePhaseLabel(phase: string): string {
   }
   if (phase === "extracting") {
     return "Extracting";
+  }
+  if (phase === "denoising") {
+    return "Denoising";
   }
   if (phase === "colorizing") {
     return "Colorizing";
@@ -1070,6 +1085,7 @@ function buildProgressEventKey(progress: PipelineProgress): string {
     progress.message,
     progress.processedFrames,
     progress.extractedFrames,
+    progress.denoisedFrames,
     progress.colorizedFrames,
     progress.upscaledFrames,
     progress.interpolatedFrames,
@@ -1106,8 +1122,27 @@ function cleanupKindLabel(job: TrackedJobEntry): string {
     return "Conversion";
   }
   const hasInterpolation = (job.progress.interpolatedFrames ?? 0) > 0;
+  const hasDenoise = (job.progress.denoisedFrames ?? 0) > 0;
   const hasColorization = (job.progress.colorizedFrames ?? 0) > 0;
   const hasUpscale = (job.progress.upscaledFrames ?? 0) > 0 || Boolean(job.modelId);
+  if (hasDenoise && hasInterpolation && hasUpscale && hasColorization) {
+    return "Denoise + Colorize + Upscale + Motion";
+  }
+  if (hasDenoise && hasColorization && hasUpscale) {
+    return "Denoise + Colorize + Upscale";
+  }
+  if (hasDenoise && hasInterpolation && hasUpscale) {
+    return "Denoise + Upscale + Motion";
+  }
+  if (hasDenoise && hasUpscale) {
+    return "Denoise + Upscale";
+  }
+  if (hasDenoise && hasColorization) {
+    return "Denoise + Colorize";
+  }
+  if (hasDenoise) {
+    return "Denoise";
+  }
   if (hasInterpolation && hasUpscale && hasColorization) {
     return "Colorize + Upscale + Motion";
   }
@@ -1225,6 +1260,7 @@ function clampJobsWindowBounds(bounds: JobsWindowBounds, width: number, height: 
 
 type PersistedRunSettings = {
   modelId: ModelId;
+  denoiserModelId: ModelId;
   colorizerModelId: ModelId;
   deepremasterProcessingMode: DeepRemasterProcessingMode;
   outputMode: OutputMode;
@@ -1240,6 +1276,7 @@ type PersistedRunSettings = {
   container: OutputContainer;
   tileSize: number;
   crf: number;
+  isDenoiseStepEnabled: boolean;
   isColorizationStepEnabled: boolean;
   isUpscaleStepEnabled: boolean;
   isInterpolationStepEnabled: boolean;
@@ -1269,6 +1306,9 @@ function parsePersistedRunSettings(raw: string | null): Partial<PersistedRunSett
 
     if (typeof parsed.modelId === "string" && models.some((model) => model.value === parsed.modelId)) {
       settings.modelId = parsed.modelId;
+    }
+    if (typeof parsed.denoiserModelId === "string" && denoiserModels.some((model) => model.value === parsed.denoiserModelId)) {
+      settings.denoiserModelId = parsed.denoiserModelId;
     }
     if (typeof parsed.colorizerModelId === "string" && colorizerModels.some((model) => model.value === parsed.colorizerModelId)) {
       settings.colorizerModelId = parsed.colorizerModelId;
@@ -1314,6 +1354,9 @@ function parsePersistedRunSettings(raw: string | null): Partial<PersistedRunSett
     }
     if (typeof parsed.crf === "number" && Number.isFinite(parsed.crf)) {
       settings.crf = parsed.crf;
+    }
+    if (typeof parsed.isDenoiseStepEnabled === "boolean") {
+      settings.isDenoiseStepEnabled = parsed.isDenoiseStepEnabled;
     }
     if (typeof parsed.isColorizationStepEnabled === "boolean") {
       settings.isColorizationStepEnabled = parsed.isColorizationStepEnabled;
@@ -1600,6 +1643,7 @@ export default function App() {
   const canOpenNativeJobsWindow = tauriWindowingAvailable() && !isStandaloneView;
   const canOpenNativeComparisonWindow = tauriWindowingAvailable() && !isStandaloneView;
   const [modelId, setModelId] = useState<ModelId>(persistedRunSettings.modelId ?? "realesrgan-x4plus");
+  const [denoiserModelId, setDenoiserModelId] = useState<ModelId>(persistedRunSettings.denoiserModelId ?? "ffmpeg-hqdn3d-balanced");
   const [colorizerModelId, setColorizerModelId] = useState<ModelId>(persistedRunSettings.colorizerModelId ?? "ddcolor-modelscope");
   const [deepremasterProcessingMode, setDeepremasterProcessingMode] = useState<DeepRemasterProcessingMode>(persistedRunSettings.deepremasterProcessingMode ?? "standard");
   const [outputMode, setOutputMode] = useState<OutputMode>(persistedRunSettings.outputMode ?? "preserveAspect4k");
@@ -1616,6 +1660,7 @@ export default function App() {
   const [container, setContainer] = useState<OutputContainer>(persistedRunSettings.container ?? "mp4");
   const [tileSize, setTileSize] = useState<number>(persistedRunSettings.tileSize ?? 0);
   const [crf, setCrf] = useState<number>(persistedRunSettings.crf ?? 18);
+  const [isDenoiseStepEnabled, setIsDenoiseStepEnabled] = useState<boolean>(persistedRunSettings.isDenoiseStepEnabled ?? true);
   const [isColorizationStepEnabled, setIsColorizationStepEnabled] = useState<boolean>(persistedRunSettings.isColorizationStepEnabled ?? false);
   const [isUpscaleStepEnabled, setIsUpscaleStepEnabled] = useState<boolean>(persistedRunSettings.isUpscaleStepEnabled ?? true);
   const [isInterpolationStepEnabled, setIsInterpolationStepEnabled] = useState<boolean>(persistedRunSettings.isInterpolationStepEnabled ?? false);
@@ -1779,6 +1824,8 @@ export default function App() {
   const selectedGpu = runtime?.availableGpus.find((gpu) => gpu.id === selectedGpuId) ?? null;
   const selectedModel = getModelDefinition(modelId);
   const selectedBackend = getBackendDefinition(selectedModel.backendId);
+  const selectedDenoiserModel = getModelDefinition(denoiserModelId);
+  const selectedDenoiserBackend = getBackendDefinition(selectedDenoiserModel.backendId);
   const selectedColorizerModel = getModelDefinition(colorizerModelId);
   const selectedColorizerBackend = getBackendDefinition(selectedColorizerModel.backendId);
   const selectedColorizerSupportsReferenceContext = modelSupportsReferenceContext(selectedColorizerModel);
@@ -1788,12 +1835,12 @@ export default function App() {
   const isSelectedModelImplemented = selectedModel.executionStatus === "runnable";
   const selectedModelLaunchRequirement = modelLaunchRequirement(selectedModel, runtime);
   const isSelectedModelLaunchable = selectedModelLaunchRequirement === null;
+  const isSelectedDenoiserImplemented = selectedDenoiserModel.executionStatus === "runnable";
+  const selectedDenoiserLaunchRequirement = modelLaunchRequirement(selectedDenoiserModel, runtime);
+  const isSelectedDenoiserLaunchable = selectedDenoiserLaunchRequirement === null;
   const isSelectedColorizerImplemented = selectedColorizerModel.executionStatus === "runnable";
   const selectedColorizerLaunchRequirement = modelLaunchRequirement(selectedColorizerModel, runtime);
   const isSelectedColorizerLaunchable = selectedColorizerLaunchRequirement === null;
-  const blindComparisonDefaultCandidates = isColorizationStepEnabled ? blindComparisonColorizerDefaultCandidates : blindComparisonUpscaleDefaultCandidates;
-  const blindComparisonAvailableModels = isColorizationStepEnabled ? blindComparisonColorizerAvailableModels : blindComparisonUpscaleAvailableModels;
-  const blindComparisonSubjectLabel = isColorizationStepEnabled ? "colorizers" : "models";
   const supportsPytorchRunner = selectedBackend.id === "pytorch-image-sr";
   const selectedModelRating = appConfig?.modelRatings[selectedModel.value]?.rating ?? null;
   const effectiveSelectedColorContextEntryIds = normalizeColorContextSelection(selectedColorContextEntryIds, {
@@ -1810,6 +1857,17 @@ export default function App() {
         referenceImagePaths: selectedColorContextEntries.map((entry) => entry.absolutePath),
       }
     : null;
+  const blindComparisonColorizerContextReady = selectedColorizationContext !== null;
+  const blindComparisonColorizerLaunchable = (model: ModelDefinition): boolean => (
+    !modelSupportsReferenceContext(model) || blindComparisonColorizerContextReady
+  );
+  const blindComparisonDefaultCandidates = isColorizationStepEnabled
+    ? blindComparisonColorizerDefaultCandidates.filter(blindComparisonColorizerLaunchable)
+    : blindComparisonUpscaleDefaultCandidates;
+  const blindComparisonAvailableModels = isColorizationStepEnabled
+    ? blindComparisonColorizerAvailableModels.filter(blindComparisonColorizerLaunchable)
+    : blindComparisonUpscaleAvailableModels;
+  const blindComparisonSubjectLabel = isColorizationStepEnabled ? "colorizers" : "models";
   const selectedColorizerReferenceRequirement = isColorizationStepEnabled && isColorMNetSelected && !selectedColorizationContext
     ? "ColorMNet needs one selected reference still before launch."
     : null;
@@ -1879,18 +1937,20 @@ export default function App() {
     : isUpscaleStepEnabled
       ? "beforeUpscale"
       : "colorizeOnly";
+  const denoiseMode: DenoiseMode = isDenoiseStepEnabled ? "beforeEnhance" : "off";
   const interpolationMode: InterpolationMode = !isUpscaleStepEnabled && isInterpolationStepEnabled
     ? "interpolateOnly"
     : isUpscaleStepEnabled && isInterpolationStepEnabled
       ? "afterUpscale"
       : "off";
-  const hasEnabledPipelineStep = isColorizationStepEnabled || isUpscaleStepEnabled || isInterpolationStepEnabled;
+  const hasEnabledPipelineStep = isDenoiseStepEnabled || isColorizationStepEnabled || isUpscaleStepEnabled || isInterpolationStepEnabled;
   const interpolationEnabled = isInterpolationEnabled(interpolationMode);
   const selectedQualityPresetLabel = qualityPresets.find((entry) => entry.value === qualityPreset)?.label ?? qualityPreset;
   const selectedCodecLabel = codecs.find((entry) => entry.value === codec)?.label ?? codec.toUpperCase();
   const selectedContainerLabel = containers.find((entry) => entry.value === container)?.label ?? container.toUpperCase();
   const encodingDetailsSummary = `${selectedCodecLabel} / ${selectedContainerLabel} • CRF ${crf} • ${selectedQualityPresetLabel} • Tile ${tileSize > 0 ? tileSize : "Auto"}`;
   const compactPipelineLabel = [
+    isDenoiseStepEnabled ? selectedDenoiserModel.label : null,
     isColorizationStepEnabled ? selectedColorizerModel.label : null,
     isUpscaleStepEnabled ? selectedModel.label : null,
     interpolationEnabled ? `Interpolation ${interpolationTargetFps} fps` : null,
@@ -1910,6 +1970,7 @@ export default function App() {
     || isPipelineRunning
     || isBlockingSourceConversionRunning
     || !hasEnabledPipelineStep
+    || (isDenoiseStepEnabled && !isSelectedDenoiserLaunchable)
     || (isColorizationStepEnabled && !isSelectedColorizerLaunchable)
     || (isUpscaleStepEnabled && !isSelectedModelLaunchable);
   const isBlindComparisonDisabled = isBusy || !source || isBlindComparisonRunning || isPipelineRunning || isBlockingSourceConversionRunning || selectedBlindComparisonModelIds.length < 2;
@@ -2174,6 +2235,12 @@ export default function App() {
       summary: `${pipelineJob.progress.extractedFrames}/${pipelineJob.progress.totalFrames || "?"}`,
     },
     {
+      id: "denoise",
+      label: "Denoise",
+      value: ratioFromCounts(pipelineJob.progress.denoisedFrames ?? 0, pipelineJob.progress.totalFrames, pipelineJob.state === "succeeded"),
+      summary: `${pipelineJob.progress.denoisedFrames ?? 0}/${pipelineJob.progress.totalFrames || "?"}`,
+    },
+    {
       id: "colorize",
       label: "Colorize",
       value: ratioFromCounts(pipelineJob.progress.colorizedFrames, pipelineJob.progress.totalFrames, pipelineJob.state === "succeeded"),
@@ -2231,13 +2298,15 @@ export default function App() {
       : result
         ? "Last Output Ready"
         : "Ready To Configure";
-  const compactPhaseBars = pipelinePhaseBars.filter((entry) => entry.id === "colorize" || entry.id === "upscale" || entry.id === "interpolate");
+  const compactPhaseBars = pipelinePhaseBars.filter((entry) => entry.id === "denoise" || entry.id === "colorize" || entry.id === "upscale" || entry.id === "interpolate");
   const activePipelineVisualStep = (() => {
     if (!pipelineJob) {
       return null;
     }
 
     switch (pipelineJob.progress.phase) {
+      case "denoising":
+        return "denoise";
       case "colorizing":
         return "colorize";
       case "interpolating":
@@ -2253,6 +2322,9 @@ export default function App() {
         }
         if (pipelineJob.progress.colorizedFrames > 0) {
           return "colorize";
+        }
+        if (pipelineJob.progress.denoisedFrames > 0) {
+          return "denoise";
         }
         return "upscale";
       default:
@@ -3288,6 +3360,7 @@ export default function App() {
   useEffect(() => {
     const nextSettings: PersistedRunSettings = {
       modelId,
+      denoiserModelId,
       colorizerModelId,
       deepremasterProcessingMode,
       outputMode,
@@ -3303,6 +3376,7 @@ export default function App() {
       container,
       tileSize,
       crf,
+      isDenoiseStepEnabled,
       isColorizationStepEnabled,
       isUpscaleStepEnabled,
       isInterpolationStepEnabled,
@@ -3325,6 +3399,7 @@ export default function App() {
     aspectRatioPreset,
     codec,
     colorizerModelId,
+    denoiserModelId,
     deepremasterProcessingMode,
     container,
     crf,
@@ -3334,6 +3409,7 @@ export default function App() {
     isBlindPanelOpen,
     isColorizationStepEnabled,
     isCleanupPanelOpen,
+    isDenoiseStepEnabled,
     isInputPanelOpen,
     isInterpolationStepEnabled,
     isOutputPanelOpen,
@@ -3467,6 +3543,7 @@ export default function App() {
       return {
         request: {
           ...exactRequest,
+          resumeFromJobId: null,
           sourcePath: job.sourcePath ?? exactRequest.sourcePath,
           modelId: job.modelId ?? exactRequest.modelId,
           codec: (job.codec === "h264" || job.codec === "h265") ? job.codec : exactRequest.codec,
@@ -3493,6 +3570,8 @@ export default function App() {
       request: {
         sourcePath: job.sourcePath,
         modelId: job.modelId,
+        denoiseMode: "off",
+        denoiserModelId: null,
         colorizationMode: "off",
         colorizerModelId: null,
         colorizationContext: null,
@@ -3527,11 +3606,15 @@ export default function App() {
   }
 
   async function applyRepeatedPipelineRequest(request: RealesrganJobRequest): Promise<void> {
+    const nextDenoiseEnabled = request.denoiseMode !== "off";
     const nextColorizationEnabled = request.colorizationMode !== "off";
     const nextInterpolationEnabled = request.interpolationMode !== "off";
     const nextUpscaleEnabled = request.colorizationMode === "colorizeOnly" ? false : request.interpolationMode !== "interpolateOnly";
 
     setModelId(request.modelId);
+    if (request.denoiserModelId) {
+      setDenoiserModelId(request.denoiserModelId);
+    }
     if (request.colorizerModelId) {
       setColorizerModelId(request.colorizerModelId);
     }
@@ -3550,6 +3633,7 @@ export default function App() {
     setContainer(request.container);
     setTileSize(request.tileSize);
     setCrf(request.crf);
+    setIsDenoiseStepEnabled(nextDenoiseEnabled);
     setIsColorizationStepEnabled(nextColorizationEnabled);
     setIsUpscaleStepEnabled(nextUpscaleEnabled);
     setIsInterpolationStepEnabled(nextInterpolationEnabled);
@@ -3626,7 +3710,7 @@ export default function App() {
       setIsBusy(true);
       setError(null);
       if (isJobsOnlyView) {
-        await handoffPipelineRequestToMainWindow(resolvedRepeat.request, "restart");
+        await handoffPipelineRequestToMainWindow({ ...resolvedRepeat.request, resumeFromJobId: job.id }, "restart");
         setStatus(`Sent ${pathLeaf(resolvedRepeat.request.sourcePath)} to the main window for restart.`);
         return;
       }
@@ -3634,7 +3718,10 @@ export default function App() {
       setStatus(`Reloading ${pathLeaf(resolvedRepeat.request.sourcePath)} for restart...`);
       await applyRepeatedPipelineRequest(resolvedRepeat.request);
       setStatus(`Restarting ${pathLeaf(resolvedRepeat.request.sourcePath)}...`);
-      await startPipelineFromRequest(resolvedRepeat.request, { ensureRuntime: false, queuedStatus: "Restarted job queued." });
+      await startPipelineFromRequest(
+        { ...resolvedRepeat.request, resumeFromJobId: job.id },
+        { ensureRuntime: false, queuedStatus: "Resume job queued." }
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
       setStatus("Failed to restart the selected job.");
@@ -4263,6 +4350,8 @@ export default function App() {
     return {
       sourcePath: source.path,
       modelId: targetModelId,
+      denoiseMode,
+      denoiserModelId: isDenoiseStepEnabled ? denoiserModelId : null,
       colorizationMode,
       colorizerModelId: isColorizationStepEnabled ? (overrides?.colorizerModelId ?? colorizerModelId) : null,
       colorizationContext: isColorizationStepEnabled ? selectedColorizationContext : null,
@@ -4555,6 +4644,18 @@ export default function App() {
       return;
     }
 
+    if (isDenoiseStepEnabled && !isSelectedDenoiserImplemented) {
+      setError(`${selectedDenoiserModel.label} is cataloged but not implemented yet.`);
+      setStatus("Selected denoiser is not implemented yet.");
+      return;
+    }
+
+    if (isDenoiseStepEnabled && !isColorizationStepEnabled && !isUpscaleStepEnabled && !isInterpolationStepEnabled) {
+      setError("Denoise-only export is not implemented yet. Enable colorization, upscaling, or interpolation after denoise.");
+      setStatus("Denoise needs a downstream pipeline step.");
+      return;
+    }
+
     if (isColorizationStepEnabled && !isSelectedColorizerImplemented) {
       setError(`${selectedColorizerModel.label} is cataloged but not implemented yet.`);
       setStatus("Selected colorizer is not implemented yet.");
@@ -4564,6 +4665,12 @@ export default function App() {
     if (isUpscaleStepEnabled && !isSelectedModelLaunchable) {
       setError(selectedModelLaunchRequirement);
       setStatus("Selected model needs additional runtime setup before it can run.");
+      return;
+    }
+
+    if (isDenoiseStepEnabled && !isSelectedDenoiserLaunchable) {
+      setError(selectedDenoiserLaunchRequirement);
+      setStatus("Selected denoiser needs additional runtime setup before it can run.");
       return;
     }
 
@@ -5307,24 +5414,50 @@ export default function App() {
             {previewSrc ? (
               <div
                 className={`preview-shell interactive-preview${outputMode === "cropTo4k" && isCropEditing ? " crop-enabled" : ""}`}
-                ref={previewRef}
-                style={source ? { aspectRatio: `${source.width} / ${source.height}` } : undefined}
               >
-                <video
-                  key={previewSrc ?? 'no-preview-src'}
-                  ref={sourcePreviewVideoRef}
-                  data-testid="source-preview"
-                  className="source-preview"
-                  controls
-                  preload="metadata"
-                  onLoadedMetadata={handleSourcePreviewLoadedMetadata}
-                  onPause={() => setSourcePreviewPlaying(false)}
-                  onPlay={() => setSourcePreviewPlaying(true)}
-                  onEnded={() => setSourcePreviewPlaying(false)}
-                  onTimeUpdate={handleSourcePreviewTimeUpdate}
+                <div
+                  className="source-preview-frame"
+                  ref={previewRef}
+                  style={source ? { aspectRatio: `${source.width} / ${source.height}` } : undefined}
                 >
-                  {previewSrc ? <source src={previewSrc} type={sourcePreviewMimeType} /> : null}
-                </video>
+                  <video
+                    key={previewSrc ?? 'no-preview-src'}
+                    ref={sourcePreviewVideoRef}
+                    data-testid="source-preview"
+                    className="source-preview"
+                    preload="metadata"
+                    onLoadedMetadata={handleSourcePreviewLoadedMetadata}
+                    onPause={() => setSourcePreviewPlaying(false)}
+                    onPlay={() => setSourcePreviewPlaying(true)}
+                    onEnded={() => setSourcePreviewPlaying(false)}
+                    onTimeUpdate={handleSourcePreviewTimeUpdate}
+                  >
+                    {previewSrc ? <source src={previewSrc} type={sourcePreviewMimeType} /> : null}
+                  </video>
+                  {cropOverlayStyle ? (
+                    <div
+                      data-testid="crop-overlay"
+                      className={`crop-overlay${isCropEditing ? " crop-overlay-editing" : ""}`}
+                      style={cropOverlayStyle}
+                      onMouseDown={isCropEditing ? (event) => beginCropDrag("move", event) : undefined}
+                    >
+                      <span className="crop-overlay-label" data-testid="crop-overlay-label">
+                        {isCropEditing ? "Crop Editing" : "Crop Frame"}
+                      </span>
+                      {isCropEditing ? (
+                        <>
+                          <button type="button" data-testid="crop-handle-nw" className="crop-handle handle-nw" onMouseDown={(event) => beginCropDrag("nw", event)} aria-label="Resize crop from top left" />
+                          <button type="button" data-testid="crop-handle-ne" className="crop-handle handle-ne" onMouseDown={(event) => beginCropDrag("ne", event)} aria-label="Resize crop from top right" />
+                          <button type="button" data-testid="crop-handle-sw" className="crop-handle handle-sw" onMouseDown={(event) => beginCropDrag("sw", event)} aria-label="Resize crop from bottom left" />
+                          <button type="button" data-testid="crop-handle-se" className="crop-handle handle-se" onMouseDown={(event) => beginCropDrag("se", event)} aria-label="Resize crop from bottom right" />
+                          <button type="button" data-testid="crop-move-handle" className="crop-move-handle" onMouseDown={(event) => beginCropDrag("move", event)} aria-label="Move crop selection">
+                            Move Crop
+                          </button>
+                        </>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
                 <div className="source-preview-toolbar" data-testid="source-preview-toolbar">
                   <div className="source-preview-transport-row">
                     <button
@@ -5359,29 +5492,6 @@ export default function App() {
                     onChange={(event) => seekSourcePreview(Number(event.target.value))}
                   />
                 </div>
-                {cropOverlayStyle ? (
-                  <div
-                    data-testid="crop-overlay"
-                    className={`crop-overlay${isCropEditing ? " crop-overlay-editing" : ""}`}
-                    style={cropOverlayStyle}
-                    onMouseDown={isCropEditing ? (event) => beginCropDrag("move", event) : undefined}
-                  >
-                    <span className="crop-overlay-label" data-testid="crop-overlay-label">
-                      {isCropEditing ? "Crop Editing" : "Crop Frame"}
-                    </span>
-                    {isCropEditing ? (
-                      <>
-                        <button type="button" data-testid="crop-handle-nw" className="crop-handle handle-nw" onMouseDown={(event) => beginCropDrag("nw", event)} aria-label="Resize crop from top left" />
-                        <button type="button" data-testid="crop-handle-ne" className="crop-handle handle-ne" onMouseDown={(event) => beginCropDrag("ne", event)} aria-label="Resize crop from top right" />
-                        <button type="button" data-testid="crop-handle-sw" className="crop-handle handle-sw" onMouseDown={(event) => beginCropDrag("sw", event)} aria-label="Resize crop from bottom left" />
-                        <button type="button" data-testid="crop-handle-se" className="crop-handle handle-se" onMouseDown={(event) => beginCropDrag("se", event)} aria-label="Resize crop from bottom right" />
-                        <button type="button" data-testid="crop-move-handle" className="crop-move-handle" onMouseDown={(event) => beginCropDrag("move", event)} aria-label="Move crop selection">
-                          Move Crop
-                        </button>
-                      </>
-                    ) : null}
-                  </div>
-                ) : null}
               </div>
             ) : (
               <div className="preview-shell preview-placeholder">
@@ -5948,6 +6058,79 @@ export default function App() {
               </p>
             </div>
 
+            <section className={`pipeline-stage-panel${isDenoiseStepEnabled ? " pipeline-stage-panel-enabled" : ""}${activePipelineVisualStep === "denoise" ? " pipeline-stage-panel-current" : ""}`} data-testid="pipeline-denoise-details">
+              <div className="pipeline-stage-panel-header" data-testid="pipeline-denoise-summary">
+                <div className="pipeline-stage-heading-block" data-testid="denoiser-section-card">
+                  <span className="catalog-chip">Denoise</span>
+                  <strong>Clean analog noise first</strong>
+                  <span>{selectedDenoiserModel.label}</span>
+                </div>
+                <button type="button" role="switch" aria-checked={isDenoiseStepEnabled} className={`pipeline-switch${isDenoiseStepEnabled ? " pipeline-switch-enabled" : ""}`} data-testid="pipeline-toggle-denoise" onClick={() => setIsDenoiseStepEnabled((current) => !current)}>
+                  <span className="pipeline-switch-track"><span className="pipeline-switch-thumb" /></span>
+                  <span className="pipeline-switch-label">{isDenoiseStepEnabled ? "On" : "Off"}</span>
+                </button>
+              </div>
+              {isDenoiseStepEnabled ? (
+                <section className="pipeline-stage-body" data-testid="denoiser-workspace-section">
+                  <label>
+                    Denoiser Model
+                    <select data-testid="denoiser-model-select" value={denoiserModelId} onChange={(event) => setDenoiserModelId(event.target.value as ModelId)}>
+                      {runnableDenoiserModels.length > 0 ? (
+                        <optgroup label="Available Now">
+                          {runnableDenoiserModels.map((model) => (
+                            <option key={model.value} value={model.value}>{model.label}</option>
+                          ))}
+                        </optgroup>
+                      ) : null}
+                      <optgroup label="Planned">
+                        {plannedDenoiserModels.map((model) => (
+                          <option key={model.value} value={model.value} disabled>{model.label} (not implemented)</option>
+                        ))}
+                      </optgroup>
+                    </select>
+                  </label>
+                  <details className="pipeline-detail-disclosure" data-testid="denoiser-details-card">
+                    <summary className="pipeline-detail-summary">
+                      <span className="source-detail-summary-label">Denoiser notes</span>
+                      <span className="source-detail-summary-value">{selectedDenoiserModel.label} • {selectedDenoiserBackend.label} • first stage</span>
+                    </summary>
+                    <div className="pipeline-detail-body">
+                      <div className="catalog-card-header">
+                        <strong data-testid="selected-denoiser-label">{selectedDenoiserModel.label}</strong>
+                        <span className={`catalog-chip execution-${!isSelectedDenoiserImplemented ? "planned" : isSelectedDenoiserLaunchable ? selectedDenoiserModel.executionStatus : "setup-required"}`} data-testid="selected-denoiser-status">
+                          {!isSelectedDenoiserImplemented ? "not implemented" : isSelectedDenoiserLaunchable ? selectedDenoiserModel.executionStatus : "setup required"}
+                        </span>
+                      </div>
+                      <p className="summary" data-testid="selected-denoiser-summary">{selectedDenoiserModel.summary}</p>
+                      {!isSelectedDenoiserImplemented ? (
+                        <p className="summary" data-testid="selected-denoiser-availability">This denoiser is cataloged for analog-video comparison, but the worker backend has not landed yet.</p>
+                      ) : !isSelectedDenoiserLaunchable ? (
+                        <p className="summary" data-testid="selected-denoiser-launch-requirement">{selectedDenoiserLaunchRequirement}</p>
+                      ) : null}
+                      <dl className="facts compact-facts">
+                        <div><dt>Backend</dt><dd>{selectedDenoiserBackend.label}</dd></div>
+                        <div><dt>Runtime Model</dt><dd>{selectedDenoiserModel.runtimeModelName}</dd></div>
+                        <div><dt>Support Tier</dt><dd>{selectedDenoiserModel.supportTier}</dd></div>
+                        <div><dt>Quality Rank</dt><dd>#{selectedDenoiserModel.qualityRank}</dd></div>
+                        {selectedDenoiserModel.qualityStats ? <div><dt>Analog Noise</dt><dd>{selectedDenoiserModel.qualityStats.analogNoiseScore}/10</dd></div> : null}
+                        {selectedDenoiserModel.qualityStats ? <div><dt>Temporal Stability</dt><dd>{selectedDenoiserModel.qualityStats.temporalStabilityScore}/10</dd></div> : null}
+                        {selectedDenoiserModel.qualityStats ? <div><dt>Detail Retention</dt><dd>{selectedDenoiserModel.qualityStats.detailRetentionScore}/10</dd></div> : null}
+                        {selectedDenoiserModel.qualityStats ? <div><dt>Speed</dt><dd>{selectedDenoiserModel.qualityStats.speedClass}</dd></div> : null}
+                        {selectedDenoiserModel.qualityStats ? <div><dt>VRAM</dt><dd>{selectedDenoiserModel.qualityStats.vramClass}</dd></div> : null}
+                        <div><dt>Pipeline Order</dt><dd>Denoise before colorize, upscale, and interpolation</dd></div>
+                        <div><dt>Suitability</dt><dd>{selectedDenoiserModel.mediaSuitability.join(", ")}</dd></div>
+                      </dl>
+                    </div>
+                  </details>
+                </section>
+              ) : null}
+            </section>
+
+            <div className="pipeline-arrow pipeline-arrow-large" aria-hidden="true">
+              <span className="pipeline-arrow-shaft" />
+              <span className="pipeline-arrow-head" />
+            </div>
+
             <section className={`pipeline-stage-panel${isColorizationStepEnabled ? " pipeline-stage-panel-enabled" : ""}${activePipelineVisualStep === "colorize" ? " pipeline-stage-panel-current" : ""}`} data-testid="pipeline-colorization-details">
               <div className="pipeline-stage-panel-header" data-testid="pipeline-colorization-summary">
                 <div className="pipeline-stage-heading-block" data-testid="colorizer-section-card">
@@ -6500,6 +6683,7 @@ export default function App() {
                     <div><dt>Frames</dt><dd>{result.frameCount}</dd></div>
                     <div><dt>Source Media</dt><dd>{formatMediaSummary(result.sourceMedia ?? null)}</dd></div>
                     <div><dt>Output Media</dt><dd>{formatMediaSummary(result.outputMedia ?? null)}</dd></div>
+                    <div><dt>Selected Denoiser</dt><dd>{activePipelineRequest?.denoiseMode !== "off" && activePipelineRequest?.denoiserModelId ? getModelDefinition(activePipelineRequest.denoiserModelId).label : "Off"}</dd></div>
                     <div><dt>Codec</dt><dd>{formatMediaLabel(result.codec)}</dd></div>
                     <div><dt>Container</dt><dd>{String(result.container).toUpperCase()}</dd></div>
                     <div><dt>Quality Preset</dt><dd>{formatQualityPresetLabel(result.effectiveSettings?.qualityPreset)}</dd></div>
@@ -6863,6 +7047,7 @@ export default function App() {
               <div className="progress-stat-grid">
                 <span className="truncated-line" data-testid="progress-total-frames" title={`Total Frames: ${pipelineJob.progress.totalFrames || "?"}`}>Total Frames: {pipelineJob.progress.totalFrames || "?"}</span>
                 <span className="truncated-line" data-testid="progress-extracted-frames" title={`Extracted PNGs: ${pipelineJob.progress.extractedFrames}`}>Extracted PNGs: {pipelineJob.progress.extractedFrames}</span>
+                <span className="truncated-line" data-testid="progress-denoised-frames" title={`Denoised PNGs: ${pipelineJob.progress.denoisedFrames ?? 0}`}>Denoised PNGs: {pipelineJob.progress.denoisedFrames ?? 0}</span>
                 <span className="truncated-line" data-testid="progress-colorized-frames" title={`Colorized PNGs: ${pipelineJob.progress.colorizedFrames}`}>Colorized PNGs: {pipelineJob.progress.colorizedFrames}</span>
                 <span className="truncated-line" data-testid="progress-upscaled-frames" title={`Upscaled PNGs: ${pipelineJob.progress.upscaledFrames}`}>Upscaled PNGs: {pipelineJob.progress.upscaledFrames}</span>
                 <span className="truncated-line" data-testid="progress-interpolated-frames" title={`Interpolated PNGs: ${pipelineJob.progress.interpolatedFrames}`}>Interpolated PNGs: {pipelineJob.progress.interpolatedFrames}</span>
@@ -7016,8 +7201,8 @@ export default function App() {
                           ? (isJobsOnlyView ? "Load Template In Main Window" : "Load Template")
                           : (isJobsOnlyView ? "Load Template In Main Window" : "Load Template From Job");
                         const restartTitle = isJobsOnlyView
-                          ? "Send this stopped job back to the main window and restart it from the beginning."
-                          : "Reload the recorded settings for this stopped job and start it again from the beginning.";
+                          ? "Send this stopped job back to the main window and resume from completed segments when available."
+                          : "Reload the recorded settings for this stopped job and resume from completed segments when available.";
                         const outputMedia = runDetails?.outputMedia ?? null;
                         const averageThroughputFps = job.progress.averageFramesPerSecond ?? runDetails?.averageThroughputFps ?? null;
                         const averagePixelsPerSecond = computePixelsPerSecond(outputMedia, averageThroughputFps);
@@ -7068,7 +7253,7 @@ export default function App() {
                                       disabled={isBusy}
                                       title={restartTitle}
                                     >
-                                      Restart
+                                      Resume
                                     </button>
                                   ) : null}
                                   <button type="button" className="cleanup-expand-button" data-testid={`cleanup-expand-${job.id}`} onClick={() => toggleCleanupJobExpanded(job.id)}>
@@ -7088,7 +7273,7 @@ export default function App() {
                                       <span>Phase: {job.phase}</span>
                                       <span>Recorded Frames: {job.recordedCount}</span>
                                       <span>Model: {job.modelId ?? "Unknown model"}</span>
-                                      {isRecoverableStoppedJob ? <span>Recovery: This incomplete job can be restarted immediately or loaded as a template for edits first.</span> : null}
+                                      {isRecoverableStoppedJob ? <span>Recovery: This incomplete job can resume from completed segment checkpoints or be loaded as a template for edits first.</span> : null}
                                       <span>Codec: {job.codec ?? "Unknown codec"}</span>
                                       <span>Container: {job.container ?? "Unknown container"}</span>
                                       <span>Scratch Size: {formatBytes(job.scratchSizeBytes)}</span>
@@ -7153,7 +7338,7 @@ export default function App() {
                                           disabled={isBusy}
                                           title={restartTitle}
                                         >
-                                          {isJobsOnlyView ? "Restart In Main Window" : "Restart Job"}
+                                          {isJobsOnlyView ? "Resume In Main Window" : "Resume Job"}
                                         </button>
                                       ) : null}
                                       {job.outputPath ? (

@@ -15,6 +15,8 @@ def build_realesrgan_job_plan(
     *,
     source_path: str,
     model_id: str,
+    denoise_mode: str = "off",
+    denoiser_model_id: str | None = None,
     colorization_mode: str = "off",
     colorizer_model_id: str | None = None,
     color_context_library_id: str | None = None,
@@ -56,10 +58,16 @@ def build_realesrgan_job_plan(
     precision_mode = resolve_precision_mode(fp16=fp16, bf16=bf16, precision=precision)
 
     ensure_runnable_model(model_id)
+    if denoise_mode != "off":
+        if not denoiser_model_id:
+            raise ValueError("Denoising was requested but no denoiser model id was provided")
+        ensure_runnable_model(denoiser_model_id)
     cache_material = "|".join(
         [
             source_path,
             model_id,
+            denoise_mode,
+            denoiser_model_id or "",
             colorization_mode,
             colorizer_model_id or "",
             color_context_library_id or "",
@@ -108,6 +116,8 @@ def build_realesrgan_job_plan(
         source_path,
         "--model-id",
         model_id,
+        "--denoise-mode",
+        denoise_mode,
         "--colorization-mode",
         colorization_mode,
         "--output-mode",
@@ -134,6 +144,9 @@ def build_realesrgan_job_plan(
 
     if colorizer_model_id:
         command.extend(["--colorizer-model-id", colorizer_model_id])
+
+    if denoiser_model_id:
+        command.extend(["--denoiser-model-id", denoiser_model_id])
 
     command.extend(["--deepremaster-processing-mode", deepremaster_processing_mode])
 
@@ -193,6 +206,8 @@ def build_realesrgan_job_plan(
         f"Model: {model_id}",
         f"Backend: {model_backend_id(model_id)}",
         f"Runtime name: {model_runtime_name(model_id)}",
+        f"Denoise mode: {denoise_mode}",
+        f"Denoiser: {denoiser_model_id or 'off'}",
         f"Output mode: {output_mode}",
         f"Preset: {preset}",
         f"Interpolation mode: {interpolation_mode}",

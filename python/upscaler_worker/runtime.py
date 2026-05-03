@@ -15,6 +15,7 @@ from pathlib import Path
 import imageio_ffmpeg
 
 from upscaler_worker.model_catalog import model_catalog
+from upscaler_worker.models.pytorch_denoise import resolve_external_denoise_command_template
 from upscaler_worker.models.pytorch_video_sr import resolve_external_video_sr_command_template
 
 
@@ -25,6 +26,16 @@ REALESRGAN_ZIP_URL = (
 RVRT_REPO_ZIP_URL = "https://codeload.github.com/JingyunLiang/RVRT/zip/refs/heads/main"
 RVRT_RELEASE_BASE_URL = "https://github.com/JingyunLiang/RVRT/releases/download/v0.0"
 RVRT_DEFAULT_TASK = "002_RVRT_videosr_bi_Vimeo_14frames"
+SWINIR_REPO_ZIP_URL = "https://codeload.github.com/JingyunLiang/SwinIR/zip/refs/heads/main"
+SCUNET_REPO_ZIP_URL = "https://codeload.github.com/cszn/SCUNet/zip/refs/heads/main"
+DPIR_REPO_ZIP_URL = "https://codeload.github.com/cszn/DPIR/zip/refs/heads/master"
+FASTDVDNET_REPO_ZIP_URL = "https://codeload.github.com/m-tassano/fastdvdnet/zip/refs/heads/master"
+KAIR_RELEASE_BASE_URL = "https://github.com/cszn/KAIR/releases/download/v1.0"
+SWINIR_RELEASE_BASE_URL = "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0"
+FASTDVDNET_MODEL_URL = "https://raw.githubusercontent.com/m-tassano/fastdvdnet/master/model.pth"
+SWINIR_COLOR_DENOISE_MODEL = "005_colorDN_DFWB_s128w8_SwinIR-M_noise25.pth"
+SCUNET_REAL_DENOISE_MODEL = "scunet_color_real_psnr.pth"
+DRUNET_COLOR_DENOISE_MODEL = "drunet_color.pth"
 RIFE_ZIP_URL = (
     "https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/"
     "rife-ncnn-vulkan-20221029-windows.zip"
@@ -208,6 +219,83 @@ def ensure_rvrt_model_weights(task_name: str = RVRT_DEFAULT_TASK) -> dict[str, s
     }
 
 
+def _ensure_source_runtime(*, name: str, zip_name: str, zip_url: str, entrypoint_relative: str) -> dict[str, str]:
+    install_dir = runtime_root() / name
+    source_root = install_dir / "src"
+    entrypoint = source_root / entrypoint_relative
+    if not entrypoint.exists():
+        archive_path = runtime_root() / zip_name
+        _download_file(zip_url, archive_path)
+        if source_root.exists():
+            shutil.rmtree(source_root)
+        source_root.mkdir(parents=True, exist_ok=True)
+        _extract_archive_with_optional_root_strip(archive_path, source_root)
+        archive_path.unlink(missing_ok=True)
+        if not entrypoint.exists():
+            raise RuntimeError(f"{name} bootstrap archive did not contain {entrypoint_relative}")
+
+    return {
+        "sourceRoot": str(source_root),
+        "entryPoint": str(entrypoint),
+    }
+
+
+def ensure_swinir_denoise_runtime() -> dict[str, str]:
+    runtime = _ensure_source_runtime(
+        name="swinir-denoise",
+        zip_name="swinir-main.zip",
+        zip_url=SWINIR_REPO_ZIP_URL,
+        entrypoint_relative="models/network_swinir.py",
+    )
+    checkpoint_path = runtime_root() / "pytorch-models" / SWINIR_COLOR_DENOISE_MODEL
+    if not checkpoint_path.exists():
+        _download_file(f"{SWINIR_RELEASE_BASE_URL}/{SWINIR_COLOR_DENOISE_MODEL}", checkpoint_path)
+    runtime["checkpointPath"] = str(checkpoint_path)
+    return runtime
+
+
+def ensure_scunet_denoise_runtime() -> dict[str, str]:
+    runtime = _ensure_source_runtime(
+        name="scunet-denoise",
+        zip_name="scunet-main.zip",
+        zip_url=SCUNET_REPO_ZIP_URL,
+        entrypoint_relative="models/network_scunet.py",
+    )
+    checkpoint_path = runtime_root() / "pytorch-models" / SCUNET_REAL_DENOISE_MODEL
+    if not checkpoint_path.exists():
+        _download_file(f"{KAIR_RELEASE_BASE_URL}/{SCUNET_REAL_DENOISE_MODEL}", checkpoint_path)
+    runtime["checkpointPath"] = str(checkpoint_path)
+    return runtime
+
+
+def ensure_drunet_denoise_runtime() -> dict[str, str]:
+    runtime = _ensure_source_runtime(
+        name="dpir-drunet",
+        zip_name="dpir-master.zip",
+        zip_url=DPIR_REPO_ZIP_URL,
+        entrypoint_relative="models/network_unet.py",
+    )
+    checkpoint_path = runtime_root() / "pytorch-models" / DRUNET_COLOR_DENOISE_MODEL
+    if not checkpoint_path.exists():
+        _download_file(f"{KAIR_RELEASE_BASE_URL}/{DRUNET_COLOR_DENOISE_MODEL}", checkpoint_path)
+    runtime["checkpointPath"] = str(checkpoint_path)
+    return runtime
+
+
+def ensure_fastdvdnet_denoise_runtime() -> dict[str, str]:
+    runtime = _ensure_source_runtime(
+        name="fastdvdnet",
+        zip_name="fastdvdnet-master.zip",
+        zip_url=FASTDVDNET_REPO_ZIP_URL,
+        entrypoint_relative="models.py",
+    )
+    checkpoint_path = runtime_root() / "pytorch-models" / "fastdvdnet-model.pth"
+    if not checkpoint_path.exists():
+        _download_file(FASTDVDNET_MODEL_URL, checkpoint_path)
+    runtime["checkpointPath"] = str(checkpoint_path)
+    return runtime
+
+
 def _ensure_deoldify_dummy_assets(dummy_root: Path) -> Path:
     dummy_root.mkdir(parents=True, exist_ok=True)
     for image_index in range(10):
@@ -377,7 +465,10 @@ def detect_external_research_runtimes() -> dict[str, object]:
             continue
 
         command_env_var = str(research_runtime.get("commandEnvVar", "")).strip()
-        command_template, command_source = resolve_external_video_sr_command_template(model_id, command_env_var)
+        if str(model.get("task", "")).strip() == "denoise":
+            command_template, command_source = resolve_external_denoise_command_template(model_id, command_env_var)
+        else:
+            command_template, command_source = resolve_external_video_sr_command_template(model_id, command_env_var)
         statuses[model_id] = {
             "kind": "external-command",
             "commandEnvVar": command_env_var,

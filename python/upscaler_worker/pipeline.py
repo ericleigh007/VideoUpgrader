@@ -24,6 +24,7 @@ from upscaler_worker.interpolation import (
 )
 from upscaler_worker.media import probe_video
 from upscaler_worker.model_catalog import ensure_runnable_model, model_backend_id, model_label, model_task
+from upscaler_worker.models.pytorch_denoise import build_external_denoise_command, validate_external_denoise_outputs
 from upscaler_worker.models.pytorch_video_sr import build_external_video_sr_command, validate_external_video_sr_outputs
 from upscaler_worker.precision import resolve_precision_mode
 from upscaler_worker.models.realesrgan import model_label
@@ -36,6 +37,7 @@ PIPELINE_SEGMENT_FRAME_LIMIT = 48
 PIPELINE_SEGMENT_TARGET_SECONDS = 10.0
 PIPELINE_STAGE_QUEUE_DEPTH = 2
 PIPELINE_INTERMEDIATE_CONTAINER = "mkv"
+SEGMENT_VISUAL_VALIDATION_ENV_VAR = "UPSCALER_VALIDATE_SEGMENT_VISUALS"
 PYTORCH_EXECUTION_PATH_FILE_IO = "file-io"
 PYTORCH_EXECUTION_PATH_STREAMING = "streaming"
 SUPPORTED_PYTORCH_EXECUTION_PATHS = {
@@ -90,6 +92,7 @@ class InterpolationEncodeTask:
     frame_limit: int
     segment_total_frames: int
     extracted_frames: int
+    colorized_frames: int
     upscaled_frames: int
     interpolated_frames: int
     cleanup_paths: tuple[Path, ...]
@@ -98,11 +101,127 @@ class InterpolationEncodeTask:
 @dataclass
 class PipelineProgressState:
     extracted_frames: int = 0
+    denoised_frames: int = 0
     colorized_frames: int = 0
     upscaled_frames: int = 0
     interpolated_frames: int = 0
     encoded_frames: int = 0
     remuxed_frames: int = 0
+
+
+def _segment_checkpoint_exists(segment_file: Path) -> bool:
+    try:
+        return segment_file.is_file() and segment_file.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _clear_incomplete_segment_work(segment_dir: Path, segment_file: Path) -> None:
+    shutil.rmtree(segment_dir, ignore_errors=True)
+    partial_file = segment_file.with_name(f"{segment_file.stem}.part{segment_file.suffix}")
+    if partial_file.exists():
+        partial_file.unlink(missing_ok=True)
+
+
+def _segment_visual_validation_enabled() -> bool:
+    value = os.environ.get(SEGMENT_VISUAL_VALIDATION_ENV_VAR, "1").strip().lower()
+    return value not in {"0", "false", "no", "off", "disabled"}
+
+
+def _local_seam_score(values: np.ndarray, index: int) -> tuple[float, float, float]:
+    if values.size == 0:
+        return 0.0, 0.0, 0.0
+    index = max(0, min(int(index), values.size - 1))
+    start = max(0, index - 8)
+    end = min(values.size, index + 9)
+    neighbor_parts: list[np.ndarray] = []
+    if index - 2 > start:
+        neighbor_parts.append(values[start:index - 2])
+    if index + 3 < end:
+        neighbor_parts.append(values[index + 3:end])
+    neighbors = np.concatenate(neighbor_parts) if neighbor_parts else values[start:end]
+    local_median = float(np.median(neighbors)) if neighbors.size else 0.0
+    edge_value = float(values[index])
+    return edge_value, local_median, edge_value / max(1.0, local_median)
+
+
+def _find_regular_tile_seams(frame: np.ndarray) -> list[str]:
+    if frame.ndim != 2 or frame.shape[0] < 48 or frame.shape[1] < 48:
+        return []
+    row_edges = np.mean(np.abs(np.diff(frame.astype(np.float32), axis=0)), axis=1)
+    column_edges = np.mean(np.abs(np.diff(frame.astype(np.float32), axis=1)), axis=0)
+    seam_labels: list[str] = []
+
+    def inspect_axis(values: np.ndarray, label: str) -> None:
+        candidates: list[tuple[float, int, float]] = []
+        for index in range(8, max(8, values.size - 8)):
+            if values[index] < values[index - 1] or values[index] < values[index + 1]:
+                continue
+            edge_value, local_median, ratio = _local_seam_score(values, index)
+            if edge_value >= 8.0 and ratio >= 2.8 and (edge_value - local_median) >= 6.0:
+                candidates.append((edge_value, index, ratio))
+        selected: list[tuple[float, int, float]] = []
+        for edge_value, index, ratio in sorted(candidates, reverse=True):
+            if all(abs(index - selected_index) >= 12 for _, selected_index, _ in selected):
+                selected.append((edge_value, index, ratio))
+            if len(selected) == 4:
+                break
+        for _, index, ratio in sorted(selected, key=lambda item: item[1]):
+            seam_labels.append(f"{label}{index + 1}:{ratio:.1f}x")
+
+    inspect_axis(row_edges, "row")
+    inspect_axis(column_edges, "col")
+    row_ratios = [float(label.rsplit(":", 1)[1].removesuffix("x")) for label in seam_labels if label.startswith("row")]
+    column_ratios = [float(label.rsplit(":", 1)[1].removesuffix("x")) for label in seam_labels if label.startswith("col")]
+    if len(row_ratios) >= 2 or (len(column_ratios) >= 3 and max(column_ratios, default=0.0) >= 6.0):
+        return seam_labels
+    return []
+
+
+def _decode_segment_validation_frame(ffmpeg: str, segment_file: Path, log: list[str]) -> np.ndarray | None:
+    command = [
+        ffmpeg,
+        "-v",
+        "error",
+        "-i",
+        str(segment_file),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=320:-1:flags=bilinear",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-",
+    ]
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, timeout=45)
+    except (subprocess.SubprocessError, OSError) as error:
+        log.append(f"Segment visual validation failed for {segment_file.name}: could not decode validation frame ({error})")
+        return None
+    width = 320
+    if not result.stdout or len(result.stdout) % width != 0:
+        log.append(f"Segment visual validation failed for {segment_file.name}: unexpected decoded frame size")
+        return None
+    height = len(result.stdout) // width
+    if height < 48:
+        log.append(f"Segment visual validation failed for {segment_file.name}: decoded frame is too small")
+        return None
+    return np.frombuffer(result.stdout, dtype=np.uint8).reshape((height, width)).astype(np.float32)
+
+
+def _validate_segment_visual_integrity(ffmpeg: str, segment_file: Path, log: list[str]) -> bool:
+    if not _segment_visual_validation_enabled():
+        return True
+    frame = _decode_segment_validation_frame(ffmpeg, segment_file, log)
+    if frame is None:
+        return False
+    seams = _find_regular_tile_seams(frame)
+    if not seams:
+        return True
+    log.append(f"Segment visual validation failed for {segment_file.name}: regular tile seams detected ({', '.join(seams)})")
+    return False
 
 
 def _should_publish_stage_progress(phase: str, progress_state: PipelineProgressState) -> bool:
@@ -148,6 +267,7 @@ class PipelineTelemetryState:
     batch_index: int | None = None
     batch_count: int | None = None
     extract_stage_seconds: float = 0.0
+    denoise_stage_seconds: float = 0.0
     colorize_stage_seconds: float = 0.0
     upscale_stage_seconds: float = 0.0
     interpolate_stage_seconds: float = 0.0
@@ -516,6 +636,7 @@ def _sample_progress_telemetry(
         "scratchSizeBytes": resources.scratch_size_bytes,
         "outputSizeBytes": resources.output_size_bytes,
         "extractStageSeconds": telemetry_state.extract_stage_seconds,
+        "denoiseStageSeconds": telemetry_state.denoise_stage_seconds,
         "colorizeStageSeconds": telemetry_state.colorize_stage_seconds,
         "upscaleStageSeconds": telemetry_state.upscale_stage_seconds,
         "interpolateStageSeconds": telemetry_state.interpolate_stage_seconds,
@@ -529,6 +650,9 @@ def _record_stage_duration(telemetry_state: PipelineTelemetryState, stage: str, 
         return
     if stage == "extract":
         telemetry_state.extract_stage_seconds += duration_seconds
+        return
+    if stage == "denoise":
+        telemetry_state.denoise_stage_seconds += duration_seconds
         return
     if stage == "colorize":
         telemetry_state.colorize_stage_seconds += duration_seconds
@@ -573,6 +697,7 @@ def _write_progress(
     processed_frames: int,
     total_frames: int,
     extracted_frames: int = 0,
+    denoised_frames: int = 0,
     colorized_frames: int = 0,
     upscaled_frames: int = 0,
     interpolated_frames: int = 0,
@@ -592,6 +717,7 @@ def _write_progress(
         "processedFrames": processed_frames,
         "totalFrames": total_frames,
         "extractedFrames": extracted_frames,
+        "denoisedFrames": denoised_frames,
         "colorizedFrames": colorized_frames,
         "upscaledFrames": upscaled_frames,
         "interpolatedFrames": interpolated_frames,
@@ -624,12 +750,13 @@ def _run_ffmpeg_with_frame_progress(
     total_frames: int,
     message_prefix: str,
     extracted_frames: int,
-    colorized_frames: int,
-    upscaled_frames: int,
-    interpolated_frames: int,
-    encoded_frames: int,
-    remuxed_frames: int,
-    telemetry_state: PipelineTelemetryState | None,
+    denoised_frames: int = 0,
+    colorized_frames: int = 0,
+    upscaled_frames: int = 0,
+    interpolated_frames: int = 0,
+    encoded_frames: int = 0,
+    remuxed_frames: int = 0,
+    telemetry_state: PipelineTelemetryState | None = None,
     stage_frame_offset: int = 0,
 ) -> tuple[int, int]:
     progress_command = command[:-1] + ["-progress", "pipe:1", "-nostats", command[-1]]
@@ -670,6 +797,7 @@ def _run_ffmpeg_with_frame_progress(
                 processed_frames=stage_progress_frames,
                 total_frames=total_frames,
                 extracted_frames=extracted_frames,
+                denoised_frames=denoised_frames,
                 colorized_frames=colorized_frames,
                 upscaled_frames=upscaled_frames,
                 interpolated_frames=interpolated_frames,
@@ -695,6 +823,7 @@ def _run_ffmpeg_with_frame_progress(
                     processed_frames=min(total_frames, stage_frame_offset + state["current_frame"]),
                     total_frames=total_frames,
                     extracted_frames=extracted_frames,
+                    denoised_frames=denoised_frames,
                     colorized_frames=colorized_frames,
                     upscaled_frames=upscaled_frames,
                     interpolated_frames=interpolated_frames,
@@ -710,6 +839,7 @@ def _run_ffmpeg_with_frame_progress(
                     processed_frames=min(total_frames, stage_frame_offset + state["current_frame"]),
                     total_frames=total_frames,
                     extracted_frames=extracted_frames,
+                    denoised_frames=denoised_frames,
                     colorized_frames=colorized_frames,
                     upscaled_frames=upscaled_frames,
                     interpolated_frames=interpolated_frames,
@@ -1064,18 +1194,20 @@ def _pipeline_percent(
     *,
     source_total_frames: int | None = None,
     interpolation_mode: str = "off",
+    denoise_mode: str = "off",
     colorization_mode: str = "off",
 ) -> int:
+    denoise_weight = 10 if denoise_mode != "off" else 0
     if interpolation_mode == "interpolateOnly":
         extract_weight = 10
         colorize_weight = 0
         upscale_weight = 0
-        interpolate_weight = 70
+        interpolate_weight = 70 - denoise_weight
         encode_weight = 15
         remux_weight = 5
     elif colorization_mode == "colorizeOnly":
         extract_weight = 10
-        colorize_weight = 70
+        colorize_weight = 70 - denoise_weight
         upscale_weight = 0
         interpolate_weight = 0
         encode_weight = 15
@@ -1083,30 +1215,37 @@ def _pipeline_percent(
     elif interpolation_mode == "afterUpscale":
         extract_weight = 10
         colorize_weight = 15 if colorization_mode == "beforeUpscale" else 0
-        upscale_weight = 20 if colorization_mode == "beforeUpscale" else 35
+        upscale_weight = (20 if colorization_mode == "beforeUpscale" else 35) - denoise_weight
         interpolate_weight = 35
         encode_weight = 15
         remux_weight = 5
     else:
         extract_weight = 10
         colorize_weight = 20 if colorization_mode == "beforeUpscale" else 0
-        upscale_weight = 50 if colorization_mode == "beforeUpscale" else 70
+        upscale_weight = (50 if colorization_mode == "beforeUpscale" else 70) - denoise_weight
         interpolate_weight = 0
         encode_weight = 15
         remux_weight = 5
 
+    upscale_weight = max(0, upscale_weight)
+    colorize_weight = max(0, colorize_weight)
+    interpolate_weight = max(0, interpolate_weight)
+
     effective_source_total_frames = source_total_frames if source_total_frames is not None and source_total_frames > 0 else total_frames
     if interpolation_mode == "off":
         effective_extracted_frames = progress_state.extracted_frames
+        effective_denoised_frames = progress_state.denoised_frames
         effective_colorized_frames = progress_state.colorized_frames
         effective_upscaled_frames = progress_state.upscaled_frames
     else:
         effective_extracted_frames = _scaled_pipeline_frames(progress_state.extracted_frames, effective_source_total_frames, total_frames)
+        effective_denoised_frames = _scaled_pipeline_frames(progress_state.denoised_frames, effective_source_total_frames, total_frames)
         effective_colorized_frames = _scaled_pipeline_frames(progress_state.colorized_frames, effective_source_total_frames, total_frames)
         effective_upscaled_frames = _scaled_pipeline_frames(progress_state.upscaled_frames, effective_source_total_frames, total_frames)
 
     aggregate = (
         _pipeline_ratio(effective_extracted_frames, total_frames) * extract_weight
+        + _pipeline_ratio(effective_denoised_frames, total_frames) * denoise_weight
         + _pipeline_ratio(effective_colorized_frames, total_frames) * colorize_weight
         + _pipeline_ratio(effective_upscaled_frames, total_frames) * upscale_weight
         + _pipeline_ratio(progress_state.interpolated_frames, total_frames) * interpolate_weight
@@ -1125,16 +1264,19 @@ def _emit_pipeline_progress(
     progress_state: PipelineProgressState,
     source_total_frames: int | None = None,
     interpolation_mode: str = "off",
+    denoise_mode: str = "off",
     colorization_mode: str = "off",
     telemetry_state: PipelineTelemetryState | None = None,
 ) -> None:
     effective_source_total_frames = source_total_frames if source_total_frames is not None and source_total_frames > 0 else total_frames
     if interpolation_mode == "off":
         effective_extracted_frames = progress_state.extracted_frames
+        effective_denoised_frames = progress_state.denoised_frames
         effective_colorized_frames = progress_state.colorized_frames
         effective_upscaled_frames = progress_state.upscaled_frames
     else:
         effective_extracted_frames = _scaled_pipeline_frames(progress_state.extracted_frames, effective_source_total_frames, total_frames)
+        effective_denoised_frames = _scaled_pipeline_frames(progress_state.denoised_frames, effective_source_total_frames, total_frames)
         effective_colorized_frames = _scaled_pipeline_frames(progress_state.colorized_frames, effective_source_total_frames, total_frames)
         effective_upscaled_frames = _scaled_pipeline_frames(progress_state.upscaled_frames, effective_source_total_frames, total_frames)
 
@@ -1146,11 +1288,13 @@ def _emit_pipeline_progress(
             progress_state,
             source_total_frames=effective_source_total_frames,
             interpolation_mode=interpolation_mode,
+            denoise_mode=denoise_mode,
             colorization_mode=colorization_mode,
         ),
         message=message,
         processed_frames=max(
             effective_extracted_frames,
+            effective_denoised_frames,
             effective_colorized_frames,
             effective_upscaled_frames,
             progress_state.interpolated_frames,
@@ -1159,6 +1303,7 @@ def _emit_pipeline_progress(
         ),
         total_frames=total_frames,
         extracted_frames=progress_state.extracted_frames,
+        denoised_frames=progress_state.denoised_frames,
         colorized_frames=progress_state.colorized_frames,
         upscaled_frames=progress_state.upscaled_frames,
         interpolated_frames=progress_state.interpolated_frames,
@@ -1197,6 +1342,141 @@ def _extract_segment_frames(
     return len(list(input_dir.glob("frame_*.png")))
 
 
+def _ffmpeg_denoise_filter(model_id: str) -> str:
+    filters = {
+        "ffmpeg-hqdn3d-balanced": "hqdn3d=2.5:2.5:6.0:6.0",
+        "ffmpeg-hqdn3d-strong": "hqdn3d=4.0:3.0:8.0:6.0",
+        "ffmpeg-nlmeans-quality": "nlmeans=s=2.5:p=7:r=15",
+    }
+    try:
+        return filters[model_id]
+    except KeyError as error:
+        supported = ", ".join(sorted(filters))
+        raise RuntimeError(f"Denoiser '{model_id}' does not have an FFmpeg filter mapping. Supported FFmpeg denoisers: {supported}") from error
+
+
+def _denoise_ffmpeg_segment(
+    *,
+    runtime: dict[str, object],
+    input_dir: Path,
+    output_dir: Path,
+    model_id: str,
+    log: list[str],
+    cancel_path: str | None,
+    pause_path: str | None,
+    progress_callback=None,
+) -> int:
+    input_frames = sorted(input_dir.glob("frame_*.png"))
+    if not input_frames:
+        raise RuntimeError("No extracted frames were found for denoising.")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(runtime["ffmpegPath"]),
+        "-y",
+        "-framerate",
+        "1",
+        "-i",
+        str(input_dir / "frame_%08d.png"),
+        "-vf",
+        _ffmpeg_denoise_filter(model_id),
+        "-frames:v",
+        str(len(input_frames)),
+        str(output_dir / "frame_%08d.png"),
+    ]
+    output_count = _run_command_with_output_frame_progress(
+        command=command,
+        output_dir=output_dir,
+        target_frame_count=len(input_frames),
+        log=log,
+        cancel_path=cancel_path,
+        pause_path=pause_path,
+        progress_callback=progress_callback,
+    )
+    if output_count <= 0:
+        raise RuntimeError("FFmpeg denoising completed without producing output frames")
+    return output_count
+
+
+def _denoise_external_segment(
+    *,
+    input_dir: Path,
+    output_dir: Path,
+    model_id: str,
+    gpu_id: int | None,
+    precision: str,
+    log: list[str],
+    cancel_path: str | None,
+    pause_path: str | None,
+    progress_callback=None,
+) -> int:
+    external = build_external_denoise_command(
+        model_id=model_id,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        gpu_id=gpu_id,
+        precision=precision,
+    )
+    target_frame_count = len(sorted(input_dir.glob("frame_*.png")))
+    log.append(
+        f"Using {external.command_source} AI denoiser command for {external.model_label} "
+        f"({external.command_env_var} can override it)."
+    )
+    _run_command_with_output_frame_progress(
+        command=external.command,
+        output_dir=output_dir,
+        target_frame_count=target_frame_count,
+        log=log,
+        cancel_path=cancel_path,
+        pause_path=pause_path,
+        progress_callback=progress_callback,
+        env=external.environment,
+    )
+    return validate_external_denoise_outputs(input_dir=input_dir, output_dir=output_dir)
+
+
+def _denoise_segment(
+    *,
+    runtime: dict[str, object],
+    input_dir: Path,
+    output_dir: Path,
+    model_id: str,
+    gpu_id: int | None,
+    precision: str,
+    log: list[str],
+    cancel_path: str | None,
+    pause_path: str | None,
+    progress_callback=None,
+) -> int:
+    backend_id = model_backend_id(model_id)
+    if backend_id == "ffmpeg-video-denoise":
+        return _denoise_ffmpeg_segment(
+            runtime=runtime,
+            input_dir=input_dir,
+            output_dir=output_dir,
+            model_id=model_id,
+            log=log,
+            cancel_path=cancel_path,
+            pause_path=pause_path,
+            progress_callback=progress_callback,
+        )
+
+    if backend_id in {"pytorch-image-denoise", "pytorch-video-denoise"}:
+        return _denoise_external_segment(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            model_id=model_id,
+            gpu_id=gpu_id,
+            precision=precision,
+            log=log,
+            cancel_path=cancel_path,
+            pause_path=pause_path,
+            progress_callback=progress_callback,
+        )
+
+    raise NotImplementedError(f"Denoiser backend '{backend_id}' is cataloged but not implemented in the worker pipeline")
+
+
 def _upscale_ncnn_segment(
     *,
     runtime: dict[str, object],
@@ -1205,6 +1485,7 @@ def _upscale_ncnn_segment(
     model_id: str,
     gpu_id: int | None,
     effective_tile: int,
+    upscale_scale: int,
     log: list[str],
     cancel_path: str | None,
     pause_path: str | None,
@@ -1225,6 +1506,8 @@ def _upscale_ncnn_segment(
         str(runtime["modelDir"]),
         "-n",
         model_id,
+        "-s",
+        str(upscale_scale),
         "-f",
         "png",
     ]
@@ -1676,13 +1959,17 @@ def _encode_segment_video(
     pause_path: str | None,
     total_frames: int,
     extracted_frames: int,
+    denoised_frames: int = 0,
     colorized_frames: int,
     upscaled_frames: int,
     interpolated_frames: int,
     encoded_frames_before_segment: int,
     telemetry_state: PipelineTelemetryState | None,
+    validate_visual_integrity: bool = True,
 ) -> int:
     output_file.parent.mkdir(parents=True, exist_ok=True)
+    partial_output_file = output_file.with_name(f"{output_file.stem}.part{output_file.suffix}")
+    partial_output_file.unlink(missing_ok=True)
     encode_command = [
         ffmpeg,
         "-y",
@@ -1729,7 +2016,7 @@ def _encode_segment_video(
             f"upscaler_codec={codec}",
             "-metadata",
             f"upscaler_container={container}",
-            str(output_file),
+            str(partial_output_file),
         ]
     )
     encoded_frame_count, _ = _run_ffmpeg_with_frame_progress(
@@ -1752,6 +2039,10 @@ def _encode_segment_video(
         telemetry_state=telemetry_state,
         stage_frame_offset=encoded_frames_before_segment,
     )
+    partial_output_file.replace(output_file)
+    if validate_visual_integrity and not _validate_segment_visual_integrity(ffmpeg, output_file, log):
+        output_file.unlink(missing_ok=True)
+        raise RuntimeError(f"Encoded segment {output_file.name} failed visual integrity validation; re-run the job to regenerate this segment.")
     return max(0, encoded_frame_count - encoded_frames_before_segment)
 
 
@@ -1766,6 +2057,7 @@ def _concat_segment_videos(
     pause_path: str | None,
     total_frames: int,
     extracted_frames: int,
+    denoised_frames: int,
     colorized_frames: int,
     upscaled_frames: int,
     interpolated_frames: int,
@@ -1803,6 +2095,7 @@ def _concat_segment_videos(
         total_frames=total_frames,
         message_prefix="Concatenating encoded segments",
         extracted_frames=extracted_frames,
+        denoised_frames=denoised_frames,
         colorized_frames=colorized_frames,
         upscaled_frames=upscaled_frames,
         interpolated_frames=interpolated_frames,
@@ -2089,6 +2382,21 @@ def _output_filter(
     return None
 
 
+def _resolve_realesrgan_ncnn_scale(
+    *,
+    output_mode: str,
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+) -> int:
+    if output_mode != "preserveAspect4k" or source_width <= 0 or source_height <= 0:
+        return 4
+
+    required_scale = min(target_width / source_width, target_height / source_height)
+    return max(2, min(4, math.ceil(required_scale - 0.0001)))
+
+
 def _effective_tile_size(model_id: str, preset: str, tile_size: int) -> int:
     if tile_size > 0:
         return tile_size
@@ -2264,6 +2572,8 @@ def run_realesrgan_pipeline(
     *,
     source_path: str,
     model_id: str,
+    denoise_mode: str = "off",
+    denoiser_model_id: str | None = None,
     colorization_mode: str = "off",
     colorizer_model_id: str | None = None,
     color_context_library_id: str | None = None,
@@ -2303,6 +2613,7 @@ def run_realesrgan_pipeline(
     crf: int,
     pytorch_execution_path: str | None = None,
     pytorch_runner: str | None = None,
+    resume_from_job_id: str | None = None,
     bf16: bool = False,
     precision: str | None = None,
     channels_last: bool = False,
@@ -2310,6 +2621,19 @@ def run_realesrgan_pipeline(
 ) -> dict[str, object]:
     ensure_not_cancelled(cancel_path)
     wait_if_paused(pause_path, cancel_path=cancel_path)
+    denoise_enabled = denoise_mode != "off"
+    denoiser_backend_id: str | None = None
+    if denoise_enabled:
+        if not denoiser_model_id:
+            raise ValueError("Denoising was requested but no denoiser model id was provided")
+        ensure_runnable_model(denoiser_model_id)
+        if model_task(denoiser_model_id) != "denoise":
+            raise ValueError(f"Model '{denoiser_model_id}' is not cataloged as a denoiser")
+        denoiser_backend_id = model_backend_id(denoiser_model_id)
+        if denoiser_backend_id not in {"ffmpeg-video-denoise", "pytorch-image-denoise", "pytorch-video-denoise"}:
+            raise NotImplementedError(
+                f"Denoiser backend '{denoiser_backend_id}' is cataloged but not implemented in the worker pipeline"
+            )
     colorization_enabled = colorization_mode != "off"
     selected_color_reference_images = [str(path) for path in (color_reference_images or [])]
     colorizer_backend_id: str | None = None
@@ -2352,15 +2676,23 @@ def run_realesrgan_pipeline(
     requested_precision_mode = quality_policy["requestedPrecision"]
     selected_precision_mode = str(quality_policy["selectedPrecision"])
     precision_source = str(quality_policy["precisionSource"])
+    denoise_precision_mode = selected_precision_mode
+    if (
+        denoise_enabled
+        and denoiser_backend_id in {"pytorch-image-denoise", "pytorch-video-denoise"}
+        and precision_source != "explicit-request"
+        and selected_precision_mode == "fp32"
+    ):
+        denoise_precision_mode = "bf16"
     effective_precision_mode = selected_precision_mode
     fp16_enabled = selected_precision_mode == "fp16"
     bf16_enabled = selected_precision_mode == "bf16"
     resolved_pytorch_execution_path = _resolve_pytorch_execution_path(active_model_id, pytorch_execution_path)
+    if denoise_enabled and resolved_pytorch_execution_path == PYTORCH_EXECUTION_PATH_STREAMING:
+        raise NotImplementedError("Denoising currently runs on extracted frame directories; use the file-io execution path when denoise is enabled.")
     runtime = ensure_runtime_assets()
     metadata = probe_video(source_path)
     validate_interpolation_request(interpolation_mode, interpolation_target_fps)
-    if colorization_enabled and interpolation_mode != "off":
-        raise NotImplementedError("Colorization with interpolation is not implemented yet. Run colorization with interpolation disabled for now.")
     requested_output = Path(output_path)
     if not requested_output.is_absolute():
         requested_output = repo_root() / requested_output
@@ -2370,11 +2702,15 @@ def run_realesrgan_pipeline(
     jobs_root = repo_root() / "artifacts" / "jobs"
     jobs_root.mkdir(parents=True, exist_ok=True)
 
-    cache_key = job_id or hashlib.sha256(
+    resume_checkpoint_key = resume_from_job_id.strip() if resume_from_job_id and resume_from_job_id.strip() else None
+    active_job_id = job_id or resume_checkpoint_key
+    cache_key = resume_checkpoint_key or active_job_id or hashlib.sha256(
         "|".join(
             [
                 source_path,
                 model_id,
+                denoise_mode,
+                denoiser_model_id or "",
                 colorization_mode,
                 colorizer_model_id or "",
                 color_context_library_id or "",
@@ -2400,6 +2736,7 @@ def run_realesrgan_pipeline(
                 container,
                 str(tile_size),
                 selected_precision_mode,
+                denoise_precision_mode,
                 str(segment_duration_seconds or 0),
                 str(crf),
                 resolved_pytorch_execution_path or "external-executable",
@@ -2410,10 +2747,15 @@ def run_realesrgan_pipeline(
     ).hexdigest()[:12]
 
     work_dir = jobs_root / f"job_{cache_key}"
-    if work_dir.exists():
+    encoded_dir = work_dir / "enc"
+    resume_from_existing_work = bool(
+        resume_checkpoint_key is not None
+        and encoded_dir.exists()
+        and any(_segment_checkpoint_exists(segment_file) for segment_file in encoded_dir.glob(f"segment_*.{PIPELINE_INTERMEDIATE_CONTAINER}"))
+    )
+    if work_dir.exists() and not resume_from_existing_work:
         shutil.rmtree(work_dir)
     segment_root = work_dir / "segments"
-    encoded_dir = work_dir / "enc"
     segment_root.mkdir(parents=True, exist_ok=True)
     encoded_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2422,6 +2764,10 @@ def run_realesrgan_pipeline(
     model_name = model_label(active_model_id)
 
     log: list[str] = []
+    if resume_from_existing_work:
+        log.append(f"Resume checkpoint source: job_{resume_checkpoint_key}")
+    elif resume_checkpoint_key is not None:
+        log.append(f"No completed segment checkpoints found for job_{resume_checkpoint_key}; restarting cleanly")
     if color_context_library_id:
         log.append(f"Color context library: {color_context_library_id}")
     if selected_color_reference_images:
@@ -2472,6 +2818,8 @@ def run_realesrgan_pipeline(
     log.append(
         f"Quality preset policy: {preset} -> tile {effective_tile} and precision {selected_precision_mode} ({precision_source})."
     )
+    if denoise_enabled and denoiser_backend_id in {"pytorch-image-denoise", "pytorch-video-denoise"}:
+        log.append(f"AI denoise precision: {denoise_precision_mode}.")
     source_media = _build_pipeline_media_summary(
         width=int(metadata["width"]),
         height=int(metadata["height"]),
@@ -2494,11 +2842,24 @@ def run_realesrgan_pipeline(
         crop_width,
         crop_height,
     )
+    realesrgan_ncnn_scale = _resolve_realesrgan_ncnn_scale(
+        output_mode=output_mode,
+        source_width=int(metadata["width"]),
+        source_height=int(metadata["height"]),
+        target_width=resolved_width,
+        target_height=resolved_height,
+    )
     if colorization_mode == "colorizeOnly":
         resolved_width = int(metadata["width"])
         resolved_height = int(metadata["height"])
         resolved_aspect_ratio = float(resolved_width / max(1, resolved_height))
         filter_chain = None
+        realesrgan_ncnn_scale = 4
+
+    if backend_id == "realesrgan-ncnn" and realesrgan_ncnn_scale != 4:
+        log.append(
+            f"Real-ESRGAN NCNN output scale: {realesrgan_ncnn_scale}x for preserve-aspect {resolved_width}x{resolved_height} target."
+        )
 
     if interpolation_mode != "off":
         runtime.update(ensure_rife_runtime())
@@ -2541,7 +2902,7 @@ def run_realesrgan_pipeline(
             source_path=source_path,
             scratch_path=work_dir,
             output_path=output_file,
-            job_id=cache_key,
+            job_id=active_job_id or cache_key,
         )
         _write_progress(
             progress_path,
@@ -2554,6 +2915,8 @@ def run_realesrgan_pipeline(
         )
 
         loaded_model = None
+        loaded_colorizer = None
+        colorizer_runtime: dict[str, object] | None = None
         segment_outputs: list[Path | None] = [None] * len(interpolation_segments)
         concat_manifest = encoded_dir / "segments.txt"
         progress_lock = threading.Lock()
@@ -2597,12 +2960,38 @@ def run_realesrgan_pipeline(
                     progress_state=progress_state,
                     source_total_frames=total_frames,
                     interpolation_mode=interpolation_mode,
+                    denoise_mode=denoise_mode,
+                    colorization_mode=colorization_mode,
                     telemetry_state=telemetry_state,
                 )
 
         def preprocess_worker() -> None:
-            nonlocal loaded_model, model_runtime
+            nonlocal loaded_model, loaded_colorizer, model_runtime, effective_precision_mode
             try:
+                if colorization_enabled:
+                    from upscaler_worker.models.colorizers import colorize_directory, load_runtime_colorizer
+
+                    loaded_colorizer = load_runtime_colorizer(
+                        colorizer_model_id,
+                        gpu_id,
+                        selected_precision_mode,
+                        log,
+                        reference_image_paths=selected_color_reference_images,
+                        deepremaster_processing_mode=deepremaster_processing_mode,
+                    )
+                    colorizer_model_ref = getattr(loaded_colorizer, "repo_id", None)
+                    if colorizer_model_ref is None:
+                        colorizer_model_ref = str(getattr(loaded_colorizer, "checkpoint_path", "")) or None
+                    colorizer_runtime = {
+                        "runner": "torch",
+                        "precision": loaded_colorizer.precision_mode,
+                        "repoId": colorizer_model_ref,
+                        "inputSize": getattr(loaded_colorizer, "input_size", None),
+                    }
+                    if colorization_mode == "colorizeOnly":
+                        model_runtime = dict(colorizer_runtime)
+                        effective_precision_mode = loaded_colorizer.precision_mode
+
                 if interpolation_mode == "afterUpscale" and backend_id == "pytorch-image-sr":
                     from upscaler_worker.models.pytorch_sr import load_runtime_model
 
@@ -2650,10 +3039,45 @@ def run_realesrgan_pipeline(
                     )
                     segment_dir = segment_root / f"segment_{active_segment_plan.index:04d}"
                     segment_input_dir = segment_dir / "in"
+                    segment_denoised_dir = segment_dir / "denoised"
+                    segment_colorized_dir = segment_dir / "colorized"
                     segment_upscaled_dir = segment_dir / "upscaled"
                     segment_interpolated_dir = segment_dir / "interpolated"
                     segment_file = encoded_dir / f"segment_{active_segment_plan.index:04d}.{PIPELINE_INTERMEDIATE_CONTAINER}"
                     frame_stage_output_dir = segment_input_dir
+
+                    if _segment_checkpoint_exists(segment_file) and _validate_segment_visual_integrity(str(ffmpeg), segment_file, log):
+                        segment_outputs[active_segment_plan.index] = segment_file
+                        with progress_lock:
+                            progress_state.extracted_frames = min(total_frames, progress_state.extracted_frames + active_segment_plan.source_frame_count)
+                            if denoise_enabled:
+                                progress_state.denoised_frames = min(total_frames, progress_state.denoised_frames + active_segment_plan.source_frame_count)
+                            if colorization_enabled:
+                                progress_state.colorized_frames = min(total_frames, progress_state.colorized_frames + active_segment_plan.source_frame_count)
+                            if interpolation_mode == "afterUpscale":
+                                progress_state.upscaled_frames = min(total_frames, progress_state.upscaled_frames + active_segment_plan.source_frame_count)
+                            progress_state.interpolated_frames = min(total_output_frames, progress_state.interpolated_frames + active_segment_plan.output_frame_count)
+                            progress_state.encoded_frames = min(total_output_frames, progress_state.encoded_frames + active_segment_plan.output_frame_count)
+                            _set_segment_progress(
+                                telemetry_state,
+                                segment_index=active_segment_plan.index + 1,
+                                segment_count=len(interpolation_segments),
+                                segment_processed_frames=active_segment_plan.output_frame_count,
+                                segment_total_frames=active_segment_plan.output_frame_count,
+                            )
+                        log.append(f"Resumed from checkpoint: encoded segment {active_segment_plan.index + 1}/{len(interpolation_segments)} at {segment_file}")
+                        _publish_progress(
+                            "encoding",
+                            f"Resumed encoded segment {active_segment_plan.index + 1}/{len(interpolation_segments)} ({progress_state.encoded_frames}/{total_output_frames} frames)",
+                        )
+                        continue
+
+                    if _segment_checkpoint_exists(segment_file):
+                        log.append(f"Discarding invalid checkpoint for segment {active_segment_plan.index + 1}/{len(interpolation_segments)} at {segment_file}")
+                        _clear_incomplete_segment_work(segment_dir, segment_file)
+
+                    if resume_from_existing_work:
+                        _clear_incomplete_segment_work(segment_dir, segment_file)
 
                     with progress_lock:
                         _set_segment_progress(
@@ -2721,6 +3145,137 @@ def run_realesrgan_pipeline(
                         f"Extracted segment {active_segment_plan.index + 1}/{len(interpolation_segments)} ({extracted_snapshot}/{total_frames} source frames)",
                     )
 
+                    if denoise_enabled and denoiser_model_id:
+                        with progress_lock:
+                            denoised_before_segment = progress_state.denoised_frames
+                            _set_segment_progress(
+                                telemetry_state,
+                                segment_index=active_segment_plan.index + 1,
+                                segment_count=len(interpolation_segments),
+                                segment_processed_frames=0,
+                                segment_total_frames=active_segment_plan.source_frame_count,
+                            )
+                        _publish_progress(
+                            "denoising",
+                            f"Denoising segment {active_segment_plan.index + 1}/{len(interpolation_segments)} (0/{active_segment_plan.source_frame_count} frames)",
+                        )
+
+                        def report_denoise_progress(processed_in_segment: int, total_in_segment: int) -> None:
+                            processed_without_overlap = max(0, processed_in_segment - active_segment_plan.overlap_before_frames)
+                            unique_processed = min(active_segment_plan.source_frame_count, processed_without_overlap)
+                            with progress_lock:
+                                progress_state.denoised_frames = min(total_frames, denoised_before_segment + unique_processed)
+                                _set_segment_progress(
+                                    telemetry_state,
+                                    segment_index=active_segment_plan.index + 1,
+                                    segment_count=len(interpolation_segments),
+                                    segment_processed_frames=unique_processed,
+                                    segment_total_frames=active_segment_plan.source_frame_count,
+                                )
+                            _publish_progress(
+                                "denoising",
+                                f"Denoising segment {active_segment_plan.index + 1}/{len(interpolation_segments)} ({unique_processed}/{active_segment_plan.source_frame_count} frames)",
+                            )
+
+                        denoise_stage_started_at = time.time()
+                        denoised_count = _denoise_segment(
+                            runtime=runtime,
+                            input_dir=segment_input_dir,
+                            output_dir=segment_denoised_dir,
+                            model_id=denoiser_model_id,
+                            gpu_id=gpu_id,
+                            precision=denoise_precision_mode,
+                            log=log,
+                            cancel_path=cancel_path,
+                            pause_path=pause_path,
+                            progress_callback=report_denoise_progress,
+                        )
+                        if denoised_count != active_segment_plan.expanded_frame_count:
+                            raise RuntimeError(
+                                f"Expected {active_segment_plan.expanded_frame_count} denoised frames for segment {active_segment_plan.index + 1}, received {denoised_count}"
+                            )
+                        with progress_lock:
+                            _record_stage_duration(telemetry_state, "denoise", time.time() - denoise_stage_started_at)
+                            progress_state.denoised_frames = min(total_frames, denoised_before_segment + active_segment_plan.source_frame_count)
+                            denoised_snapshot = progress_state.denoised_frames
+                            _set_segment_progress(
+                                telemetry_state,
+                                segment_index=active_segment_plan.index + 1,
+                                segment_count=len(interpolation_segments),
+                                segment_processed_frames=active_segment_plan.source_frame_count,
+                                segment_total_frames=active_segment_plan.source_frame_count,
+                            )
+                        _publish_progress(
+                            "denoising",
+                            f"Denoised segment {active_segment_plan.index + 1}/{len(interpolation_segments)} ({denoised_snapshot}/{total_frames} source frames)",
+                        )
+                        frame_stage_output_dir = segment_denoised_dir
+
+                    if colorization_enabled:
+                        with progress_lock:
+                            colorized_before_segment = progress_state.colorized_frames
+                            _set_segment_progress(
+                                telemetry_state,
+                                segment_index=active_segment_plan.index + 1,
+                                segment_count=len(interpolation_segments),
+                                segment_processed_frames=0,
+                                segment_total_frames=active_segment_plan.source_frame_count,
+                            )
+                        _publish_progress(
+                            "colorizing",
+                            f"Colorizing segment {active_segment_plan.index + 1}/{len(interpolation_segments)} (0/{active_segment_plan.source_frame_count} frames)",
+                        )
+
+                        def report_colorize_progress(processed_in_segment: int, total_in_segment: int) -> None:
+                            processed_without_overlap = max(0, processed_in_segment - active_segment_plan.overlap_before_frames)
+                            unique_processed = min(active_segment_plan.source_frame_count, processed_without_overlap)
+                            with progress_lock:
+                                current_colorized_frames = min(total_frames, colorized_before_segment + unique_processed)
+                                _set_segment_progress(
+                                    telemetry_state,
+                                    segment_index=active_segment_plan.index + 1,
+                                    segment_count=len(interpolation_segments),
+                                    segment_processed_frames=unique_processed,
+                                    segment_total_frames=active_segment_plan.source_frame_count,
+                                )
+                            _publish_progress(
+                                "colorizing",
+                                f"Colorizing segment {active_segment_plan.index + 1}/{len(interpolation_segments)} ({unique_processed}/{active_segment_plan.source_frame_count} frames)",
+                            )
+
+                        colorize_stage_started_at = time.time()
+                        colorized_count = colorize_directory(
+                            loaded_model=loaded_colorizer,
+                            input_dir=frame_stage_output_dir,
+                            output_dir=segment_colorized_dir,
+                            cancel_path=cancel_path,
+                            pause_path=pause_path,
+                            progress_callback=report_colorize_progress,
+                        )
+                        if colorized_count != active_segment_plan.expanded_frame_count:
+                            raise RuntimeError(
+                                f"Expected {active_segment_plan.expanded_frame_count} colorized frames for segment {active_segment_plan.index + 1}, received {colorized_count}"
+                            )
+                        with progress_lock:
+                            _record_stage_duration(telemetry_state, "colorize", time.time() - colorize_stage_started_at)
+                            progress_state.colorized_frames = min(total_frames, colorized_before_segment + active_segment_plan.source_frame_count)
+                            colorized_snapshot = progress_state.colorized_frames
+                            _set_segment_progress(
+                                telemetry_state,
+                                segment_index=active_segment_plan.index + 1,
+                                segment_count=len(interpolation_segments),
+                                segment_processed_frames=active_segment_plan.source_frame_count,
+                                segment_total_frames=active_segment_plan.source_frame_count,
+                            )
+                        _publish_progress(
+                            "colorizing",
+                            f"Colorized segment {active_segment_plan.index + 1}/{len(interpolation_segments)} ({colorized_snapshot}/{total_frames} source frames)",
+                        )
+                        frame_stage_output_dir = segment_colorized_dir
+                    else:
+                        with progress_lock:
+                            colorized_snapshot = progress_state.colorized_frames
+
                     if interpolation_mode == "afterUpscale":
                         with progress_lock:
                             upscaled_before_segment = progress_state.upscaled_frames
@@ -2752,11 +3307,12 @@ def run_realesrgan_pipeline(
                         if backend_id == "realesrgan-ncnn":
                             upscaled_count = _upscale_ncnn_segment(
                                 runtime=runtime,
-                                input_dir=segment_input_dir,
+                                input_dir=frame_stage_output_dir,
                                 output_dir=segment_upscaled_dir,
                                 model_id=model_id,
                                 gpu_id=gpu_id,
                                 effective_tile=effective_tile,
+                                upscale_scale=realesrgan_ncnn_scale,
                                 log=log,
                                 cancel_path=cancel_path,
                                 pause_path=pause_path,
@@ -2765,7 +3321,7 @@ def run_realesrgan_pipeline(
                         elif backend_id == "pytorch-image-sr":
                             upscaled_count = _upscale_pytorch_segment(
                                 loaded_model=loaded_model,
-                                input_dir=segment_input_dir,
+                                input_dir=frame_stage_output_dir,
                                 output_dir=segment_upscaled_dir,
                                 effective_tile=effective_tile,
                                 cancel_path=cancel_path,
@@ -2774,7 +3330,7 @@ def run_realesrgan_pipeline(
                             )
                         elif backend_id == "pytorch-video-sr":
                             upscaled_count, external_runtime = _upscale_external_video_segment(
-                                input_dir=segment_input_dir,
+                                input_dir=frame_stage_output_dir,
                                 output_dir=segment_upscaled_dir,
                                 model_id=model_id,
                                 effective_tile=effective_tile,
@@ -2891,9 +3447,10 @@ def run_realesrgan_pipeline(
                             frame_limit=frame_limit,
                             segment_total_frames=active_segment_plan.output_frame_count,
                             extracted_frames=extracted_snapshot,
+                            colorized_frames=colorized_snapshot,
                             upscaled_frames=upscaled_snapshot,
                             interpolated_frames=interpolated_snapshot,
-                            cleanup_paths=(segment_input_dir, segment_upscaled_dir, segment_interpolated_dir),
+                            cleanup_paths=(segment_input_dir, segment_denoised_dir, segment_colorized_dir, segment_upscaled_dir, segment_interpolated_dir),
                         ),
                     )
             except BaseException as error:  # noqa: BLE001
@@ -2903,6 +3460,10 @@ def run_realesrgan_pipeline(
                     import torch
 
                     torch.cuda.synchronize(loaded_model.device)
+                if loaded_colorizer is not None and getattr(loaded_colorizer.device, "type", "cpu") == "cuda":
+                    import torch
+
+                    torch.cuda.synchronize(loaded_colorizer.device)
                 _queue_put(encode_queue, sentinel)
 
         def encoder_worker() -> None:
@@ -2952,11 +3513,12 @@ def run_realesrgan_pipeline(
                         pause_path=pause_path,
                         total_frames=total_output_frames,
                         extracted_frames=item.extracted_frames,
-                        colorized_frames=0,
+                        colorized_frames=item.colorized_frames,
                         upscaled_frames=item.upscaled_frames,
                         interpolated_frames=item.interpolated_frames,
                         encoded_frames_before_segment=encoded_before_segment,
                         telemetry_state=telemetry_state,
+                        validate_visual_integrity=not preview_mode,
                     )
                     for cleanup_path in item.cleanup_paths:
                         shutil.rmtree(cleanup_path, ignore_errors=True)
@@ -3008,7 +3570,8 @@ def run_realesrgan_pipeline(
                 pause_path=pause_path,
                 total_frames=total_output_frames,
                 extracted_frames=progress_state.extracted_frames,
-                colorized_frames=0,
+                denoised_frames=progress_state.denoised_frames,
+                colorized_frames=progress_state.colorized_frames,
                 upscaled_frames=progress_state.upscaled_frames,
                 interpolated_frames=progress_state.interpolated_frames,
                 encoded_frames=progress_state.encoded_frames,
@@ -3068,6 +3631,7 @@ def run_realesrgan_pipeline(
                 total_frames=total_output_frames,
                 message_prefix="Remuxing original audio",
                 extracted_frames=progress_state.extracted_frames,
+                denoised_frames=progress_state.denoised_frames,
                 colorized_frames=progress_state.colorized_frames,
                 upscaled_frames=progress_state.upscaled_frames,
                 interpolated_frames=progress_state.interpolated_frames,
@@ -3099,6 +3663,7 @@ def run_realesrgan_pipeline(
                 total_frames=total_output_frames,
                 message_prefix="Finalizing video output",
                 extracted_frames=progress_state.extracted_frames,
+                denoised_frames=progress_state.denoised_frames,
                 colorized_frames=progress_state.colorized_frames,
                 upscaled_frames=progress_state.upscaled_frames,
                 interpolated_frames=progress_state.interpolated_frames,
@@ -3117,6 +3682,7 @@ def run_realesrgan_pipeline(
             processed_frames=total_output_frames,
             total_frames=total_output_frames,
             extracted_frames=progress_state.extracted_frames,
+            denoised_frames=progress_state.denoised_frames,
             colorized_frames=progress_state.colorized_frames,
             upscaled_frames=progress_state.upscaled_frames,
             interpolated_frames=progress_state.interpolated_frames,
@@ -3126,9 +3692,7 @@ def run_realesrgan_pipeline(
         )
 
         silent_video.unlink(missing_ok=True)
-        for segment_file in segment_files:
-            segment_file.unlink(missing_ok=True)
-        concat_manifest.unlink(missing_ok=True)
+        log.append(f"Preserved {len(segment_files)} encoded segment checkpoints for recovery in {encoded_dir}")
         total_elapsed_seconds = max(0.0, time.time() - telemetry_state.started_at)
         resolved_frame_count = max(
             1,
@@ -3192,6 +3756,8 @@ def run_realesrgan_pipeline(
             "runtime": runtime,
             "stageTimings": {
                 "extractSeconds": telemetry_state.extract_stage_seconds,
+                "denoiseSeconds": telemetry_state.denoise_stage_seconds,
+                "colorizeSeconds": telemetry_state.colorize_stage_seconds,
                 "upscaleSeconds": telemetry_state.upscale_stage_seconds,
                 "interpolateSeconds": telemetry_state.interpolate_stage_seconds,
                 "encodeSeconds": telemetry_state.encode_stage_seconds,
@@ -3209,7 +3775,9 @@ def run_realesrgan_pipeline(
             "segmentCount": len(interpolation_segments),
             "segmentFrameLimit": segment_frame_limit,
             "log": log + [
-                f"Model: {model_name} ({model_id})",
+                f"Model: {model_name} ({active_model_id})",
+                *( [f"Denoiser: {model_label(denoiser_model_id)} ({denoiser_model_id})"] if denoise_enabled and denoiser_model_id else [] ),
+                *( [f"Colorizer: {model_label(colorizer_model_id)} ({colorizer_model_id})"] if colorization_enabled and colorizer_model_id else [] ),
                 f"Interpolation mode: {interpolation_mode}",
                 f"Resolved output fps: {encode_fps}",
                 f"Resolved output canvas: {encode_width}x{encode_height}",
@@ -3218,7 +3786,7 @@ def run_realesrgan_pipeline(
                 f"Processed duration: {effective_duration:.2f}s",
                 f"Average throughput: {average_throughput:.2f} fps",
                 f"Rolling throughput: {(telemetry_state.resources.rolling_frames_per_second or 0.0):.2f} fps",
-                f"Stage timings: extract {telemetry_state.extract_stage_seconds:.2f}s, upscale {telemetry_state.upscale_stage_seconds:.2f}s, interpolate {telemetry_state.interpolate_stage_seconds:.2f}s, encode {telemetry_state.encode_stage_seconds:.2f}s, remux {telemetry_state.remux_stage_seconds:.2f}s",
+                f"Stage timings: extract {telemetry_state.extract_stage_seconds:.2f}s, denoise {telemetry_state.denoise_stage_seconds:.2f}s, colorize {telemetry_state.colorize_stage_seconds:.2f}s, upscale {telemetry_state.upscale_stage_seconds:.2f}s, interpolate {telemetry_state.interpolate_stage_seconds:.2f}s, encode {telemetry_state.encode_stage_seconds:.2f}s, remux {telemetry_state.remux_stage_seconds:.2f}s",
             ],
         }
 
@@ -3228,7 +3796,7 @@ def run_realesrgan_pipeline(
         source_path=source_path,
         scratch_path=work_dir,
         output_path=output_file,
-        job_id=cache_key,
+        job_id=active_job_id or cache_key,
     )
     progress_lock = threading.Lock()
     _write_progress(
@@ -3281,6 +3849,7 @@ def run_realesrgan_pipeline(
                 message=message,
                 total_frames=total_frames,
                 progress_state=progress_state,
+                    denoise_mode=denoise_mode,
                 colorization_mode=colorization_mode,
                 telemetry_state=telemetry_state,
             )
@@ -3290,6 +3859,39 @@ def run_realesrgan_pipeline(
             for segment in segments:
                 if stop_event.is_set():
                     break
+                segment_dir = segment_root / f"segment_{segment.index:04d}"
+                segment_file = encoded_dir / f"segment_{segment.index:04d}.{PIPELINE_INTERMEDIATE_CONTAINER}"
+                if _segment_checkpoint_exists(segment_file) and _validate_segment_visual_integrity(str(ffmpeg), segment_file, log):
+                    segment_outputs[segment.index] = segment_file
+                    with progress_lock:
+                        progress_state.extracted_frames = min(total_frames, progress_state.extracted_frames + segment.frame_count)
+                        if denoise_enabled:
+                            progress_state.denoised_frames = min(total_frames, progress_state.denoised_frames + segment.frame_count)
+                        if colorization_enabled:
+                            progress_state.colorized_frames = min(total_frames, progress_state.colorized_frames + segment.frame_count)
+                        if colorization_mode != "colorizeOnly":
+                            progress_state.upscaled_frames = min(total_frames, progress_state.upscaled_frames + segment.frame_count)
+                        progress_state.encoded_frames = min(total_frames, progress_state.encoded_frames + segment.frame_count)
+                        _set_segment_progress(
+                            telemetry_state,
+                            segment_index=segment.index + 1,
+                            segment_count=len(segments),
+                            segment_processed_frames=segment.frame_count,
+                            segment_total_frames=segment.frame_count,
+                        )
+                    log.append(f"Resumed from checkpoint: encoded segment {segment.index + 1}/{len(segments)} at {segment_file}")
+                    _publish_progress(
+                        "encoding",
+                        f"Resumed encoded segment {segment.index + 1}/{len(segments)} ({progress_state.encoded_frames}/{total_frames} frames)",
+                    )
+                    continue
+
+                if _segment_checkpoint_exists(segment_file):
+                    log.append(f"Discarding invalid checkpoint for segment {segment.index + 1}/{len(segments)} at {segment_file}")
+                    _clear_incomplete_segment_work(segment_dir, segment_file)
+
+                if resume_from_existing_work:
+                    _clear_incomplete_segment_work(segment_dir, segment_file)
                 with progress_lock:
                     _set_segment_progress(
                         telemetry_state,
@@ -3302,7 +3904,7 @@ def run_realesrgan_pipeline(
                     "extracting",
                     f"Extracting segment {segment.index + 1}/{len(segments)} (0/{segment.frame_count} frames)",
                 )
-                segment_input_dir = segment_root / f"segment_{segment.index:04d}" / "in"
+                segment_input_dir = segment_dir / "in"
                 stage_started_at = time.time()
                 extracted_count = _extract_segment_frames(
                     ffmpeg=str(ffmpeg),
@@ -3419,10 +4021,70 @@ def run_realesrgan_pipeline(
 
                 segment_dir = segment_root / f"segment_{segment.index:04d}"
                 segment_input_dir = segment_dir / "in"
+                segment_denoised_dir = segment_dir / "denoised"
                 segment_colorized_dir = segment_dir / "colorized"
                 segment_output_dir = segment_dir / "out"
                 stage_input_dir = segment_input_dir
                 stage_started_at = time.time()
+
+                if denoise_enabled and denoiser_model_id:
+                    with progress_lock:
+                        denoised_before_segment = progress_state.denoised_frames
+                        _set_segment_progress(
+                            telemetry_state,
+                            segment_index=segment.index + 1,
+                            segment_count=len(segments),
+                            segment_processed_frames=0,
+                            segment_total_frames=segment.frame_count,
+                        )
+                    _publish_progress(
+                        "denoising",
+                        f"Denoising segment {segment.index + 1}/{len(segments)} (0/{segment.frame_count} frames)",
+                    )
+
+                    def report_denoise_progress(processed_in_segment: int, total_in_segment: int) -> None:
+                        with progress_lock:
+                            progress_state.denoised_frames = min(total_frames, denoised_before_segment + processed_in_segment)
+                            _set_segment_progress(
+                                telemetry_state,
+                                segment_index=segment.index + 1,
+                                segment_count=len(segments),
+                                segment_processed_frames=processed_in_segment,
+                                segment_total_frames=total_in_segment,
+                            )
+                        _publish_progress(
+                            "denoising",
+                            f"Denoising segment {segment.index + 1}/{len(segments)} ({processed_in_segment}/{total_in_segment} frames)",
+                        )
+
+                    denoise_stage_started_at = time.time()
+                    denoised_count = _denoise_segment(
+                        runtime=runtime,
+                        input_dir=stage_input_dir,
+                        output_dir=segment_denoised_dir,
+                        model_id=denoiser_model_id,
+                        gpu_id=gpu_id,
+                        precision=denoise_precision_mode,
+                        log=log,
+                        cancel_path=cancel_path,
+                        pause_path=pause_path,
+                        progress_callback=report_denoise_progress,
+                    )
+                    with progress_lock:
+                        _record_stage_duration(telemetry_state, "denoise", time.time() - denoise_stage_started_at)
+                        progress_state.denoised_frames = min(total_frames, denoised_before_segment + denoised_count)
+                        _set_segment_progress(
+                            telemetry_state,
+                            segment_index=segment.index + 1,
+                            segment_count=len(segments),
+                            segment_processed_frames=denoised_count,
+                            segment_total_frames=segment.frame_count,
+                        )
+                    _publish_progress(
+                        "denoising",
+                        f"Denoised segment {segment.index + 1}/{len(segments)} ({progress_state.denoised_frames}/{total_frames} frames)",
+                    )
+                    stage_input_dir = segment_denoised_dir
 
                 if colorization_enabled:
                     with progress_lock:
@@ -3457,7 +4119,7 @@ def run_realesrgan_pipeline(
                     colorize_stage_started_at = time.time()
                     colorized_count = colorize_directory(
                         loaded_model=loaded_colorizer,
-                        input_dir=segment_input_dir,
+                        input_dir=stage_input_dir,
                         output_dir=segment_colorized_dir,
                         cancel_path=cancel_path,
                         pause_path=pause_path,
@@ -3521,6 +4183,7 @@ def run_realesrgan_pipeline(
                             model_id=model_id,
                             gpu_id=gpu_id,
                             effective_tile=effective_tile,
+                            upscale_scale=realesrgan_ncnn_scale,
                             log=log,
                             cancel_path=cancel_path,
                             pause_path=pause_path,
@@ -3615,6 +4278,8 @@ def run_realesrgan_pipeline(
                     segment_output_dir = stage_input_dir
 
                 shutil.rmtree(segment_input_dir, ignore_errors=True)
+                if denoise_enabled:
+                    shutil.rmtree(segment_denoised_dir, ignore_errors=True)
                 if stage_input_dir != segment_input_dir and colorization_mode != "colorizeOnly":
                     shutil.rmtree(stage_input_dir, ignore_errors=True)
                 _queue_put(encode_queue, (segment, segment_output_dir))
@@ -3676,11 +4341,13 @@ def run_realesrgan_pipeline(
                         pause_path=pause_path,
                     total_frames=total_frames,
                     extracted_frames=progress_state.extracted_frames,
+                    denoised_frames=progress_state.denoised_frames,
                     colorized_frames=progress_state.colorized_frames,
                     upscaled_frames=progress_state.upscaled_frames,
                     interpolated_frames=progress_state.interpolated_frames,
                     encoded_frames_before_segment=progress_state.encoded_frames,
                     telemetry_state=telemetry_state,
+                    validate_visual_integrity=not preview_mode,
                 )
                 shutil.rmtree(segment_output_dir, ignore_errors=True)
                 segment_outputs[segment.index] = segment_file
@@ -3810,6 +4477,7 @@ def run_realesrgan_pipeline(
             pause_path=pause_path,
             total_frames=total_frames,
             extracted_frames=progress_state.extracted_frames,
+            denoised_frames=progress_state.denoised_frames,
             colorized_frames=progress_state.colorized_frames,
             upscaled_frames=progress_state.upscaled_frames,
             interpolated_frames=progress_state.interpolated_frames,
@@ -3866,6 +4534,7 @@ def run_realesrgan_pipeline(
             total_frames=total_frames,
             message_prefix="Remuxing original audio",
             extracted_frames=progress_state.extracted_frames,
+            denoised_frames=progress_state.denoised_frames,
             colorized_frames=progress_state.colorized_frames,
             upscaled_frames=progress_state.upscaled_frames,
             interpolated_frames=progress_state.interpolated_frames,
@@ -3898,6 +4567,7 @@ def run_realesrgan_pipeline(
             total_frames=total_frames,
             message_prefix="Finalizing video output",
             extracted_frames=progress_state.extracted_frames,
+            denoised_frames=progress_state.denoised_frames,
             colorized_frames=progress_state.colorized_frames,
             upscaled_frames=progress_state.upscaled_frames,
             interpolated_frames=progress_state.interpolated_frames,
@@ -3917,6 +4587,7 @@ def run_realesrgan_pipeline(
         processed_frames=total_frames,
         total_frames=total_frames,
         extracted_frames=progress_state.extracted_frames,
+        denoised_frames=progress_state.denoised_frames,
         colorized_frames=progress_state.colorized_frames,
         upscaled_frames=progress_state.upscaled_frames,
         encoded_frames=progress_state.encoded_frames,
@@ -3925,9 +4596,7 @@ def run_realesrgan_pipeline(
     )
 
     if concat_manifest is not None:
-        for segment_file in segment_files:
-            Path(segment_file).unlink(missing_ok=True)
-        concat_manifest.unlink(missing_ok=True)
+        log.append(f"Preserved {len(segment_files)} encoded segment checkpoints for recovery in {encoded_dir}")
     silent_video.unlink(missing_ok=True)
 
     total_elapsed_seconds = max(0.0, time.time() - telemetry_state.started_at)
@@ -3981,6 +4650,7 @@ def run_realesrgan_pipeline(
         "runtime": runtime,
         "stageTimings": {
             "extractSeconds": telemetry_state.extract_stage_seconds,
+            "denoiseSeconds": telemetry_state.denoise_stage_seconds,
             "colorizeSeconds": telemetry_state.colorize_stage_seconds,
             "upscaleSeconds": telemetry_state.upscale_stage_seconds,
             "interpolateSeconds": telemetry_state.interpolate_stage_seconds,
@@ -4000,6 +4670,7 @@ def run_realesrgan_pipeline(
         "segmentFrameLimit": segment_frame_limit,
         "log": log + [
             f"Model: {model_name} ({active_model_id})",
+            *( [f"Denoiser: {model_label(denoiser_model_id)} ({denoiser_model_id})"] if denoise_enabled and denoiser_model_id else [] ),
             *( [f"Colorizer: {model_label(colorizer_model_id)} ({colorizer_model_id})"] if colorization_enabled and colorizer_model_id else [] ),
             f"Execution path: {resolved_pytorch_execution_path or ('realesrgan-ncnn-vulkan' if backend_id == 'realesrgan-ncnn' else 'file-io' if backend_id == 'pytorch-image-colorization' else 'external-command')}",
             f"Runner: {str(model_runtime.get('runner')) if isinstance(model_runtime, dict) and model_runtime.get('runner') else ('ncnn-vulkan' if backend_id == 'realesrgan-ncnn' else 'torch' if backend_id == 'pytorch-image-colorization' else pytorch_runner or 'torch')}",
@@ -4013,6 +4684,6 @@ def run_realesrgan_pipeline(
             f"Processed duration: {effective_duration:.2f}s",
             f"Average throughput: {average_throughput:.2f} fps",
             f"Rolling throughput: {(telemetry_state.resources.rolling_frames_per_second or 0.0):.2f} fps",
-            f"Stage timings: extract {telemetry_state.extract_stage_seconds:.2f}s, colorize {telemetry_state.colorize_stage_seconds:.2f}s, upscale {telemetry_state.upscale_stage_seconds:.2f}s, interpolate {telemetry_state.interpolate_stage_seconds:.2f}s, encode {telemetry_state.encode_stage_seconds:.2f}s, remux {telemetry_state.remux_stage_seconds:.2f}s",
+            f"Stage timings: extract {telemetry_state.extract_stage_seconds:.2f}s, denoise {telemetry_state.denoise_stage_seconds:.2f}s, colorize {telemetry_state.colorize_stage_seconds:.2f}s, upscale {telemetry_state.upscale_stage_seconds:.2f}s, interpolate {telemetry_state.interpolate_stage_seconds:.2f}s, encode {telemetry_state.encode_stage_seconds:.2f}s, remux {telemetry_state.remux_stage_seconds:.2f}s",
         ],
     }

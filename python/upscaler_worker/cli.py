@@ -6,6 +6,8 @@ from pathlib import Path
 
 from upscaler_worker.benchmark import benchmark_fixture, compare_precision_quality, _parse_tile_sizes
 from upscaler_worker.benchmark_pytorch_pipeline_paths import benchmark_pytorch_pipeline_paths, _parse_execution_paths
+from upscaler_worker.caption_removal import remove_hard_captions
+from upscaler_worker.denoise_comparison import compare_denoisers
 from upscaler_worker.media import convert_source_to_mp4, probe_video
 from upscaler_worker.model_catalog import model_catalog, model_backend_id, model_research_runtime, model_runtime_asset
 from upscaler_worker.models.pytorch_sr import ensure_model_checkpoint
@@ -79,10 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser("prepare-realesrgan-job")
     prepare.add_argument("--source", required=True)
     prepare.add_argument("--model-id", default="realesrgan-x4plus")
+    prepare.add_argument("--denoise-mode", choices=["off", "beforeEnhance"], default="off")
+    prepare.add_argument("--denoiser-model-id")
     prepare.add_argument("--colorization-mode", choices=["off", "colorizeOnly", "beforeUpscale"], default="off")
     prepare.add_argument("--colorizer-model-id")
     prepare.add_argument("--color-context-library-id")
     prepare.add_argument("--color-reference-image", action="append", default=[])
+    prepare.add_argument("--deepremaster-processing-mode", choices=["standard", "high"], default="standard")
     prepare.add_argument("--output-mode", required=True)
     prepare.add_argument("--preset", required=True)
     prepare.add_argument("--interpolation-mode", choices=["off", "afterUpscale", "interpolateOnly"], default="off")
@@ -134,6 +139,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_job = subparsers.add_parser("run-realesrgan-pipeline")
     run_job.add_argument("--source", required=True)
     run_job.add_argument("--model-id", default="realesrgan-x4plus")
+    run_job.add_argument("--denoise-mode", choices=["off", "beforeEnhance"], default="off")
+    run_job.add_argument("--denoiser-model-id")
     run_job.add_argument("--colorization-mode", choices=["off", "colorizeOnly", "beforeUpscale"], default="off")
     run_job.add_argument("--colorizer-model-id")
     run_job.add_argument("--color-context-library-id")
@@ -155,6 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_job.add_argument("--crop-width", type=float)
     run_job.add_argument("--crop-height", type=float)
     run_job.add_argument("--job-id")
+    run_job.add_argument("--resume-from-job-id")
     run_job.add_argument("--progress-path")
     run_job.add_argument("--cancel-path")
     run_job.add_argument("--pause-path")
@@ -230,6 +238,40 @@ def build_parser() -> argparse.ArgumentParser:
     path_benchmark.add_argument("--target-width", type=int, default=640)
     path_benchmark.add_argument("--target-height", type=int, default=360)
 
+    denoise_compare = subparsers.add_parser("compare-denoisers")
+    denoise_compare.add_argument("--source", required=True)
+    denoise_compare.add_argument("--output-dir", default="artifacts/outputs")
+    denoise_compare.add_argument("--work-dir", default="artifacts/runtime/denoise-comparison")
+    denoise_compare.add_argument("--start-seconds", type=float, default=120.0)
+    denoise_compare.add_argument("--duration-seconds", type=float, default=4.0)
+    denoise_compare.add_argument("--fps", type=int, default=12)
+    denoise_compare.add_argument("--model-id", action="append", dest="model_ids")
+    denoise_compare.add_argument("--include-ai", action="store_true")
+    denoise_compare.add_argument("--gpu-id", type=int)
+    denoise_compare.add_argument("--precision", default="fp32", choices=["fp32", "fp16", "bf16"])
+    denoise_compare.add_argument("--keep-work-dir", action="store_true")
+    denoise_compare.add_argument("--control-safe-bottom-pixels", type=int, default=120)
+
+    caption_remove = subparsers.add_parser("remove-hard-captions")
+    caption_remove.add_argument("--source", required=True)
+    caption_remove.add_argument("--output-dir", default="artifacts/outputs")
+    caption_remove.add_argument("--work-dir", default="artifacts/runtime/caption-removal")
+    caption_remove.add_argument("--start-seconds", type=float, default=0.0)
+    caption_remove.add_argument("--duration-seconds", type=float, default=4.0)
+    caption_remove.add_argument("--fps", type=int, default=12)
+    caption_remove.add_argument("--bottom-region-fraction", type=float, default=0.42)
+    caption_remove.add_argument("--light-threshold", type=int, default=185)
+    caption_remove.add_argument("--color-hue-min", type=int, default=18)
+    caption_remove.add_argument("--color-hue-max", type=int, default=95)
+    caption_remove.add_argument("--mask-dilate-pixels", type=int, default=5)
+    caption_remove.add_argument("--line-box-padding-pixels", type=int, default=0)
+    caption_remove.add_argument("--line-box-max-gap-pixels", type=int, default=0)
+    caption_remove.add_argument("--temporal-radius", type=int, default=1)
+    caption_remove.add_argument("--inpaint-radius", type=float, default=3.0)
+    caption_remove.add_argument("--inpaint-method", default="telea", choices=["telea", "ns"])
+    caption_remove.add_argument("--keep-work-dir", action="store_true")
+    caption_remove.add_argument("--control-safe-bottom-pixels", type=int, default=120)
+
     av_fixture = subparsers.add_parser("generate-av-sync-fixture")
     av_fixture.add_argument("--output-path", required=True)
     av_fixture.add_argument("--duration-seconds", type=float, default=7200.0)
@@ -266,6 +308,8 @@ def main() -> int:
         result = build_realesrgan_job_plan(
             source_path=args.source,
             model_id=args.model_id,
+            denoise_mode=args.denoise_mode,
+            denoiser_model_id=args.denoiser_model_id,
             colorization_mode=args.colorization_mode,
             colorizer_model_id=args.colorizer_model_id,
             color_context_library_id=args.color_context_library_id,
@@ -293,9 +337,9 @@ def main() -> int:
             codec=args.codec,
             container=args.container,
             tile_size=args.tile_size,
-            fp16=selected_precision == "fp16",
-            bf16=selected_precision == "bf16",
-            precision=selected_precision,
+            fp16=args.fp16,
+            bf16=args.bf16,
+            precision=args.precision,
             torch_compile_enabled=args.torch_compile,
             torch_compile_mode=args.torch_compile_mode,
             torch_compile_cudagraphs=args.torch_compile_cudagraphs,
@@ -334,6 +378,8 @@ def main() -> int:
         result = run_realesrgan_pipeline(
             source_path=args.source,
             model_id=args.model_id,
+            denoise_mode=args.denoise_mode,
+            denoiser_model_id=args.denoiser_model_id,
             colorization_mode=args.colorization_mode,
             colorizer_model_id=args.colorizer_model_id,
             color_context_library_id=args.color_context_library_id,
@@ -355,6 +401,7 @@ def main() -> int:
             crop_width=args.crop_width,
             crop_height=args.crop_height,
             job_id=args.job_id,
+            resume_from_job_id=args.resume_from_job_id,
             progress_path=args.progress_path,
             cancel_path=args.cancel_path,
             pause_path=args.pause_path,
@@ -366,9 +413,9 @@ def main() -> int:
             codec=args.codec,
             container=args.container,
             tile_size=args.tile_size,
-            fp16=selected_precision == "fp16",
-            bf16=selected_precision == "bf16",
-            precision=selected_precision,
+            fp16=args.fp16,
+            bf16=args.bf16,
+            precision=args.precision,
             torch_compile_enabled=args.torch_compile,
             torch_compile_mode=args.torch_compile_mode,
             torch_compile_cudagraphs=args.torch_compile_cudagraphs,
@@ -445,6 +492,48 @@ def main() -> int:
             torch_compile_cudagraphs=args.torch_compile_cudagraphs,
             pytorch_runner=args.pytorch_runner,
             channels_last=args.channels_last,
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "compare-denoisers":
+        result = compare_denoisers(
+            source=Path(args.source),
+            output_dir=Path(args.output_dir),
+            work_dir=Path(args.work_dir),
+            start_seconds=args.start_seconds,
+            duration_seconds=args.duration_seconds,
+            fps=args.fps,
+            models=args.model_ids,
+            include_ai=args.include_ai,
+            gpu_id=args.gpu_id,
+            precision=args.precision,
+            keep_work_dir=args.keep_work_dir,
+            control_safe_bottom_pixels=args.control_safe_bottom_pixels,
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "remove-hard-captions":
+        result = remove_hard_captions(
+            source=Path(args.source),
+            output_dir=Path(args.output_dir),
+            work_dir=Path(args.work_dir),
+            start_seconds=args.start_seconds,
+            duration_seconds=args.duration_seconds,
+            fps=args.fps,
+            bottom_region_fraction=args.bottom_region_fraction,
+            light_threshold=args.light_threshold,
+            color_hue_min=args.color_hue_min,
+            color_hue_max=args.color_hue_max,
+            mask_dilate_pixels=args.mask_dilate_pixels,
+            line_box_padding_pixels=args.line_box_padding_pixels,
+            line_box_max_gap_pixels=args.line_box_max_gap_pixels,
+            temporal_radius=args.temporal_radius,
+            inpaint_radius=args.inpaint_radius,
+            inpaint_method=args.inpaint_method,
+            keep_work_dir=args.keep_work_dir,
+            control_safe_bottom_pixels=args.control_safe_bottom_pixels,
         )
         print(json.dumps(result, indent=2))
         return 0

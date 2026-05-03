@@ -18,6 +18,8 @@ export type InterpolationMode = "off" | "afterUpscale" | "interpolateOnly";
 
 export type ColorizationMode = "off" | "colorizeOnly" | "beforeUpscale";
 
+export type DenoiseMode = "off" | "beforeEnhance";
+
 export type ColorizationContextKind = "referenceImages";
 
 export type DeepRemasterProcessingMode = "standard" | "high";
@@ -141,6 +143,9 @@ export interface OutputSizingOptions {
 export interface RealesrganJobRequest extends OutputSizingOptions {
   sourcePath: string;
   modelId: ModelId;
+  resumeFromJobId?: string | null;
+  denoiseMode: DenoiseMode;
+  denoiserModelId: ModelId | null;
   colorizationMode: ColorizationMode;
   colorizerModelId: ModelId | null;
   colorizationContext: SelectedColorizationContext | null;
@@ -163,7 +168,7 @@ export interface RealesrganJobRequest extends OutputSizingOptions {
   crf: number;
 }
 
-export type PipelinePhase = "queued" | "paused" | "extracting" | "colorizing" | "upscaling" | "interpolating" | "encoding" | "remuxing" | "completed" | "failed";
+export type PipelinePhase = "queued" | "paused" | "extracting" | "denoising" | "colorizing" | "upscaling" | "interpolating" | "encoding" | "remuxing" | "completed" | "failed";
 
 export interface PipelineProgress {
   phase: PipelinePhase;
@@ -172,6 +177,7 @@ export interface PipelineProgress {
   processedFrames: number;
   totalFrames: number;
   extractedFrames: number;
+  denoisedFrames: number;
   colorizedFrames: number;
   upscaledFrames: number;
   interpolatedFrames: number;
@@ -193,6 +199,7 @@ export interface PipelineProgress {
   scratchSizeBytes?: number | null;
   outputSizeBytes?: number | null;
   extractStageSeconds?: number | null;
+  denoiseStageSeconds?: number | null;
   colorizeStageSeconds?: number | null;
   upscaleStageSeconds?: number | null;
   interpolateStageSeconds?: number | null;
@@ -243,6 +250,7 @@ export interface PipelineEffectiveSettings {
 
 export interface PipelineStageTimings {
   extractSeconds: number;
+  denoiseSeconds?: number;
   colorizeSeconds: number;
   upscaleSeconds: number;
   interpolateSeconds: number;

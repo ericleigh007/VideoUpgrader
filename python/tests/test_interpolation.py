@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from upscaler_worker.interpolation import (
     build_rife_command,
@@ -34,22 +35,40 @@ class InterpolationTests(unittest.TestCase):
         self.assertFalse(should_skip_interpolation(input_frame_count=300, target_frame_count=750))
 
     def test_build_rife_command_includes_model_target_and_gpu(self) -> None:
-        command = build_rife_command(
-            executable_path="C:/tools/rife-ncnn-vulkan.exe",
-            model_root="C:/tools/rife/models",
-            input_dir=Path("C:/frames/in"),
-            output_dir=Path("C:/frames/out"),
-            target_frame_count=750,
-            gpu_id=1,
-            uhd_mode=True,
-        )
+        with patch.dict("os.environ", {}, clear=True):
+            command = build_rife_command(
+                executable_path="C:/tools/rife-ncnn-vulkan.exe",
+                model_root="C:/tools/rife/models",
+                input_dir=Path("C:/frames/in"),
+                output_dir=Path("C:/frames/out"),
+                target_frame_count=750,
+                gpu_id=1,
+                uhd_mode=True,
+            )
 
         self.assertIn("-n", command)
         self.assertIn("750", command)
         self.assertIn("-g", command)
         self.assertIn("1", command)
         self.assertIn("-u", command)
+        self.assertIn("-j", command)
+        self.assertIn("8:4:8", command)
         self.assertIn("rife-v4.6", " ".join(command))
+
+    def test_build_rife_command_allows_default_threading_override(self) -> None:
+        with patch.dict("os.environ", {"UPSCALER_RIFE_THREADS": "default"}, clear=True):
+            command = build_rife_command(
+                executable_path="C:/tools/rife-ncnn-vulkan.exe",
+                model_root="C:/tools/rife/models",
+                input_dir=Path("C:/frames/in"),
+                output_dir=Path("C:/frames/out"),
+                target_frame_count=750,
+                gpu_id=1,
+                uhd_mode=True,
+            )
+
+        self.assertIn("-u", command)
+        self.assertNotIn("-j", command)
 
 
 if __name__ == "__main__":
